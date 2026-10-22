@@ -1,0 +1,30 @@
+{
+  "name": "workers-ai2api",
+  "version": "2.0.0",
+  "private": true,
+  "description": "OpenAI-compatible gateway for Cloudflare Workers AI with a dynamic, free-tier-aware model catalog.",
+  "type": "module",
+  "main": "_worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "node scripts/build.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "sync:catalog": "node scripts/sync-catalog.mjs",
+    "check": "npm test && npm run build"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers-ai",
+    "openai",
+    "ai-gateway"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.6",
+    "esbuild": "^0.28.2",
+    "vitest": "^4.1.12",
+    "wrangler": "^4.151.3"
+  }
+}

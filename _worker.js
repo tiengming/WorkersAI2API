@@ -1,350 +1,8766 @@
-/**
- * WorkersAI2API
- * 一个反向代理：把 Cloudflare Workers AI 转换成 OpenAI 兼容的接口格式，
- * 支持多账号负载均衡、故障自动切换重试，还自带一个可视化管理面板。
- */
+/*! Workers AI2API v2.0.0 — independent project, MIT */
 
-// 默认模型映射表（左边是客户端请求的模型名，右边是 Cloudflare 上对应的真实模型）
-const DEFAULT_MODEL_MAP = {
-	// 对话 / 文本生成模型
-	'glm-5.2': '@cf/zai-org/glm-5.2',
-	'glm-4.7-flash': '@cf/zai-org/glm-4.7-flash',
-	'kimi-k2.7-code': '@cf/moonshotai/kimi-k2.7-code',
-	'kimi-k2.6': '@cf/moonshotai/kimi-k2.6', // 就是一坨屎，别吃
-	'gemma-4-26b-a4b-it': '@cf/google/gemma-4-26b-a4b-it',
-	'nemotron-3-120b-a12b': '@cf/nvidia/nemotron-3-120b-a12b',
-	'gpt-oss-20b': '@cf/openai/gpt-oss-20b',
-	'gpt-oss-120b': '@cf/openai/gpt-oss-120b',
-
-	// 向量嵌入（Embeddings）模型
-	'embeddinggemma-300m': '@cf/google/embeddinggemma-300m',
-	'qwen3-embedding-0.6b': '@cf/qwen/qwen3-embedding-0.6b',
-	'bge-m3': '@cf/baai/bge-m3'
+// src/utils.js
+function json(data, init = {}) {
+  const headers = new Headers(init.headers || {});
+  if (!headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json; charset=utf-8");
+  }
+  return new Response(JSON.stringify(data), { ...init, headers });
+}
+function openAIError(message, {
+  status = 400,
+  type = "invalid_request_error",
+  code = null,
+  param = null,
+  extra = {}
+} = {}) {
+  return json({
+    error: {
+      message,
+      type,
+      param,
+      code,
+      ...extra
+    }
+  }, { status });
+}
+var RequestError = class extends Error {
+  constructor(message, { status = 400, type = "invalid_request_error", code = null, param = null, extra = {}, headers = {} } = {}) {
+    super(message);
+    this.name = "RequestError";
+    this.status = status;
+    this.type = type;
+    this.code = code;
+    this.param = param;
+    this.extra = extra;
+    this.headers = headers;
+  }
+  toResponse() {
+    return json({
+      error: { message: this.message, type: this.type, param: this.param, code: this.code, ...this.extra }
+    }, { status: this.status, headers: this.headers });
+  }
 };
+function cors(response, request) {
+  const origin = request?.headers?.get("Origin") || "*";
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", origin);
+  headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, x-session-affinity, anthropic-version, anthropic-beta");
+  headers.set("Access-Control-Expose-Headers", "x-workers-ai-model, x-workers-ai-account, x-quota-remaining, x-quota-limit, x-request-id");
+  headers.set("Vary", "Origin");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+function preflight(request) {
+  return cors(new Response(null, { status: 204 }), request);
+}
+async function sha256Hex(value) {
+  const data = new TextEncoder().encode(String(value));
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function randomId(prefix = "") {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return prefix ? `${prefix}${hex}` : hex;
+}
+function timingSafeEqual(a, b) {
+  const left = new TextEncoder().encode(String(a ?? ""));
+  const right = new TextEncoder().encode(String(b ?? ""));
+  if (left.length !== right.length) return false;
+  let diff = 0;
+  for (let i = 0; i < left.length; i += 1) diff |= left[i] ^ right[i];
+  return diff === 0;
+}
+function bearerToken(request) {
+  const header = request.headers.get("Authorization") || "";
+  if (header.toLowerCase().startsWith("bearer ")) return header.slice(7).trim();
+  return null;
+}
+function utcDay(date = /* @__PURE__ */ new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+function estimateTokens(value) {
+  let chars = 0;
+  let images = 0;
+  const walk = (node) => {
+    if (node == null) return;
+    if (typeof node === "string") {
+      chars += node.length;
+      return;
+    }
+    if (typeof node === "number" || typeof node === "boolean") {
+      chars += String(node).length;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (typeof node === "object") {
+      if (node.type === "image_url" || node.type === "image" || node.image_url || node.source?.type === "base64") {
+        images += 1;
+      }
+      for (const [key, item] of Object.entries(node)) {
+        chars += key.length;
+        walk(item);
+      }
+    }
+  };
+  walk(value);
+  return Math.ceil(chars / 3.6) + images * 850;
+}
+function isPlainObject(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
 
-export default {
-	async fetch(request, env, ctx) {
-		// 1. 检查是否绑定了 KV 存储
-		if (!env.KV) {
-			return handleKVError(request);
-		}
-
-		// 2. 检查是否配置了 ADMIN_PASSWORD 环境变量
-		if (!env.ADMIN_PASSWORD) {
-			return handlePasswordError(request);
-		}
-
-		// 处理跨域预检请求（OPTIONS）
-		if (request.method === 'OPTIONS') {
-			return new Response(null, {
-				headers: {
-					'Access-Control-Allow-Origin': '*',
-					'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
-					'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key'
-				}
-			});
-		}
-
-		const url = new URL(request.url);
-
-		// 2. OpenAI 兼容的代理接口（/v1/ 开头）
-		if (url.pathname.startsWith('/v1/')) {
-			const response = await handleV1Proxy(request, env, ctx);
-			return addCORSHeaders(response);
-		}
-
-		// 3. 后台管理面板的 API 接口（/api/ 开头）
-		if (url.pathname.startsWith('/api/')) {
-			const response = await handleDashboardApi(request, env, ctx);
-			return addCORSHeaders(response);
-		}
-
-		// 4. 后台管理面板页面
-		if (url.pathname === '/admin' || url.pathname === '/admin/') {
-			const isLoggedIn = await verifyAdminCookie(request, env);
-			if (isLoggedIn) {
-				return handleAdminPage(request, env, ctx);
-			} else {
-				// 未登录则跳转到首页（登录页）
-				return new Response(null, {
-					status: 302,
-					headers: { 'Location': '/' }
-				});
-			}
-		}
-
-		// 5. 首页 / 登录页
-		if (url.pathname === '/') {
-			return handleLandingPage(request, env, ctx);
-		}
-
-		// robots.txt 支持，用于屏蔽搜索引擎爬虫
-		if (url.pathname === '/robots.txt') {
-			return new Response('User-agent: *\nDisallow: /', {
-				headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-			});
-		}
-
-		// 6. 其他路径一律返回 404
-		return new Response('404 Not Found', { status: 404 });
-	}
+// src/config.js
+var CONFIG_KEY = "config:v2";
+var LEGACY_CONFIG_KEY = "config";
+var DEFAULT_SETTINGS = {
+  /** Optional AI Gateway id. Adds `cf-aig-gateway-id` to upstream requests. */
+  gatewayId: "",
+  gatewaySkipCache: false,
+  /** Allow unauthenticated /v1 access when no API keys exist. */
+  allowPublic: false,
+  /** Hard cap per Cloudflare account, per UTC day. Never raise above your plan's free allocation. */
+  dailyNeurons: 1e4,
+  /** Default max output tokens used for quota reservation when a client omits max_tokens. */
+  defaultMaxOutputTokens: 1024,
+  /** Optional map of alias -> @cf model id. */
+  aliases: {},
+  /** Optional map of model id -> performance score (0-100), for operators with their own evals. */
+  benchmarks: {}
 };
-
-// 工具函数：给响应加上跨域（CORS）响应头
-function addCORSHeaders(response) {
-	const newResponse = new Response(response.body, response);
-	newResponse.headers.set('Access-Control-Allow-Origin', '*');
-	newResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
-	newResponse.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key');
-	return newResponse;
+var memory = { config: null, expires: 0 };
+function defaultConfig() {
+  return {
+    version: 2,
+    accounts: [],
+    apiKeys: [],
+    settings: { ...DEFAULT_SETTINGS }
+  };
 }
-
-// 工具函数：计算字符串的 SHA-256 哈希值
-async function sha256(message) {
-	const msgBuffer = new TextEncoder().encode(message);
-	const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
-	const hashArray = Array.from(new Uint8Array(hashBuffer));
-	return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+function normalizeAccount(account, index) {
+  const accountId = String(account.accountId || account.account_id || "").trim();
+  const apiToken = String(account.apiToken || account.api_token || account.token || "").trim();
+  return {
+    id: account.id || accountId || `account-${index + 1}`,
+    name: String(account.name || `Account ${index + 1}`).trim(),
+    accountId,
+    apiToken,
+    status: account.status === "disabled" ? "disabled" : "active",
+    createdAt: account.createdAt || (/* @__PURE__ */ new Date()).toISOString()
+  };
 }
-
-// ----------------------------------------------------
-// KV 读写相关工具函数
-// （把所有配置合并存到一个 'config' 键里，一次读取就能拿到全部配置，省 KV 读次数）
-// ----------------------------------------------------
-const memoryCache = {
-	config: null,
-	configExpiry: 0
-};
-const CACHE_TTL_MS = 60000; // 内存缓存有效期：1 分钟
-
-async function getAppConfig(env) {
-	const now = Date.now();
-	if (memoryCache.config && now < memoryCache.configExpiry) {
-		return memoryCache.config;
-	}
-
-	const raw = await env.KV.get('config');
-	let parsed = { accounts: [], apiKeys: [], customModelMap: {} };
-
-	if (raw) {
-		try {
-			const data = JSON.parse(raw);
-			parsed = {
-				accounts: data.accounts || [],
-				apiKeys: data.apiKeys || [],
-				customModelMap: data.customModelMap || {}
-			};
-		} catch (e) { }
-	} else {
-		// 仅在 KV 首次初始化时写入默认模型映射，避免覆盖已有配置。
-		parsed.customModelMap = { ...DEFAULT_MODEL_MAP };
-		await env.KV.put('config', JSON.stringify(parsed));
-	}
-
-	memoryCache.config = parsed;
-	memoryCache.configExpiry = now + CACHE_TTL_MS;
-	return parsed;
+function normalizeConfig(input) {
+  const base = defaultConfig();
+  const data = isPlainObject(input) ? input : {};
+  const accounts = Array.isArray(data.accounts) ? data.accounts.map(normalizeAccount) : [];
+  const apiKeys = Array.isArray(data.apiKeys) ? data.apiKeys.map((key) => ({
+    id: key.id || key.key || `key-${Math.random().toString(36).slice(2)}`,
+    name: String(key.name || "API key"),
+    hash: key.hash || null,
+    // Legacy plaintext keys are migrated lazily in getConfig().
+    legacyKey: key.hash ? null : key.key || null,
+    prefix: key.prefix || (key.key ? String(key.key).slice(0, 10) : "sk-wa-"),
+    last4: key.last4 || (key.key ? String(key.key).slice(-4) : ""),
+    createdAt: key.createdAt || (/* @__PURE__ */ new Date()).toISOString(),
+    lastUsedAt: key.lastUsedAt || null,
+    enabled: key.enabled !== false
+  })) : [];
+  const settings = {
+    ...DEFAULT_SETTINGS,
+    ...isPlainObject(data.settings) ? data.settings : {},
+    aliases: {
+      ...isPlainObject(data.settings?.aliases) ? data.settings.aliases : {},
+      ...isPlainObject(data.aliases) ? data.aliases : {},
+      ...isPlainObject(data.customModelMap) ? data.customModelMap : {}
+    },
+    benchmarks: {
+      ...isPlainObject(data.settings?.benchmarks) ? data.settings.benchmarks : {}
+    }
+  };
+  settings.dailyNeurons = Math.max(0, Number(settings.dailyNeurons) || DEFAULT_SETTINGS.dailyNeurons);
+  settings.defaultMaxOutputTokens = Math.max(1, Number(settings.defaultMaxOutputTokens) || 1024);
+  settings.gatewaySkipCache = settings.gatewaySkipCache === true;
+  settings.allowPublic = settings.allowPublic === true;
+  return { version: 2, accounts, apiKeys, settings };
 }
-
-async function saveAppConfig(env, config) {
-	await env.KV.put('config', JSON.stringify(config));
-	memoryCache.config = config;
-	memoryCache.configExpiry = Date.now() + CACHE_TTL_MS;
+async function migrateLegacyKeys(env, config) {
+  let changed = false;
+  for (const key of config.apiKeys) {
+    if (!key.hash && key.legacyKey) {
+      key.hash = await sha256Hex(key.legacyKey);
+      key.prefix = key.legacyKey.slice(0, 10);
+      key.last4 = key.legacyKey.slice(-4);
+      delete key.legacyKey;
+      changed = true;
+    }
+  }
+  if (changed) await env.KV.put(CONFIG_KEY, JSON.stringify(config));
+  return config;
 }
-
+async function getConfig(env, { force = false } = {}) {
+  const now = Date.now();
+  if (!force && memory.config && now < memory.expires) return memory.config;
+  let raw = await env.KV.get(CONFIG_KEY);
+  if (!raw) {
+    const legacyRaw = await env.KV.get(LEGACY_CONFIG_KEY);
+    let legacy = null;
+    if (legacyRaw) {
+      try {
+        legacy = JSON.parse(legacyRaw);
+      } catch {
+        legacy = null;
+      }
+    }
+    const config2 = normalizeConfig(legacy);
+    await env.KV.put(CONFIG_KEY, JSON.stringify(config2));
+    const migrated = await migrateLegacyKeys(env, config2);
+    memory = { config: migrated, expires: now + 3e4 };
+    return migrated;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = {};
+  }
+  const config = normalizeConfig(parsed);
+  if (config.apiKeys.some((key) => !key.hash && key.legacyKey)) {
+    await migrateLegacyKeys(env, config);
+  }
+  memory = { config, expires: now + 3e4 };
+  return config;
+}
+async function saveConfig(env, config) {
+  const normalized = normalizeConfig(config);
+  await env.KV.put(CONFIG_KEY, JSON.stringify(normalized));
+  memory = { config: normalized, expires: Date.now() + 3e4 };
+  return normalized;
+}
+async function updateConfig(env, updater) {
+  const config = await getConfig(env, { force: true });
+  const next = updater(structuredClone(config)) || config;
+  return saveConfig(env, next);
+}
 async function getAccounts(env) {
-	const config = await getAppConfig(env);
-	return config.accounts;
+  const config = await getConfig(env);
+  return config.accounts;
+}
+async function getActiveAccounts(env) {
+  const config = await getConfig(env);
+  return config.accounts.filter((account) => account.status === "active" && account.accountId && account.apiToken);
+}
+async function getSettings(env) {
+  const config = await getConfig(env);
+  return config.settings;
 }
 
-async function saveAccounts(env, accounts) {
-	const config = await getAppConfig(env);
-	config.accounts = accounts;
-	await saveAppConfig(env, config);
-	await env.KV.delete('cache_usage_summary'); // 清除用量统计的缓存
+// src/auth.js
+function hasAdminPassword(env) {
+  return Boolean(env.ADMIN_PASSWORD && String(env.ADMIN_PASSWORD).trim());
+}
+async function adminToken(env) {
+  return sha256Hex(String(env.ADMIN_PASSWORD).trim());
+}
+async function isAdmin(request, env) {
+  if (!hasAdminPassword(env)) return false;
+  const cookie = request.headers.get("Cookie") || "";
+  const match = cookie.match(/(?:^|;\s*)admin_token=([^;]+)/);
+  const token = match ? decodeURIComponent(match[1]) : bearerToken(request);
+  if (!token) return false;
+  return timingSafeEqual(token, await adminToken(env));
+}
+function adminCookie(token, { clear = false, secure = true } = {}) {
+  const parts = [
+    `admin_token=${clear ? "" : token}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${clear ? 0 : 86400}`
+  ];
+  if (secure) parts.push("Secure");
+  return parts.join("; ");
+}
+async function verifyApiKey(request, env) {
+  const config = await getConfig(env);
+  const enabled = config.apiKeys.filter((key2) => key2.enabled !== false);
+  if (enabled.length === 0) {
+    if (config.settings.allowPublic) return { ok: true, key: null, public: true };
+    return { ok: false, reason: "no_keys" };
+  }
+  const provided = request.headers.get("x-api-key") || bearerToken(request);
+  if (!provided) return { ok: false, reason: "missing" };
+  const hash = await sha256Hex(provided);
+  const key = enabled.find((item) => item.hash && timingSafeEqual(item.hash, hash));
+  if (!key) return { ok: false, reason: "invalid" };
+  return { ok: true, key, public: false };
 }
 
-async function getApiKeys(env) {
-	const config = await getAppConfig(env);
-	return config.apiKeys;
+// src/catalog/pricing.js
+var PRICING_URL = "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md";
+var MODEL_ID_RE = /@cf\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+/;
+function parseKind(text) {
+  const value = text.toLowerCase();
+  if (value.includes("cached input token")) return "cached_input_token";
+  if (value.includes("input token")) return "input_token";
+  if (value.includes("output token")) return "output_token";
+  if (value.includes("audio minute")) return "audio_minute";
+  if (value.includes("character")) return "character";
+  if (value.includes("step")) {
+    if (value.includes("input")) return "input_image_tile_step";
+    if (value.includes("output")) return "output_image_tile_step";
+    return "step";
+  }
+  if (value.includes("tile")) return "image_tile";
+  if (value.includes("image")) return "image";
+  if (value.includes("megapixel") || value.includes("mp")) return "image_megapixel";
+  return "unknown";
+}
+function parseSegments(cell) {
+  return String(cell).split(/<br\s*\/?>/i).map((part) => part.trim()).filter(Boolean).map((part) => {
+    const numberMatch = part.match(/([\d.]+)/);
+    if (!numberMatch) return null;
+    const value = Number(numberMatch[1]);
+    if (!Number.isFinite(value)) return null;
+    const descriptor = part.replace(/^\$?\s*[\d.]+\s*/, "").trim();
+    const isNeurons = /neuron/i.test(descriptor);
+    return {
+      value,
+      descriptor,
+      kind: parseKind(descriptor),
+      isNeurons,
+      raw: part
+    };
+  }).filter(Boolean);
+}
+function displayFor(items) {
+  const labels = {
+    input_token: "input",
+    output_token: "output",
+    cached_input_token: "cached input",
+    audio_minute: "audio minute",
+    character: "1k chars",
+    step: "step",
+    image_tile: "tile",
+    image: "image",
+    image_megapixel: "MP",
+    input_image_tile_step: "input tile/step",
+    output_image_tile_step: "output tile/step"
+  };
+  return items.map((item) => `$${item.usd} / ${labels[item.kind] || item.kind}`).join(" \xB7 ");
+}
+function parsePricingMarkdown(markdown) {
+  const models = {};
+  const text = String(markdown || "");
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim().startsWith("|")) continue;
+    const cells = line.split("|").slice(1, -1).map((cell) => cell.trim());
+    if (cells.length < 2) continue;
+    const modelId = cells[0].match(MODEL_ID_RE)?.[0];
+    if (!modelId) continue;
+    if (/websocket/i.test(cells[0]) && !models[modelId]) {
+    }
+    const usdSegments = parseSegments(cells[1]).filter((item) => !item.isNeurons);
+    const neuronSegments = parseSegments(cells[2] || "").filter((item) => item.isNeurons);
+    const items = [];
+    const length = Math.max(usdSegments.length, neuronSegments.length);
+    for (let i = 0; i < length; i += 1) {
+      const usd = usdSegments[i];
+      const neurons = neuronSegments[i];
+      if (!usd && !neurons) continue;
+      const kind = usd?.kind !== "unknown" ? usd.kind : neurons?.kind;
+      items.push({
+        kind: kind || "unknown",
+        usd: usd?.value ?? null,
+        neurons: neurons?.value ?? null,
+        unit: usd?.descriptor || neurons?.descriptor || ""
+      });
+    }
+    if (items.length === 0) continue;
+    if (models[modelId] && /websocket/i.test(cells[0])) {
+      models[`${modelId}#websocket`] = { items, display: displayFor(items), source: PRICING_URL };
+      continue;
+    }
+    if (models[modelId]) continue;
+    const tokens = {};
+    const byKind = Object.fromEntries(items.map((item) => [item.kind, item]));
+    const usdToNeurons = (usd) => Math.ceil(usd * (1e6 / 11));
+    if (byKind.input_token) {
+      tokens.input_usd_per_million = byKind.input_token.usd;
+      tokens.input_neurons_per_million = byKind.input_token.neurons ?? usdToNeurons(byKind.input_token.usd);
+    }
+    if (byKind.output_token) {
+      tokens.output_usd_per_million = byKind.output_token.usd;
+      tokens.output_neurons_per_million = byKind.output_token.neurons ?? usdToNeurons(byKind.output_token.usd);
+    }
+    if (byKind.cached_input_token) {
+      tokens.cached_input_usd_per_million = byKind.cached_input_token.usd;
+      tokens.cached_input_neurons_per_million = byKind.cached_input_token.neurons ?? usdToNeurons(byKind.cached_input_token.usd);
+    }
+    models[modelId] = {
+      items,
+      tokens,
+      display: displayFor(items),
+      source: PRICING_URL
+    };
+  }
+  const paidMatch = text.match(/Some models require a paid billing method[\s\S]*?This applies to([\s\S]*?)\.\s*You can access/i);
+  const paidOnly = paidMatch ? [...paidMatch[1].matchAll(/`(@cf\/[^`]+)`/g)].map((match) => match[1].trim()) : [];
+  const freeMatch = text.match(/([\d,]+)\s+Neurons per day/i);
+  const freeDailyNeurons = freeMatch ? Number(freeMatch[1].replace(/,/g, "")) : null;
+  const updatedMatch = text.match(/Last updated\s+([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})/i);
+  return {
+    models,
+    paidOnly,
+    freeDailyNeurons,
+    updatedAt: updatedMatch?.[1] || null,
+    source: PRICING_URL
+  };
 }
 
-async function saveApiKeys(env, keys) {
-	const config = await getAppConfig(env);
-	config.apiKeys = keys;
-	await saveAppConfig(env, config);
+// src/catalog/ranking.js
+var SIZE_MIN = 7;
+var SIZE_MAX = 12.1;
+function shortModelId(id) {
+  return String(id || "").split("/").pop();
+}
+function extractSizes(text) {
+  if (!text) return { total: null, active: null };
+  const value = String(text).toLowerCase();
+  const moe = value.match(/(\d+(?:\.\d+)?)\s*b\s*[-_/ ]?a\s*(\d+(?:\.\d+)?)\s*b/);
+  if (moe) return { total: Number(moe[1]), active: Number(moe[2]) };
+  const backbone = value.match(/(\d+(?:\.\d+)?)\s*b\s*(?:backbone\s*)?param/);
+  if (backbone) return { total: Number(backbone[1]), active: null };
+  const all = [...value.matchAll(/(\d+(?:\.\d+)?)\s*b\b/g)].map((match) => Number(match[1])).filter((number) => number >= 0.3 && number <= 2e3);
+  if (all.length) return { total: Math.max(...all), active: null };
+  return { total: null, active: null };
+}
+function modelSizes(model) {
+  const fromId = extractSizes(`${model?.id || ""} ${model?.name || ""}`);
+  const fromDescription = extractSizes(model?.description || "");
+  return {
+    total: fromId.total || fromDescription.total || null,
+    active: fromId.active || fromDescription.active || null
+  };
+}
+function normalize(value, min, max) {
+  return Math.max(0, Math.min(100, (value - min) / (max - min) * 100));
+}
+function recencyScore(model) {
+  const raw = model?.created_at || model?.created || model?.release_date;
+  const time = typeof raw === "number" ? raw * 1e3 : Date.parse(raw || "");
+  if (!Number.isFinite(time)) return 45;
+  const months = (Date.now() - time) / (1e3 * 60 * 60 * 24 * 30.44);
+  return Math.max(0, Math.min(100, 100 - months * 2.2));
+}
+function priceScore(model) {
+  const output = Number(model?.pricing?.tokens?.output_usd_per_million);
+  if (!Number.isFinite(output) || output <= 0) return 45;
+  return normalize(Math.log10(output), Math.log10(0.05), Math.log10(15));
+}
+function performanceScore(model, overrides = {}) {
+  const sizes = modelSizes(model);
+  const effectiveParams = sizes.active || sizes.total;
+  const size = effectiveParams ? normalize(Math.log10(effectiveParams), SIZE_MIN, SIZE_MAX) : 40;
+  const caps = model?.capabilities || {};
+  let capability = 30;
+  if (caps.reasoning) capability += 20;
+  if (caps.function_calling) capability += 18;
+  if (caps.vision) capability += 10;
+  if (caps.structured_output) capability += 8;
+  if (caps.audio_output || caps.audio_input) capability += 6;
+  capability = Math.min(100, capability);
+  const context = Number(model?.context_window) || 0;
+  const contextScore = context > 0 ? normalize(Math.log10(context), Math.log10(4e3), Math.log10(1e6)) : 30;
+  const recency = recencyScore(model);
+  const price = priceScore(model);
+  const override = overrides?.[model?.id] ?? overrides?.[shortModelId(model?.id)];
+  const overrideScore = Number.isFinite(Number(override)) ? Number(override) : null;
+  const weights = overrideScore == null ? { size: 0.35, capability: 0.25, context: 0.15, recency: 0.15, price: 0.1 } : { size: 0.18, capability: 0.14, context: 0.08, recency: 0.08, price: 0.07, override: 0.45 };
+  const score = size * weights.size + capability * weights.capability + contextScore * weights.context + recency * weights.recency + price * weights.price + (overrideScore == null ? 0 : overrideScore * weights.override);
+  return {
+    score: Math.round(score * 10) / 10,
+    tier: tierFor(score),
+    basis: [
+      effectiveParams ? `${effectiveParams}B ${sizes.active ? "active" : "parameters"}` : "size unknown",
+      `${context ? `${Math.round(context / 1e3)}k context` : "context unknown"}`,
+      caps.reasoning ? "reasoning" : null,
+      caps.function_calling ? "tools" : null,
+      caps.vision ? "vision" : null,
+      overrideScore == null ? "heuristic score" : "operator benchmark"
+    ].filter(Boolean),
+    components: {
+      size: Math.round(size),
+      capability: Math.round(capability),
+      context: Math.round(contextScore),
+      recency: Math.round(recency),
+      price: Math.round(price),
+      override: overrideScore
+    }
+  };
+}
+function tierFor(score) {
+  if (score >= 80) return "S";
+  if (score >= 65) return "A";
+  if (score >= 50) return "B";
+  if (score >= 35) return "C";
+  return "D";
+}
+function rankModels(models, overrides = {}) {
+  const ranked = models.map((model) => ({
+    ...model,
+    performance: performanceScore(model, overrides)
+  }));
+  ranked.sort((a, b) => {
+    const diff = b.performance.score - a.performance.score;
+    if (diff) return diff;
+    return (b.context_window || 0) - (a.context_window || 0);
+  });
+  return ranked.map((model, index) => {
+    model.performance.rank = index + 1;
+    return model;
+  });
 }
 
-async function getCustomModelMap(env) {
-	const config = await getAppConfig(env);
-	return config.customModelMap;
+// src/catalog/normalize.js
+var TASK_ALIASES = {
+  "text generation": "text-generation",
+  "text-generation": "text-generation",
+  "text embeddings": "text-embeddings",
+  "text-embeddings": "text-embeddings",
+  "text-to-image": "text-to-image",
+  "text to image": "text-to-image",
+  "automatic speech recognition": "automatic-speech-recognition",
+  "speech recognition": "automatic-speech-recognition",
+  "text-to-speech": "text-to-speech",
+  "text to speech": "text-to-speech",
+  translation: "translation",
+  "summarization": "summarization",
+  "text classification": "text-classification",
+  "image classification": "image-classification",
+  "image-to-text": "image-to-text",
+  "object detection": "object-detection",
+  "dumb pipe": "dumb-pipe"
+};
+function normalizeTask(value) {
+  if (!value) return "unknown";
+  const raw = typeof value === "string" ? value : value.name || value.id || value.task || "";
+  return TASK_ALIASES[String(raw).toLowerCase()] || String(raw).toLowerCase().replace(/\s+/g, "-");
+}
+function endpointForTask(task) {
+  switch (task) {
+    case "text-generation":
+      return "/v1/chat/completions";
+    case "text-embeddings":
+      return "/v1/embeddings";
+    case "text-to-image":
+      return "/v1/images/generations";
+    case "automatic-speech-recognition":
+      return "/v1/audio/transcriptions";
+    case "text-to-speech":
+      return "/v1/audio/speech";
+    default:
+      return "/v1/run";
+  }
+}
+function propsOf(raw) {
+  const out = {};
+  const props = raw?.properties ?? raw?.property ?? raw?.capabilities;
+  if (Array.isArray(props)) {
+    for (const item of props) {
+      if (typeof item === "string") out[item] = true;
+      else if (item?.property_id) out[item.property_id] = item.value;
+      else if (isPlainObject(item)) Object.assign(out, item);
+    }
+  } else if (isPlainObject(props)) {
+    Object.assign(out, props);
+  }
+  return out;
+}
+function truthy(value) {
+  return value === true || value === 1 || ["true", "yes", "1", "supported"].includes(String(value ?? "").toLowerCase());
+}
+function firstNumber(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0) return number;
+  }
+  return null;
+}
+function parseModalities(raw, task) {
+  const architecture = raw.architecture || {};
+  const input = architecture.input_modalities || raw.input_modalities || raw.modalities?.input || taskModalities(task).input;
+  const output = architecture.output_modalities || raw.output_modalities || raw.modalities?.output || taskModalities(task).output;
+  return { input: [...new Set(input)], output: [...new Set(output)] };
+}
+function taskModalities(task) {
+  switch (task) {
+    case "text-to-image":
+      return { input: ["text"], output: ["image"] };
+    case "automatic-speech-recognition":
+      return { input: ["audio"], output: ["text"] };
+    case "text-to-speech":
+      return { input: ["text"], output: ["audio"] };
+    case "image-to-text":
+      return { input: ["image"], output: ["text"] };
+    default:
+      return { input: ["text"], output: ["text"] };
+  }
+}
+function inferCapabilities(raw, props, modalities, task, description) {
+  const supported = /* @__PURE__ */ new Set([
+    ...raw.supported_parameters || [],
+    ...props.supported_parameters || []
+  ]);
+  const text = `${description || ""} ${raw.name || ""} ${raw.id || ""}`.toLowerCase();
+  const input = modalities.input || [];
+  const output = modalities.output || [];
+  const functionCalling = truthy(props.function_calling) || truthy(props.tool_calling) || supported.has("tools") || supported.has("tool_choice") || /\bfunction calling\b|\btool[- ]calling\b/.test(text);
+  const reasoning = truthy(props.reasoning) || supported.has("reasoning") || supported.has("reasoning_effort") || /\breasoning\b|\bthinking\b/.test(text);
+  const structured = truthy(props.structured_output) || supported.has("structured_outputs") || supported.has("response_format") || /\bstructured output\b/.test(text);
+  return {
+    function_calling: Boolean(functionCalling),
+    reasoning: Boolean(reasoning),
+    structured_output: Boolean(structured),
+    vision: input.includes("image") || input.includes("video"),
+    audio_input: input.includes("audio"),
+    audio_output: output.includes("audio"),
+    streaming: props.streaming === void 0 ? task.includes("text") : truthy(props.streaming),
+    multilingual: /\bmultilingual\b|\b100\+ languages\b/.test(text)
+  };
+}
+function pricingFromOpenRouter(raw) {
+  const prices = raw?.pricing;
+  if (!isPlainObject(prices)) return null;
+  const perToken = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number * 1e6 : null;
+  };
+  const input = perToken(prices.prompt ?? prices.input);
+  const output = perToken(prices.completion ?? prices.output);
+  const cached = perToken(prices.input_cache_read ?? prices.cached_input);
+  if (input == null && output == null) return null;
+  const usdToNeurons = (usd) => Math.ceil(usd * (1e6 / 11));
+  const tokens = {};
+  const items = [];
+  if (input != null) {
+    tokens.input_usd_per_million = input;
+    tokens.input_neurons_per_million = usdToNeurons(input);
+    items.push({ kind: "input_token", usd: input, neurons: usdToNeurons(input), unit: "per M input tokens" });
+  }
+  if (output != null) {
+    tokens.output_usd_per_million = output;
+    tokens.output_neurons_per_million = usdToNeurons(output);
+    items.push({ kind: "output_token", usd: output, neurons: usdToNeurons(output), unit: "per M output tokens" });
+  }
+  if (cached != null) {
+    tokens.cached_input_usd_per_million = cached;
+    tokens.cached_input_neurons_per_million = usdToNeurons(cached);
+    items.push({ kind: "cached_input_token", usd: cached, neurons: usdToNeurons(cached), unit: "per M cached input tokens" });
+  }
+  return {
+    items,
+    tokens,
+    display: items.map((item) => `$${item.usd} / ${item.kind.replace(/_/g, " ")}`).join(" \xB7 "),
+    source: "cloudflare-models-api"
+  };
+}
+function createdTimestamp(raw) {
+  if (raw?.created) return Number(raw.created);
+  if (raw?.created_at) {
+    const time = Date.parse(raw.created_at);
+    return Number.isFinite(time) ? Math.floor(time / 1e3) : null;
+  }
+  return null;
+}
+function normalizeModel(raw, { paidOnly = /* @__PURE__ */ new Set(), pricing = null, freeQuota = 1e4 } = {}) {
+  if (!raw?.id || !String(raw.id).startsWith("@cf/")) return null;
+  const id = String(raw.id);
+  const props = propsOf(raw);
+  const task = normalizeTask(raw.task || raw.task_name || raw.type);
+  const description = String(raw.description || "");
+  const modalities = parseModalities(raw, task);
+  const capabilities = inferCapabilities(raw, props, modalities, task, description);
+  const short = shortModelId(id);
+  const contextWindow = firstNumber(
+    raw.context_length,
+    raw.context_window,
+    props.context_window,
+    raw.limits?.context_window,
+    raw.top_provider?.context_length
+  );
+  const maxOutput = firstNumber(
+    raw.max_output_tokens,
+    props.max_output_tokens,
+    raw.limits?.max_output_tokens,
+    raw.top_provider?.max_completion_tokens
+  );
+  const price = pricing || pricingFromOpenRouter(raw);
+  const requiresPaid = paidOnly.has(id) || truthy(props.requires_paid) || truthy(raw.requires_paid) || truthy(raw.requires_workers_paid);
+  const outputRate = Number(price?.tokens?.output_neurons_per_million);
+  const inputRate = Number(price?.tokens?.input_neurons_per_million);
+  const dailyTokens = outputRate > 0 ? Math.floor(freeQuota / outputRate * 1e6) : inputRate > 0 ? Math.floor(freeQuota / inputRate * 1e6) : null;
+  const created = createdTimestamp(raw);
+  const deprecated = truthy(raw.deprecated) || truthy(props.deprecated);
+  return {
+    id,
+    name: String(raw.name || short.replace(/-/g, " ")),
+    author: String(raw.author?.name || raw.author || raw.source_name || id.split("/")[0].replace("@cf", "")),
+    task,
+    description,
+    context_window: contextWindow,
+    max_output_tokens: maxOutput,
+    modalities,
+    capabilities,
+    pricing: price || { items: [], tokens: {}, display: "\u2014", source: null },
+    requires_paid: Boolean(requiresPaid),
+    deprecated: Boolean(deprecated),
+    free: !requiresPaid && !deprecated,
+    free_daily_output_tokens: dailyTokens,
+    created_at: created ? new Date(created * 1e3).toISOString() : raw.created_at || null,
+    created_unix: created,
+    docs_url: `https://developers.cloudflare.com/workers-ai/models/${short}/`,
+    openai_compatible: task === "text-generation" || task === "text-embeddings",
+    endpoints: [endpointForTask(task), "/v1/run"].filter((value, index, all) => all.indexOf(value) === index),
+    aliases: [id, short]
+  };
+}
+function normalizeApiModel(raw, options) {
+  return normalizeModel(raw, options);
+}
+function normalizeOpenRouterModel(raw, options) {
+  return normalizeModel(raw, options);
 }
 
-async function saveCustomModelMap(env, map) {
-	const config = await getAppConfig(env);
-	config.customModelMap = map;
-	await saveAppConfig(env, config);
+// src/data/catalog-snapshot.js
+var catalog_snapshot_default = {
+  "generated_at": "2026-10-22T03:08:01.063Z",
+  "free_daily_neurons": 1e4,
+  "pricing": {
+    "models": {
+      "@cf/meta/llama-3.2-1b-instruct": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.027,
+            "neurons": 2457,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.201,
+            "neurons": 18252,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.027,
+          "input_neurons_per_million": 2457,
+          "output_usd_per_million": 0.201,
+          "output_neurons_per_million": 18252
+        },
+        "display": "$0.027 / input \xB7 $0.201 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-3.2-3b-instruct": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.051,
+            "neurons": 4625,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.335,
+            "neurons": 30475,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.051,
+          "input_neurons_per_million": 4625,
+          "output_usd_per_million": 0.335,
+          "output_neurons_per_million": 30475
+        },
+        "display": "$0.051 / input \xB7 $0.335 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-3.1-8b-instruct-fp8-fast": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.045,
+            "neurons": 4119,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.384,
+            "neurons": 34868,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.045,
+          "input_neurons_per_million": 4119,
+          "output_usd_per_million": 0.384,
+          "output_neurons_per_million": 34868
+        },
+        "display": "$0.045 / input \xB7 $0.384 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-3.2-11b-vision-instruct": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.049,
+            "neurons": 4410,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.676,
+            "neurons": 61493,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.049,
+          "input_neurons_per_million": 4410,
+          "output_usd_per_million": 0.676,
+          "output_neurons_per_million": 61493
+        },
+        "display": "$0.049 / input \xB7 $0.676 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-3.1-70b-instruct-fp8-fast": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.293,
+            "neurons": 26668,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 2.253,
+            "neurons": 204805,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.293,
+          "input_neurons_per_million": 26668,
+          "output_usd_per_million": 2.253,
+          "output_neurons_per_million": 204805
+        },
+        "display": "$0.293 / input \xB7 $2.253 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-3.3-70b-instruct-fp8-fast": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.293,
+            "neurons": 26668,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 2.253,
+            "neurons": 204805,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.293,
+          "input_neurons_per_million": 26668,
+          "output_usd_per_million": 2.253,
+          "output_neurons_per_million": 204805
+        },
+        "display": "$0.293 / input \xB7 $2.253 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.497,
+            "neurons": 45170,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4.881,
+            "neurons": 443756,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.497,
+          "input_neurons_per_million": 45170,
+          "output_usd_per_million": 4.881,
+          "output_neurons_per_million": 443756
+        },
+        "display": "$0.497 / input \xB7 $4.881 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/deepseek-ai/deepseek-v4-flash-0731": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.44,
+            "neurons": 4e4,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.014,
+            "neurons": 1273,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1.32,
+            "neurons": 12e4,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.44,
+          "input_neurons_per_million": 4e4,
+          "output_usd_per_million": 1.32,
+          "output_neurons_per_million": 12e4,
+          "cached_input_usd_per_million": 0.014,
+          "cached_input_neurons_per_million": 1273
+        },
+        "display": "$0.44 / input \xB7 $0.014 / cached input \xB7 $1.32 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/deepseek-ai/deepseek-v4.1-flash-1017": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.3,
+            "neurons": 27273,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 6e-3,
+            "neurons": 545,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1.2,
+            "neurons": 109091,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.3,
+          "input_neurons_per_million": 27273,
+          "output_usd_per_million": 1.2,
+          "output_neurons_per_million": 109091,
+          "cached_input_usd_per_million": 6e-3,
+          "cached_input_neurons_per_million": 545
+        },
+        "display": "$0.3 / input \xB7 $0.006 / cached input \xB7 $1.2 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/deepseek-ai/deepseek-v4-pro-0813": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 1.32,
+            "neurons": 12e4,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.044,
+            "neurons": 4e3,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 3.96,
+            "neurons": 36e4,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 1.32,
+          "input_neurons_per_million": 12e4,
+          "output_usd_per_million": 3.96,
+          "output_neurons_per_million": 36e4,
+          "cached_input_usd_per_million": 0.044,
+          "cached_input_neurons_per_million": 4e3
+        },
+        "display": "$1.32 / input \xB7 $0.044 / cached input \xB7 $3.96 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/mistral/mistral-7b-instruct-v0.1": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.11,
+            "neurons": 1e4,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.19,
+            "neurons": 17300,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.11,
+          "input_neurons_per_million": 1e4,
+          "output_usd_per_million": 0.19,
+          "output_neurons_per_million": 17300
+        },
+        "display": "$0.11 / input \xB7 $0.19 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/mistralai/mistral-small-3.1-24b-instruct": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.351,
+            "neurons": 31876,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.555,
+            "neurons": 50488,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.351,
+          "input_neurons_per_million": 31876,
+          "output_usd_per_million": 0.555,
+          "output_neurons_per_million": 50488
+        },
+        "display": "$0.351 / input \xB7 $0.555 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-3.1-8b-instruct": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.282,
+            "neurons": 25608,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.827,
+            "neurons": 75147,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.282,
+          "input_neurons_per_million": 25608,
+          "output_usd_per_million": 0.827,
+          "output_neurons_per_million": 75147
+        },
+        "display": "$0.282 / input \xB7 $0.827 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-3.1-8b-instruct-fp8": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.152,
+            "neurons": 13778,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.287,
+            "neurons": 26128,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.152,
+          "input_neurons_per_million": 13778,
+          "output_usd_per_million": 0.287,
+          "output_neurons_per_million": 26128
+        },
+        "display": "$0.152 / input \xB7 $0.287 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-3.1-8b-instruct-awq": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.123,
+            "neurons": 11161,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.266,
+            "neurons": 24215,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.123,
+          "input_neurons_per_million": 11161,
+          "output_usd_per_million": 0.266,
+          "output_neurons_per_million": 24215
+        },
+        "display": "$0.123 / input \xB7 $0.266 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-3-8b-instruct": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.282,
+            "neurons": 25608,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.827,
+            "neurons": 75147,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.282,
+          "input_neurons_per_million": 25608,
+          "output_usd_per_million": 0.827,
+          "output_neurons_per_million": 75147
+        },
+        "display": "$0.282 / input \xB7 $0.827 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-3-8b-instruct-awq": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.123,
+            "neurons": 11161,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.266,
+            "neurons": 24215,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.123,
+          "input_neurons_per_million": 11161,
+          "output_usd_per_million": 0.266,
+          "output_neurons_per_million": 24215
+        },
+        "display": "$0.123 / input \xB7 $0.266 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-2-7b-chat-fp16": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.556,
+            "neurons": 50505,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 6.667,
+            "neurons": 606061,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.556,
+          "input_neurons_per_million": 50505,
+          "output_usd_per_million": 6.667,
+          "output_neurons_per_million": 606061
+        },
+        "display": "$0.556 / input \xB7 $6.667 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-guard-3-8b": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.484,
+            "neurons": 44003,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.03,
+            "neurons": 2730,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.484,
+          "input_neurons_per_million": 44003,
+          "output_usd_per_million": 0.03,
+          "output_neurons_per_million": 2730
+        },
+        "display": "$0.484 / input \xB7 $0.03 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/llama-4-scout-17b-16e-instruct": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.27,
+            "neurons": 24545,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.85,
+            "neurons": 77273,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.27,
+          "input_neurons_per_million": 24545,
+          "output_usd_per_million": 0.85,
+          "output_neurons_per_million": 77273
+        },
+        "display": "$0.27 / input \xB7 $0.85 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/google/gemma-3-12b-it": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.345,
+            "neurons": 31371,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.556,
+            "neurons": 50560,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.345,
+          "input_neurons_per_million": 31371,
+          "output_usd_per_million": 0.556,
+          "output_neurons_per_million": 50560
+        },
+        "display": "$0.345 / input \xB7 $0.556 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/qwen/qwq-32b": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.66,
+            "neurons": 6e4,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1,
+            "neurons": 90909,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.66,
+          "input_neurons_per_million": 6e4,
+          "output_usd_per_million": 1,
+          "output_neurons_per_million": 90909
+        },
+        "display": "$0.66 / input \xB7 $1 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/qwen/qwen2.5-coder-32b-instruct": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.66,
+            "neurons": 6e4,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1,
+            "neurons": 90909,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.66,
+          "input_neurons_per_million": 6e4,
+          "output_usd_per_million": 1,
+          "output_neurons_per_million": 90909
+        },
+        "display": "$0.66 / input \xB7 $1 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/qwen/qwen3-30b-a3b-fp8": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.051,
+            "neurons": 4625,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.335,
+            "neurons": 30475,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.051,
+          "input_neurons_per_million": 4625,
+          "output_usd_per_million": 0.335,
+          "output_neurons_per_million": 30475
+        },
+        "display": "$0.051 / input \xB7 $0.335 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/qwen/qwen3.8-27b": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.45,
+            "neurons": 40909,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 3.2,
+            "neurons": 290909,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.45,
+          "input_neurons_per_million": 40909,
+          "output_usd_per_million": 3.2,
+          "output_neurons_per_million": 290909
+        },
+        "display": "$0.45 / input \xB7 $3.2 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/openai/gpt-oss-120b": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.35,
+            "neurons": 31818,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.75,
+            "neurons": 68182,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.35,
+          "input_neurons_per_million": 31818,
+          "output_usd_per_million": 0.75,
+          "output_neurons_per_million": 68182
+        },
+        "display": "$0.35 / input \xB7 $0.75 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/openai/gpt-oss-20b": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.2,
+            "neurons": 18182,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.3,
+            "neurons": 27273,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.2,
+          "input_neurons_per_million": 18182,
+          "output_usd_per_million": 0.3,
+          "output_neurons_per_million": 27273
+        },
+        "display": "$0.2 / input \xB7 $0.3 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/aisingapore/gemma-sea-lion-v4-27b-it": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.351,
+            "neurons": 31876,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.555,
+            "neurons": 50488,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.351,
+          "input_neurons_per_million": 31876,
+          "output_usd_per_million": 0.555,
+          "output_neurons_per_million": 50488
+        },
+        "display": "$0.351 / input \xB7 $0.555 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/ibm-granite/granite-4.0-h-micro": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.017,
+            "neurons": 1542,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.112,
+            "neurons": 10158,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.017,
+          "input_neurons_per_million": 1542,
+          "output_usd_per_million": 0.112,
+          "output_neurons_per_million": 10158
+        },
+        "display": "$0.017 / input \xB7 $0.112 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/zai-org/glm-4.7-flash": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.06,
+            "neurons": 5500,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.4,
+            "neurons": 36400,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.06,
+          "input_neurons_per_million": 5500,
+          "output_usd_per_million": 0.4,
+          "output_neurons_per_million": 36400
+        },
+        "display": "$0.06 / input \xB7 $0.4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/zai-org/glm-5.2": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 1.4,
+            "neurons": 127273,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.26,
+            "neurons": 23636,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4.4,
+            "neurons": 4e5,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 1.4,
+          "input_neurons_per_million": 127273,
+          "output_usd_per_million": 4.4,
+          "output_neurons_per_million": 4e5,
+          "cached_input_usd_per_million": 0.26,
+          "cached_input_neurons_per_million": 23636
+        },
+        "display": "$1.4 / input \xB7 $0.26 / cached input \xB7 $4.4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/zai-org/glm-5.3": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 1.4,
+            "neurons": 127273,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.26,
+            "neurons": 23636,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4.4,
+            "neurons": 4e5,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 1.4,
+          "input_neurons_per_million": 127273,
+          "output_usd_per_million": 4.4,
+          "output_neurons_per_million": 4e5,
+          "cached_input_usd_per_million": 0.26,
+          "cached_input_neurons_per_million": 23636
+        },
+        "display": "$1.4 / input \xB7 $0.26 / cached input \xB7 $4.4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/zai-org/glm-5.3-flash": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.15,
+            "neurons": 13636,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.03,
+            "neurons": 2727,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.5,
+            "neurons": 45455,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.15,
+          "input_neurons_per_million": 13636,
+          "output_usd_per_million": 0.5,
+          "output_neurons_per_million": 45455,
+          "cached_input_usd_per_million": 0.03,
+          "cached_input_neurons_per_million": 2727
+        },
+        "display": "$0.15 / input \xB7 $0.03 / cached input \xB7 $0.5 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/nvidia/nemotron-3-120b-a12b": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.5,
+            "neurons": 45455,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1.5,
+            "neurons": 136364,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.5,
+          "input_neurons_per_million": 45455,
+          "output_usd_per_million": 1.5,
+          "output_neurons_per_million": 136364
+        },
+        "display": "$0.5 / input \xB7 $1.5 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/moonshotai/kimi-k2.5": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.6,
+            "neurons": 54545,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.1,
+            "neurons": 9091,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 3,
+            "neurons": 272727,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.6,
+          "input_neurons_per_million": 54545,
+          "output_usd_per_million": 3,
+          "output_neurons_per_million": 272727,
+          "cached_input_usd_per_million": 0.1,
+          "cached_input_neurons_per_million": 9091
+        },
+        "display": "$0.6 / input \xB7 $0.1 / cached input \xB7 $3 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/moonshotai/kimi-k2.6": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.95,
+            "neurons": 86364,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.16,
+            "neurons": 14545,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4,
+            "neurons": 363636,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.95,
+          "input_neurons_per_million": 86364,
+          "output_usd_per_million": 4,
+          "output_neurons_per_million": 363636,
+          "cached_input_usd_per_million": 0.16,
+          "cached_input_neurons_per_million": 14545
+        },
+        "display": "$0.95 / input \xB7 $0.16 / cached input \xB7 $4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/moonshotai/kimi-k2.7-code": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.95,
+            "neurons": 86364,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.19,
+            "neurons": 17273,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4,
+            "neurons": 363636,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.95,
+          "input_neurons_per_million": 86364,
+          "output_usd_per_million": 4,
+          "output_neurons_per_million": 363636,
+          "cached_input_usd_per_million": 0.19,
+          "cached_input_neurons_per_million": 17273
+        },
+        "display": "$0.95 / input \xB7 $0.19 / cached input \xB7 $4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/google/gemma-4-26b-a4b-it": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.1,
+            "neurons": 9091,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.3,
+            "neurons": 27273,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.1,
+          "input_neurons_per_million": 9091,
+          "output_usd_per_million": 0.3,
+          "output_neurons_per_million": 27273
+        },
+        "display": "$0.1 / input \xB7 $0.3 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/daily-co/phonellm-mini-alpha-2": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.06,
+            "neurons": 5455,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.24,
+            "neurons": 21818,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.06,
+          "input_neurons_per_million": 5455,
+          "output_usd_per_million": 0.24,
+          "output_neurons_per_million": 21818
+        },
+        "display": "$0.06 / input \xB7 $0.24 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/baai/bge-small-en-v1.5": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.02,
+            "neurons": 1841,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.02,
+          "input_neurons_per_million": 1841
+        },
+        "display": "$0.02 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/baai/bge-base-en-v1.5": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.067,
+            "neurons": 6058,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.067,
+          "input_neurons_per_million": 6058
+        },
+        "display": "$0.067 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/baai/bge-large-en-v1.5": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.204,
+            "neurons": 18582,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.204,
+          "input_neurons_per_million": 18582
+        },
+        "display": "$0.204 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/baai/bge-m3": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.012,
+            "neurons": 1075,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.012,
+          "input_neurons_per_million": 1075
+        },
+        "display": "$0.012 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/pfnet/plamo-embedding-1b": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.019,
+            "neurons": 1689,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.019,
+          "input_neurons_per_million": 1689
+        },
+        "display": "$0.019 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/qwen/qwen3-embedding-0.6b": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.012,
+            "neurons": 1075,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.012,
+          "input_neurons_per_million": 1075
+        },
+        "display": "$0.012 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/black-forest-labs/flux-1-schnell": {
+        "items": [
+          {
+            "kind": "image_tile",
+            "usd": 528e-7,
+            "neurons": 4.8,
+            "unit": "per 512x512 tile"
+          },
+          {
+            "kind": "step",
+            "usd": 1056e-7,
+            "neurons": 9.6,
+            "unit": "per step"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0000528 / tile \xB7 $0.0001056 / step",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/leonardo/lucid-origin": {
+        "items": [
+          {
+            "kind": "image_tile",
+            "usd": 6996e-6,
+            "neurons": 636,
+            "unit": "per 512x512 tile"
+          },
+          {
+            "kind": "step",
+            "usd": 132e-6,
+            "neurons": 12,
+            "unit": "per step"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.006996 / tile \xB7 $0.000132 / step",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/leonardo/phoenix-1.0": {
+        "items": [
+          {
+            "kind": "image_tile",
+            "usd": 583e-5,
+            "neurons": 530,
+            "unit": "per 512x512 tile"
+          },
+          {
+            "kind": "step",
+            "usd": 11e-5,
+            "neurons": 10,
+            "unit": "per step"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.00583 / tile \xB7 $0.00011 / step",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/black-forest-labs/flux-2-dev": {
+        "items": [
+          {
+            "kind": "input_image_tile_step",
+            "usd": 21e-5,
+            "neurons": 18.75,
+            "unit": "per input 512x512 tile, per step"
+          },
+          {
+            "kind": "output_image_tile_step",
+            "usd": 41e-5,
+            "neurons": 37.5,
+            "unit": "per output 512x512 tile, per step"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.00021 / input tile/step \xB7 $0.00041 / output tile/step",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/black-forest-labs/flux-2-klein-4b": {
+        "items": [
+          {
+            "kind": "image_tile",
+            "usd": 59e-6,
+            "neurons": 5.37,
+            "unit": "per input 512x512 tile"
+          },
+          {
+            "kind": "image_tile",
+            "usd": 287e-6,
+            "neurons": 26.05,
+            "unit": "per output 512x512 tile"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.000059 / tile \xB7 $0.000287 / tile",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/black-forest-labs/flux-2-klein-9b": {
+        "items": [
+          {
+            "kind": "image_megapixel",
+            "usd": 0.015,
+            "neurons": 1363.64,
+            "unit": "per first MP (1024x1024)"
+          },
+          {
+            "kind": "image_megapixel",
+            "usd": 2e-3,
+            "neurons": 181.82,
+            "unit": "per subsequent MP"
+          },
+          {
+            "kind": "image",
+            "usd": 2e-3,
+            "neurons": 181.82,
+            "unit": "per input image MP"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.015 / MP \xB7 $0.002 / MP \xB7 $0.002 / image",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/openai/whisper": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 5e-4,
+            "neurons": 41.14,
+            "unit": "per audio minute"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0005 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/openai/whisper-large-v3-turbo": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 5e-4,
+            "neurons": 46.63,
+            "unit": "per audio minute"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0005 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/myshell-ai/melotts": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 2e-4,
+            "neurons": 18.63,
+            "unit": "per audio minute"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0002 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/deepgram/aura-1": {
+        "items": [
+          {
+            "kind": "character",
+            "usd": 0.015,
+            "neurons": 1,
+            "unit": "per 1k characters input"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.015 / 1k chars",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/deepgram/nova-3": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 52e-4,
+            "neurons": 472.73,
+            "unit": "per audio minute input"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0052 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/deepgram/nova-3#websocket": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 92e-4,
+            "neurons": 836.36,
+            "unit": "per audio minute input"
+          }
+        ],
+        "display": "$0.0092 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/pipecat-ai/smart-turn-v2": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 33795e-8,
+            "neurons": 0.51,
+            "unit": "per audio minute input"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.00033795 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/deepgram/aura-2-en": {
+        "items": [
+          {
+            "kind": "character",
+            "usd": 0.03,
+            "neurons": 2727.27,
+            "unit": "per 1k characters input"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.03 / 1k chars",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/deepgram/aura-2-es": {
+        "items": [
+          {
+            "kind": "character",
+            "usd": 0.03,
+            "neurons": 2727.27,
+            "unit": "per 1k characters input"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.03 / 1k chars",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/deepgram/flux": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 77e-4,
+            "neurons": 700,
+            "unit": "per audio minute"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0077 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/huggingface/distilbert-sst-2-int8": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.026,
+            "neurons": 2394,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.026,
+          "input_neurons_per_million": 2394
+        },
+        "display": "$0.026 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/baai/bge-reranker-base": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 3e-3,
+            "neurons": 283,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 3e-3,
+          "input_neurons_per_million": 283
+        },
+        "display": "$0.003 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/meta/m2m100-1.2b": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.342,
+            "neurons": 31050,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.342,
+            "neurons": 31050,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.342,
+          "input_neurons_per_million": 31050,
+          "output_usd_per_million": 0.342,
+          "output_neurons_per_million": 31050
+        },
+        "display": "$0.342 / input \xB7 $0.342 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/microsoft/resnet-50": {
+        "items": [
+          {
+            "kind": "image",
+            "usd": 2.51,
+            "neurons": 228055,
+            "unit": "per M images"
+          }
+        ],
+        "tokens": {},
+        "display": "$2.51 / image",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/ai4bharat/indictrans2-en-indic-1B": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.342,
+            "neurons": 31050,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.342,
+            "neurons": 31050,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.342,
+          "input_neurons_per_million": 31050,
+          "output_usd_per_million": 0.342,
+          "output_neurons_per_million": 31050
+        },
+        "display": "$0.342 / input \xB7 $0.342 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/moondream/moondream3.1-9B-A2B": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.3,
+            "neurons": 27273,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1,
+            "neurons": 90909,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.3,
+          "input_neurons_per_million": 27273,
+          "output_usd_per_million": 1,
+          "output_neurons_per_million": 90909
+        },
+        "display": "$0.3 / input \xB7 $1 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/cloudflare/clef": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.24,
+            "neurons": 21818,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.24,
+          "input_neurons_per_million": 21818
+        },
+        "display": "$0.24 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/cloudflare/clef-omni": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.15,
+            "neurons": 13636,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.15,
+          "input_neurons_per_million": 13636
+        },
+        "display": "$0.15 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/cloudflare/clef-flash": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.038,
+            "neurons": 3455,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.038,
+          "input_neurons_per_million": 3455
+        },
+        "display": "$0.038 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "@cf/cloudflare/clairic": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.1,
+            "neurons": 9091,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.1,
+          "input_neurons_per_million": 9091
+        },
+        "display": "$0.1 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      }
+    },
+    "paidOnly": [
+      "@cf/moonshotai/kimi-k2.6",
+      "@cf/moonshotai/kimi-k2.7-code",
+      "@cf/zai-org/glm-5.2",
+      "@cf/zai-org/glm-5.3",
+      "@cf/zai-org/glm-5.3-flash",
+      "@cf/deepseek-ai/deepseek-v4-flash-0731",
+      "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+      "@cf/deepseek-ai/deepseek-v4-pro-0813"
+    ],
+    "freeDailyNeurons": 1e4,
+    "updatedAt": "Oct 20, 2026",
+    "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+  },
+  "models": [
+    {
+      "id": "@cf/zai-org/glm-5.3",
+      "name": "glm-5.3",
+      "author": "Zhipu AI",
+      "task": "text-generation",
+      "description": "GLM-5.3 is Z.ai's flagship agentic coding model, pairing a 1M-token context window with reasoning, function calling, and structured outputs to power multi-step, tool-driven development workflows.",
+      "context_window": 1048576,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": true,
+        "structured_output": true,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 1.4,
+            "neurons": 127273,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.26,
+            "neurons": 23636,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4.4,
+            "neurons": 4e5,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 1.4,
+          "input_neurons_per_million": 127273,
+          "output_usd_per_million": 4.4,
+          "output_neurons_per_million": 4e5,
+          "cached_input_usd_per_million": 0.26,
+          "cached_input_neurons_per_million": 23636
+        },
+        "display": "$1.4 / input \xB7 $0.26 / cached input \xB7 $4.4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": true,
+      "deprecated": false,
+      "free": false,
+      "free_daily_output_tokens": 25e3,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/glm-5.3/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/zai-org/glm-5.3",
+        "glm-5.3"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 62.6,
+        "tier": "B",
+        "basis": [
+          "size unknown",
+          "1049k context",
+          "reasoning",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 76,
+          "context": 100,
+          "recency": 45,
+          "price": 78,
+          "override": null
+        },
+        "rank": 1
+      }
+    },
+    {
+      "id": "@cf/deepseek-ai/deepseek-v4-pro-0813",
+      "name": "deepseek-v4-pro-0813",
+      "author": "DeepSeek",
+      "task": "text-generation",
+      "description": "DeepSeek V4 Pro is a high-capability reasoning model from DeepSeek with a one million token context window, built for long-horizon agentic workflows and complex, multi-step problem-solving",
+      "context_window": 1048576,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 1.32,
+            "neurons": 12e4,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.044,
+            "neurons": 4e3,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 3.96,
+            "neurons": 36e4,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 1.32,
+          "input_neurons_per_million": 12e4,
+          "output_usd_per_million": 3.96,
+          "output_neurons_per_million": 36e4,
+          "cached_input_usd_per_million": 0.044,
+          "cached_input_neurons_per_million": 4e3
+        },
+        "display": "$1.32 / input \xB7 $0.044 / cached input \xB7 $3.96 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": true,
+      "deprecated": false,
+      "free": false,
+      "free_daily_output_tokens": 27777,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/deepseek-v4-pro-0813/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/deepseek-ai/deepseek-v4-pro-0813",
+        "deepseek-v4-pro-0813"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 60.4,
+        "tier": "B",
+        "basis": [
+          "size unknown",
+          "1049k context",
+          "reasoning",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 68,
+          "context": 100,
+          "recency": 45,
+          "price": 77,
+          "override": null
+        },
+        "rank": 2
+      }
+    },
+    {
+      "id": "@cf/moonshotai/kimi-k2.7-code",
+      "name": "kimi-k2.7-code",
+      "author": "Moonshot AI",
+      "task": "text-generation",
+      "description": "Kimi K2.7 is a frontier-scale open-source 1T parameter model with a 262.1k context window, multi-turn tool calling, vision inputs, and structured outputs for agentic workloads.",
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": true,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.95,
+            "neurons": 86364,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.19,
+            "neurons": 17273,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4,
+            "neurons": 363636,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.95,
+          "input_neurons_per_million": 86364,
+          "output_usd_per_million": 4,
+          "output_neurons_per_million": 363636,
+          "cached_input_usd_per_million": 0.19,
+          "cached_input_neurons_per_million": 17273
+        },
+        "display": "$0.95 / input \xB7 $0.19 / cached input \xB7 $4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": true,
+      "deprecated": false,
+      "free": false,
+      "free_daily_output_tokens": 27500,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/kimi-k2.7-code/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/moonshotai/kimi-k2.7-code",
+        "kimi-k2.7-code"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 53.8,
+        "tier": "B",
+        "basis": [
+          "size unknown",
+          "262k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 56,
+          "context": 76,
+          "recency": 45,
+          "price": 77,
+          "override": null
+        },
+        "rank": 3
+      }
+    },
+    {
+      "id": "@cf/moonshotai/kimi-k2.6",
+      "name": "kimi-k2.6",
+      "author": "Moonshot AI",
+      "task": "text-generation",
+      "description": "Kimi K2.6 is a frontier-scale open-source 1T parameter model with a 262.1k context window, multi-turn tool calling, vision inputs, and structured outputs for agentic workloads.",
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": true,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.95,
+            "neurons": 86364,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.16,
+            "neurons": 14545,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4,
+            "neurons": 363636,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.95,
+          "input_neurons_per_million": 86364,
+          "output_usd_per_million": 4,
+          "output_neurons_per_million": 363636,
+          "cached_input_usd_per_million": 0.16,
+          "cached_input_neurons_per_million": 14545
+        },
+        "display": "$0.95 / input \xB7 $0.16 / cached input \xB7 $4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": true,
+      "deprecated": false,
+      "free": false,
+      "free_daily_output_tokens": 27500,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/kimi-k2.6/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/moonshotai/kimi-k2.6",
+        "kimi-k2.6"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 53.8,
+        "tier": "B",
+        "basis": [
+          "size unknown",
+          "262k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 56,
+          "context": 76,
+          "recency": 45,
+          "price": 77,
+          "override": null
+        },
+        "rank": 4
+      }
+    },
+    {
+      "id": "@cf/deepseek-ai/deepseek-v4-flash-0731",
+      "name": "deepseek-v4-flash-0731",
+      "author": "DeepSeek",
+      "task": "text-generation",
+      "description": '"DeepSeek-V4-Flash-0731 is the official release of DeepSeek-V4-Flash, superseding the preview version, with substantially enhanced agentic capabilities. "',
+      "context_window": 1048576,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.44,
+            "neurons": 4e4,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.014,
+            "neurons": 1273,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1.32,
+            "neurons": 12e4,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.44,
+          "input_neurons_per_million": 4e4,
+          "output_usd_per_million": 1.32,
+          "output_neurons_per_million": 12e4,
+          "cached_input_usd_per_million": 0.014,
+          "cached_input_neurons_per_million": 1273
+        },
+        "display": "$0.44 / input \xB7 $0.014 / cached input \xB7 $1.32 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": true,
+      "deprecated": false,
+      "free": false,
+      "free_daily_output_tokens": 83333,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/deepseek-v4-flash-0731/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/deepseek-ai/deepseek-v4-flash-0731",
+        "deepseek-v4-flash-0731"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 53.5,
+        "tier": "B",
+        "basis": [
+          "size unknown",
+          "1049k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 48,
+          "context": 100,
+          "recency": 45,
+          "price": 57,
+          "override": null
+        },
+        "rank": 5
+      }
+    },
+    {
+      "id": "@cf/zai-org/glm-5.2",
+      "name": "glm-5.2",
+      "author": "Zhipu AI",
+      "task": "text-generation",
+      "description": "Z.ai's flagship agentic coding model",
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 1.4,
+            "neurons": 127273,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.26,
+            "neurons": 23636,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4.4,
+            "neurons": 4e5,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 1.4,
+          "input_neurons_per_million": 127273,
+          "output_usd_per_million": 4.4,
+          "output_neurons_per_million": 4e5,
+          "cached_input_usd_per_million": 0.26,
+          "cached_input_neurons_per_million": 23636
+        },
+        "display": "$1.4 / input \xB7 $0.26 / cached input \xB7 $4.4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": true,
+      "deprecated": false,
+      "free": false,
+      "free_daily_output_tokens": 25e3,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/glm-5.2/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/zai-org/glm-5.2",
+        "glm-5.2"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 52,
+        "tier": "B",
+        "basis": [
+          "size unknown",
+          "262k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 48,
+          "context": 76,
+          "recency": 45,
+          "price": 78,
+          "override": null
+        },
+        "rank": 6
+      }
+    },
+    {
+      "id": "@cf/zai-org/glm-4.7-flash",
+      "name": "glm-4.7-flash",
+      "author": "Zhipu AI",
+      "task": "text-generation",
+      "description": "GLM-4.7-Flash is a fast and efficient multilingual text generation model with a 131,072 token context window. Optimized for dialogue, instruction-following, and multi-turn tool calling across 100+ languages.",
+      "context_window": 131072,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": true
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.06,
+            "neurons": 5500,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.4,
+            "neurons": 36400,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.06,
+          "input_neurons_per_million": 5500,
+          "output_usd_per_million": 0.4,
+          "output_neurons_per_million": 36400
+        },
+        "display": "$0.06 / input \xB7 $0.4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 274725,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/glm-4.7-flash/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/zai-org/glm-4.7-flash",
+        "glm-4.7-flash"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 50.9,
+        "tier": "B",
+        "basis": [
+          "size unknown",
+          "131k context",
+          "reasoning",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 68,
+          "context": 63,
+          "recency": 45,
+          "price": 36,
+          "override": null
+        },
+        "rank": 7
+      }
+    },
+    {
+      "id": "@cf/ibm-granite/granite-4.0-h-micro",
+      "name": "granite-4.0-h-micro",
+      "author": "IBM",
+      "task": "text-generation",
+      "description": "Granite 4.0 instruct models deliver strong performance across benchmarks, achieving industry-leading results in key agentic tasks like instruction following and function calling. These efficiencies make the models well-suited for a wide range of use cases like retrieval-augmented generation (RAG), multi-agent workflows, and edge deployments.",
+      "context_window": 131e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.017,
+            "neurons": 1542,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.112,
+            "neurons": 10158,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.017,
+          "input_neurons_per_million": 1542,
+          "output_usd_per_million": 0.112,
+          "output_neurons_per_million": 10158
+        },
+        "display": "$0.017 / input \xB7 $0.112 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 984445,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/granite-4.0-h-micro/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/ibm-granite/granite-4.0-h-micro",
+        "granite-4.0-h-micro"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 43.6,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "131k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 48,
+          "context": 63,
+          "recency": 45,
+          "price": 14,
+          "override": null
+        },
+        "rank": 8
+      }
+    },
+    {
+      "id": "@cf/baai/bge-base-en-v1.5",
+      "name": "bge-base-en-v1.5",
+      "author": "BAAI",
+      "task": "text-embeddings",
+      "description": "BAAI general embedding (Base) model that transforms any given text into a 768-dimensional vector",
+      "context_window": 153600,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.067,
+            "neurons": 6058,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.067,
+          "input_neurons_per_million": 6058
+        },
+        "display": "$0.067 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 1650709,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/bge-base-en-v1.5/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/embeddings",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/baai/bge-base-en-v1.5",
+        "bge-base-en-v1.5"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 42.7,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "154k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 66,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 9
+      }
+    },
+    {
+      "id": "@cf/nvidia/nemotron-3-120b-a12b",
+      "name": "nemotron-3-120b-a12b",
+      "author": "NVIDIA",
+      "task": "text-generation",
+      "description": "NVIDIA Nemotron 3 Super is a hybrid MoE model with leading accuracy for multi-agent applications and specialized agentic AI systems.",
+      "context_window": 256e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.5,
+            "neurons": 45455,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1.5,
+            "neurons": 136364,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.5,
+          "input_neurons_per_million": 45455,
+          "output_usd_per_million": 1.5,
+          "output_neurons_per_million": 136364
+        },
+        "display": "$0.5 / input \xB7 $1.5 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 73333,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/nemotron-3-120b-a12b/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/nvidia/nemotron-3-120b-a12b",
+        "nemotron-3-120b-a12b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 41,
+        "tier": "C",
+        "basis": [
+          "12B active",
+          "256k context",
+          "reasoning",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 68,
+          "context": 75,
+          "recency": 45,
+          "price": 60,
+          "override": null
+        },
+        "rank": 10
+      }
+    },
+    {
+      "id": "@cf/cloudflare/clairic",
+      "name": "clairic",
+      "author": "Cloudflare",
+      "task": "text-generation",
+      "description": "Clairic is a System One-style model that can extract, compute, estimate, and forecast values from inputs. It is strongly typed and outputs confidence scores and probabilities against its outputs. This model is in preview from the Cloudflare Workers AI team.",
+      "context_window": 65536,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.1,
+            "neurons": 9091,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.1,
+          "input_neurons_per_million": 9091
+        },
+        "display": "$0.1 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 1099989,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/clairic/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/cloudflare/clairic",
+        "clairic"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 40.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "66k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 51,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 11
+      }
+    },
+    {
+      "id": "@cf/baai/bge-m3",
+      "name": "bge-m3",
+      "author": "BAAI",
+      "task": "text-embeddings",
+      "description": "Multi-Functionality, Multi-Linguality, and Multi-Granularity embeddings model.",
+      "context_window": 6e4,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.012,
+            "neurons": 1075,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.012,
+          "input_neurons_per_million": 1075
+        },
+        "display": "$0.012 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 9302325,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/bge-m3/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/embeddings",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/baai/bge-m3",
+        "bge-m3"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 40.1,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "60k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 49,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 12
+      }
+    },
+    {
+      "id": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+      "name": "deepseek-v4.1-flash-1017",
+      "author": "DeepSeek",
+      "task": "text-generation",
+      "description": "We introduce DeepSeek-V4.1-Flash, a multimodal Mixture-of-Experts (MoE) model with 552B backbone parameters and support for contexts of up to one million tokens. The model natively processes images and text, and generates text autoregressively.",
+      "context_window": 1048576,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.3,
+            "neurons": 27273,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 6e-3,
+            "neurons": 545,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1.2,
+            "neurons": 109091,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.3,
+          "input_neurons_per_million": 27273,
+          "output_usd_per_million": 1.2,
+          "output_neurons_per_million": 109091,
+          "cached_input_usd_per_million": 6e-3,
+          "cached_input_neurons_per_million": 545
+        },
+        "display": "$0.3 / input \xB7 $0.006 / cached input \xB7 $1.2 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": true,
+      "deprecated": false,
+      "free": false,
+      "free_daily_output_tokens": 91666,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/deepseek-v4.1-flash-1017/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+        "deepseek-v4.1-flash-1017"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 39.3,
+        "tier": "C",
+        "basis": [
+          "552B parameters",
+          "1049k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 48,
+          "context": 100,
+          "recency": 45,
+          "price": 56,
+          "override": null
+        },
+        "rank": 13
+      }
+    },
+    {
+      "id": "@cf/deepgram/aura-2-es",
+      "name": "aura-2-es",
+      "author": "Deepgram",
+      "task": "text-to-speech",
+      "description": "Aura-2 is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "audio"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": true,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "character",
+            "usd": 0.03,
+            "neurons": 2727.27,
+            "unit": "per 1k characters input"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.03 / 1k chars",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-2-es/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/audio/speech",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/deepgram/aura-2-es",
+        "aura-2-es"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 38.8,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 36,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 14
+      }
+    },
+    {
+      "id": "@cf/deepgram/aura-2-en",
+      "name": "aura-2-en",
+      "author": "Deepgram",
+      "task": "text-to-speech",
+      "description": "Aura-2 is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "audio"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": true,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "character",
+            "usd": 0.03,
+            "neurons": 2727.27,
+            "unit": "per 1k characters input"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.03 / 1k chars",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-2-en/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/audio/speech",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/deepgram/aura-2-en",
+        "aura-2-en"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 38.8,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 36,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 15
+      }
+    },
+    {
+      "id": "@cf/deepgram/flux",
+      "name": "flux",
+      "author": "Deepgram",
+      "task": "automatic-speech-recognition",
+      "description": "Flux is the first conversational speech recognition model built specifically for voice agents.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "audio"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": true,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 77e-4,
+            "neurons": 700,
+            "unit": "per audio minute"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0077 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/flux/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/audio/transcriptions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/deepgram/flux",
+        "flux"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 38.8,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 36,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 16
+      }
+    },
+    {
+      "id": "@cf/deepgram/aura-1",
+      "name": "aura-1",
+      "author": "Deepgram",
+      "task": "text-to-speech",
+      "description": "Aura is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "audio"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": true,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "character",
+            "usd": 0.015,
+            "neurons": 1,
+            "unit": "per 1k characters input"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.015 / 1k chars",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-1/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/audio/speech",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/deepgram/aura-1",
+        "aura-1"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 38.8,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 36,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 17
+      }
+    },
+    {
+      "id": "@cf/myshell-ai/melotts",
+      "name": "melotts",
+      "author": "MyShell",
+      "task": "text-to-speech",
+      "description": "MeloTTS is a high-quality multi-lingual text-to-speech library by MyShell.ai.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "audio"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": true,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 2e-4,
+            "neurons": 18.63,
+            "unit": "per audio minute"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0002 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/melotts/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/audio/speech",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/myshell-ai/melotts",
+        "melotts"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 38.8,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 36,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 18
+      }
+    },
+    {
+      "id": "@cf/deepgram/nova-3",
+      "name": "nova-3",
+      "author": "Deepgram",
+      "task": "automatic-speech-recognition",
+      "description": "Transcribe audio using Deepgram\u2019s speech-to-text model",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "audio"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": true,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 52e-4,
+            "neurons": 472.73,
+            "unit": "per audio minute input"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0052 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/nova-3/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/audio/transcriptions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/deepgram/nova-3",
+        "nova-3"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 38.8,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 36,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 19
+      }
+    },
+    {
+      "id": "@cf/openai/whisper",
+      "name": "whisper",
+      "author": "OpenAI",
+      "task": "automatic-speech-recognition",
+      "description": "Whisper is a general-purpose speech recognition model. It is trained on a large dataset of diverse audio and is also a multitasking model that can perform multilingual speech recognition, speech translation, and language identification.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "audio"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": true,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": true
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 5e-4,
+            "neurons": 41.14,
+            "unit": "per audio minute"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0005 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/whisper/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/audio/transcriptions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/openai/whisper",
+        "whisper"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 38.8,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 36,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 20
+      }
+    },
+    {
+      "id": "@cf/openai/whisper-tiny-en",
+      "name": "whisper-tiny-en",
+      "author": "OpenAI",
+      "task": "automatic-speech-recognition",
+      "description": "Whisper is a pre-trained model for automatic speech recognition (ASR) and speech translation. Trained on 680k hours of labelled data, Whisper models demonstrate a strong ability to generalize to many datasets and domains without the need for fine-tuning. This is the English-only version of the Whisper Tiny model which was trained on the task of speech recognition.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "audio"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": true,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/whisper-tiny-en/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/audio/transcriptions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/openai/whisper-tiny-en",
+        "whisper-tiny-en"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 38.8,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 36,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 21
+      }
+    },
+    {
+      "id": "@cf/openai/whisper-large-v3-turbo",
+      "name": "whisper-large-v3-turbo",
+      "author": "OpenAI",
+      "task": "automatic-speech-recognition",
+      "description": '"Whisper is a pre-trained model for automatic speech recognition (ASR) and speech translation. "',
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "audio"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": true,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 5e-4,
+            "neurons": 46.63,
+            "unit": "per audio minute"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0005 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/whisper-large-v3-turbo/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/audio/transcriptions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/openai/whisper-large-v3-turbo",
+        "whisper-large-v3-turbo"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 38.8,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 36,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 22
+      }
+    },
+    {
+      "id": "@cf/google/gemma-4-26b-a4b-it",
+      "name": "gemma-4-26b-a4b-it",
+      "author": "Google",
+      "task": "text-generation",
+      "description": "Gemma 4 is Google's most intelligent family of open models, built from Gemini 3 research to maximize intelligence-per-parameter.",
+      "context_window": 256e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.1,
+            "neurons": 9091,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.3,
+            "neurons": 27273,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.1,
+          "input_neurons_per_million": 9091,
+          "output_usd_per_million": 0.3,
+          "output_neurons_per_million": 27273
+        },
+        "display": "$0.1 / input \xB7 $0.3 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 366663,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/gemma-4-26b-a4b-it/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/google/gemma-4-26b-a4b-it",
+        "gemma-4-26b-a4b-it"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 38.2,
+        "tier": "C",
+        "basis": [
+          "4B active",
+          "256k context",
+          "reasoning",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 68,
+          "context": 75,
+          "recency": 45,
+          "price": 31,
+          "override": null
+        },
+        "rank": 23
+      }
+    },
+    {
+      "id": "@cf/daily-co/phonellm-mini-alpha-2",
+      "name": "phonellm-mini-alpha-2",
+      "author": "daily-co",
+      "task": "text-generation",
+      "description": "PhoneLLM is an open model tuned for voice agents. The model is based on Nemotron Nano 30B base capabilities and excels at typical voice agent tasks with thinking disabled.",
+      "context_window": 262140,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.06,
+            "neurons": 5455,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.24,
+            "neurons": 21818,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.06,
+          "input_neurons_per_million": 5455,
+          "output_usd_per_million": 0.24,
+          "output_neurons_per_million": 21818
+        },
+        "display": "$0.06 / input \xB7 $0.24 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 458337,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/phonellm-mini-alpha-2/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/daily-co/phonellm-mini-alpha-2",
+        "phonellm-mini-alpha-2"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.9,
+        "tier": "C",
+        "basis": [
+          "30B parameters",
+          "262k context",
+          "reasoning",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 68,
+          "context": 76,
+          "recency": 45,
+          "price": 28,
+          "override": null
+        },
+        "rank": 24
+      }
+    },
+    {
+      "id": "@cf/openai/gpt-oss-120b",
+      "name": "gpt-oss-120b",
+      "author": "OpenAI",
+      "task": "text-generation",
+      "description": "OpenAI\u2019s open-weight models designed for powerful reasoning, agentic tasks, and versatile developer use cases \u2013 gpt-oss-120b is for production, general purpose, high reasoning use-cases.",
+      "context_window": 128e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.35,
+            "neurons": 31818,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.75,
+            "neurons": 68182,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.35,
+          "input_neurons_per_million": 31818,
+          "output_usd_per_million": 0.75,
+          "output_neurons_per_million": 68182
+        },
+        "display": "$0.35 / input \xB7 $0.75 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 146666,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/gpt-oss-120b/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/openai/gpt-oss-120b",
+        "gpt-oss-120b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.9,
+        "tier": "C",
+        "basis": [
+          "120B parameters",
+          "128k context",
+          "reasoning",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 68,
+          "context": 63,
+          "recency": 45,
+          "price": 47,
+          "override": null
+        },
+        "rank": 25
+      }
+    },
+    {
+      "id": "@cf/zai-org/glm-5.3-flash",
+      "name": "glm-5.3-flash",
+      "author": "Zhipu AI",
+      "task": "text-generation",
+      "description": "The first natively multimodal model in the GLM-5 series. With 320B total parameters and just 18B active parameters, it outperforms GLM-5.2 across benchmarks and real-world workloads at one-tenth the price, while approaching Claude Opus 4.8 on coding and agentic benchmarks.",
+      "context_window": 1048576,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.15,
+            "neurons": 13636,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.03,
+            "neurons": 2727,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.5,
+            "neurons": 45455,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.15,
+          "input_neurons_per_million": 13636,
+          "output_usd_per_million": 0.5,
+          "output_neurons_per_million": 45455,
+          "cached_input_usd_per_million": 0.03,
+          "cached_input_neurons_per_million": 2727
+        },
+        "display": "$0.15 / input \xB7 $0.03 / cached input \xB7 $0.5 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": true,
+      "deprecated": false,
+      "free": false,
+      "free_daily_output_tokens": 219997,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/glm-5.3-flash/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/zai-org/glm-5.3-flash",
+        "glm-5.3-flash"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.8,
+        "tier": "C",
+        "basis": [
+          "320B parameters",
+          "1049k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 48,
+          "context": 100,
+          "recency": 45,
+          "price": 40,
+          "override": null
+        },
+        "rank": 26
+      }
+    },
+    {
+      "id": "@cf/qwen/qwen3.8-27b",
+      "name": "qwen3.8-27b",
+      "author": "Qwen",
+      "task": "text-generation",
+      "description": "Qwen 3.8 27B is a 27-billion-parameter instruction-tuned language model from Alibaba's Qwen family, designed for vision, efficient general-purpose text generation and agentic workloads.",
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.45,
+            "neurons": 40909,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 3.2,
+            "neurons": 290909,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.45,
+          "input_neurons_per_million": 40909,
+          "output_usd_per_million": 3.2,
+          "output_neurons_per_million": 290909
+        },
+        "display": "$0.45 / input \xB7 $3.2 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 34375,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/qwen3.8-27b/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/qwen/qwen3.8-27b",
+        "qwen3.8-27b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.4,
+        "tier": "C",
+        "basis": [
+          "27B parameters",
+          "262k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 48,
+          "context": 76,
+          "recency": 45,
+          "price": 73,
+          "override": null
+        },
+        "rank": 27
+      }
+    },
+    {
+      "id": "@cf/baai/bge-large-en-v1.5",
+      "name": "bge-large-en-v1.5",
+      "author": "BAAI",
+      "task": "text-embeddings",
+      "description": "BAAI general embedding (Large) model that transforms any given text into a 1024-dimensional vector",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.204,
+            "neurons": 18582,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.204,
+          "input_neurons_per_million": 18582
+        },
+        "display": "$0.204 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 538155,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/bge-large-en-v1.5/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/embeddings",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/baai/bge-large-en-v1.5",
+        "bge-large-en-v1.5"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 28
+      }
+    },
+    {
+      "id": "@cf/baai/bge-reranker-base",
+      "name": "bge-reranker-base",
+      "author": "BAAI",
+      "task": "text-classification",
+      "description": '"Different from embedding model, reranker uses question and document as input and directly output similarity instead of embedding. You can get a relevance score by inputting query and passage to the reranker. And the score can be mapped to a float value in [0,1] by sigmoid function.\\n\\n"',
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 3e-3,
+            "neurons": 283,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 3e-3,
+          "input_neurons_per_million": 283
+        },
+        "display": "$0.003 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 35335689,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/bge-reranker-base/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/baai/bge-reranker-base",
+        "bge-reranker-base"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 29
+      }
+    },
+    {
+      "id": "@cf/baai/bge-small-en-v1.5",
+      "name": "bge-small-en-v1.5",
+      "author": "BAAI",
+      "task": "text-embeddings",
+      "description": "BAAI general embedding (Small) model that transforms any given text into a 384-dimensional vector",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.02,
+            "neurons": 1841,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.02,
+          "input_neurons_per_million": 1841
+        },
+        "display": "$0.02 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 5431830,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/bge-small-en-v1.5/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/embeddings",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/baai/bge-small-en-v1.5",
+        "bge-small-en-v1.5"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 30
+      }
+    },
+    {
+      "id": "@cf/google/embeddinggemma-300m",
+      "name": "embeddinggemma-300m",
+      "author": "Google",
+      "task": "text-embeddings",
+      "description": "EmbeddingGemma is a 300M parameter, state-of-the-art for its size, open embedding model from Google, built from Gemma 3 (with T5Gemma initialization) and the same research and technology used to create Gemini models. EmbeddingGemma produces vector representations of text, making it well-suited for search and retrieval tasks, including classification, clustering, and semantic similarity search. This model was trained with data in 100+ spoken languages.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/embeddinggemma-300m/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/embeddings",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/google/embeddinggemma-300m",
+        "embeddinggemma-300m"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 31
+      }
+    },
+    {
+      "id": "@cf/huggingface/distilbert-sst-2-int8",
+      "name": "distilbert-sst-2-int8",
+      "author": "HuggingFace",
+      "task": "text-classification",
+      "description": "Distilled BERT model that was finetuned on SST-2 for sentiment classification",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.026,
+            "neurons": 2394,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.026,
+          "input_neurons_per_million": 2394
+        },
+        "display": "$0.026 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 4177109,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/distilbert-sst-2-int8/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/huggingface/distilbert-sst-2-int8",
+        "distilbert-sst-2-int8"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 32
+      }
+    },
+    {
+      "id": "@cf/lykon/dreamshaper-8-lcm",
+      "name": "dreamshaper-8-lcm",
+      "author": "lykon",
+      "task": "text-to-image",
+      "description": "Stable Diffusion model that has been fine-tuned to be better at photorealism without sacrificing range.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/dreamshaper-8-lcm/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/lykon/dreamshaper-8-lcm",
+        "dreamshaper-8-lcm"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 33
+      }
+    },
+    {
+      "id": "@cf/black-forest-labs/flux-1-schnell",
+      "name": "flux-1-schnell",
+      "author": "Black Forest Labs",
+      "task": "text-to-image",
+      "description": '"FLUX.1 [schnell] is a 12 billion parameter rectified flow transformer capable of generating images from text descriptions. "',
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "image_tile",
+            "usd": 528e-7,
+            "neurons": 4.8,
+            "unit": "per 512x512 tile"
+          },
+          {
+            "kind": "step",
+            "usd": 1056e-7,
+            "neurons": 9.6,
+            "unit": "per step"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0000528 / tile \xB7 $0.0001056 / step",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-1-schnell/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/black-forest-labs/flux-1-schnell",
+        "flux-1-schnell"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 34
+      }
+    },
+    {
+      "id": "@cf/black-forest-labs/flux-2-dev",
+      "name": "flux-2-dev",
+      "author": "Black Forest Labs",
+      "task": "text-to-image",
+      "description": "FLUX.2 [dev] is an image model from Black Forest Labs where you can generate highly realistic and detailed images, with multi-reference support.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_image_tile_step",
+            "usd": 21e-5,
+            "neurons": 18.75,
+            "unit": "per input 512x512 tile, per step"
+          },
+          {
+            "kind": "output_image_tile_step",
+            "usd": 41e-5,
+            "neurons": 37.5,
+            "unit": "per output 512x512 tile, per step"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.00021 / input tile/step \xB7 $0.00041 / output tile/step",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-2-dev/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/black-forest-labs/flux-2-dev",
+        "flux-2-dev"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 35
+      }
+    },
+    {
+      "id": "@cf/leonardo/lucid-origin",
+      "name": "lucid-origin",
+      "author": "Leonardo",
+      "task": "text-to-image",
+      "description": `"Lucid Origin from Leonardo.AI is their most adaptable and prompt-responsive model to date. Whether you're generating images with sharp graphic design, stunning full-HD renders, or highly specific creative direction, it adheres closely to your prompts, renders text with accuracy, and supports a wide array of visual styles and aesthetics \u2013 from stylized concept art to crisp product mockups.\\n"`,
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "image_tile",
+            "usd": 6996e-6,
+            "neurons": 636,
+            "unit": "per 512x512 tile"
+          },
+          {
+            "kind": "step",
+            "usd": 132e-6,
+            "neurons": 12,
+            "unit": "per step"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.006996 / tile \xB7 $0.000132 / step",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/lucid-origin/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/leonardo/lucid-origin",
+        "lucid-origin"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 36
+      }
+    },
+    {
+      "id": "@cf/leonardo/phoenix-1.0",
+      "name": "phoenix-1.0",
+      "author": "Leonardo",
+      "task": "text-to-image",
+      "description": "Phoenix 1.0 is a model by Leonardo.Ai that generates images with exceptional prompt adherence and coherent text.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "image_tile",
+            "usd": 583e-5,
+            "neurons": 530,
+            "unit": "per 512x512 tile"
+          },
+          {
+            "kind": "step",
+            "usd": 11e-5,
+            "neurons": 10,
+            "unit": "per step"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.00583 / tile \xB7 $0.00011 / step",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/phoenix-1.0/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/leonardo/phoenix-1.0",
+        "phoenix-1.0"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 37
+      }
+    },
+    {
+      "id": "@cf/pipecat-ai/smart-turn-v2",
+      "name": "smart-turn-v2",
+      "author": "Pipecat",
+      "task": "dumb-pipe",
+      "description": "An open source, community-driven, native audio turn detection model in 2nd version",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "audio_minute",
+            "usd": 33795e-8,
+            "neurons": 0.51,
+            "unit": "per audio minute input"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.00033795 / audio minute",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/smart-turn-v2/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/pipecat-ai/smart-turn-v2",
+        "smart-turn-v2"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 38
+      }
+    },
+    {
+      "id": "@cf/runwayml/stable-diffusion-v1-5-inpainting",
+      "name": "stable-diffusion-v1-5-inpainting",
+      "author": "RunwayML",
+      "task": "text-to-image",
+      "description": "Stable Diffusion Inpainting is a latent text-to-image diffusion model capable of generating photo-realistic images given any text input, with the extra capability of inpainting the pictures by using a mask.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/stable-diffusion-v1-5-inpainting/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/runwayml/stable-diffusion-v1-5-inpainting",
+        "stable-diffusion-v1-5-inpainting"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 39
+      }
+    },
+    {
+      "id": "@cf/microsoft/resnet-50",
+      "name": "resnet-50",
+      "author": "Microsoft",
+      "task": "image-classification",
+      "description": "50 layers deep image classification CNN trained on more than 1M images from ImageNet",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "image",
+            "usd": 2.51,
+            "neurons": 228055,
+            "unit": "per M images"
+          }
+        ],
+        "tokens": {},
+        "display": "$2.51 / image",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/resnet-50/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/microsoft/resnet-50",
+        "resnet-50"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 40
+      }
+    },
+    {
+      "id": "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+      "name": "stable-diffusion-xl-base-1.0",
+      "author": "Stability.ai",
+      "task": "text-to-image",
+      "description": "Diffusion-based text-to-image generative model by Stability AI. Generates and modify images based on text prompts.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/stable-diffusion-xl-base-1.0/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/stabilityai/stable-diffusion-xl-base-1.0",
+        "stable-diffusion-xl-base-1.0"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 41
+      }
+    },
+    {
+      "id": "@cf/bytedance/stable-diffusion-xl-lightning",
+      "name": "stable-diffusion-xl-lightning",
+      "author": "ByteDance",
+      "task": "text-to-image",
+      "description": "SDXL-Lightning is a lightning-fast text-to-image generation model. It can generate high-quality 1024px images in a few steps.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/stable-diffusion-xl-lightning/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/bytedance/stable-diffusion-xl-lightning",
+        "stable-diffusion-xl-lightning"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 42
+      }
+    },
+    {
+      "id": "@cf/openai/gpt-oss-20b",
+      "name": "gpt-oss-20b",
+      "author": "OpenAI",
+      "task": "text-generation",
+      "description": "OpenAI\u2019s open-weight models designed for powerful reasoning, agentic tasks, and versatile developer use cases \u2013 gpt-oss-20b is for lower latency, and local or specialized use-cases.",
+      "context_window": 128e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.2,
+            "neurons": 18182,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.3,
+            "neurons": 27273,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.2,
+          "input_neurons_per_million": 18182,
+          "output_usd_per_million": 0.3,
+          "output_neurons_per_million": 27273
+        },
+        "display": "$0.2 / input \xB7 $0.3 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 366663,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/gpt-oss-20b/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/openai/gpt-oss-20b",
+        "gpt-oss-20b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 36.3,
+        "tier": "C",
+        "basis": [
+          "20B parameters",
+          "128k context",
+          "reasoning",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 68,
+          "context": 63,
+          "recency": 45,
+          "price": 31,
+          "override": null
+        },
+        "rank": 43
+      }
+    },
+    {
+      "id": "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+      "name": "deepseek-r1-distill-qwen-32b",
+      "author": "DeepSeek",
+      "task": "text-generation",
+      "description": "DeepSeek-R1-Distill-Qwen-32B is a model distilled from DeepSeek-R1 based on Qwen2.5. It outperforms OpenAI-o1-mini across various benchmarks, achieving new state-of-the-art results for dense models.",
+      "context_window": 8e4,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.497,
+            "neurons": 45170,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4.881,
+            "neurons": 443756,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.497,
+          "input_neurons_per_million": 45170,
+          "output_usd_per_million": 4.881,
+          "output_neurons_per_million": 443756
+        },
+        "display": "$0.497 / input \xB7 $4.881 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 22534,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/deepseek-r1-distill-qwen-32b/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+        "deepseek-r1-distill-qwen-32b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 35.4,
+        "tier": "C",
+        "basis": [
+          "32B parameters",
+          "80k context",
+          "reasoning",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 50,
+          "context": 54,
+          "recency": 45,
+          "price": 80,
+          "override": null
+        },
+        "rank": 44
+      }
+    },
+    {
+      "id": "@cf/swiss-ai/apertus-v1.5-8b",
+      "name": "apertus-v1.5-8b",
+      "author": "swiss-ai",
+      "task": "text-generation",
+      "description": '"Apertus 1.5 is an 8B parameter language model designed to advance the state of multilingual, multimodal, fully open, and transparent AI. The models support a wide range of languages, handle contexts of up to 262,144 tokens, and it uses only fully open training data whilst delivering performance comparable to other models of similar size. For access, please fill out this form: https://forms.gle/kgvmkr6ucHN3xNuH6"',
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": true
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/apertus-v1.5-8b/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/swiss-ai/apertus-v1.5-8b",
+        "apertus-v1.5-8b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 34.6,
+        "tier": "D",
+        "basis": [
+          "8B parameters",
+          "262k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 48,
+          "context": 76,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 45
+      }
+    },
+    {
+      "id": "@cf/moondream/moondream3.1-9B-A2B",
+      "name": "moondream3.1-9B-A2B",
+      "author": "moondream",
+      "task": "image-to-text",
+      "description": "Moondream 3 is a fast, efficient 9B mixture-of-experts vision language model (2B active parameters) that delivers frontier-level visual reasoning for tasks like object detection, pointing, OCR, and structured output.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": true,
+        "structured_output": true,
+        "vision": true,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.3,
+            "neurons": 27273,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1,
+            "neurons": 90909,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.3,
+          "input_neurons_per_million": 27273,
+          "output_usd_per_million": 1,
+          "output_neurons_per_million": 90909
+        },
+        "display": "$0.3 / input \xB7 $1 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 11e4,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/moondream3.1-9B-A2B/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/moondream/moondream3.1-9B-A2B",
+        "moondream3.1-9B-A2B"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 33.5,
+        "tier": "D",
+        "basis": [
+          "2B active",
+          "context unknown",
+          "reasoning",
+          "vision",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 68,
+          "context": 30,
+          "recency": 45,
+          "price": 53,
+          "override": null
+        },
+        "rank": 46
+      }
+    },
+    {
+      "id": "@cf/meta/llama-4-scout-17b-16e-instruct",
+      "name": "llama-4-scout-17b-16e-instruct",
+      "author": "Meta",
+      "task": "text-generation",
+      "description": "Meta's Llama 4 Scout is a 17 billion parameter model with 16 experts that is natively multimodal. These models leverage a mixture-of-experts architecture to offer industry-leading performance in text and image understanding.",
+      "context_window": 131e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.27,
+            "neurons": 24545,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.85,
+            "neurons": 77273,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.27,
+          "input_neurons_per_million": 24545,
+          "output_usd_per_million": 0.85,
+          "output_neurons_per_million": 77273
+        },
+        "display": "$0.27 / input \xB7 $0.85 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 129411,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/llama-4-scout-17b-16e-instruct/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/meta/llama-4-scout-17b-16e-instruct",
+        "llama-4-scout-17b-16e-instruct"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 33.2,
+        "tier": "D",
+        "basis": [
+          "17B parameters",
+          "131k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 48,
+          "context": 63,
+          "recency": 45,
+          "price": 50,
+          "override": null
+        },
+        "rank": 47
+      }
+    },
+    {
+      "id": "@cf/meta/llama-3.2-11b-vision-instruct",
+      "name": "llama-3.2-11b-vision-instruct",
+      "author": "Meta",
+      "task": "text-generation",
+      "description": '" The Llama 3.2-Vision instruction-tuned models are optimized for visual recognition, image reasoning, captioning, and answering general questions about an image."',
+      "context_window": 128e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.049,
+            "neurons": 4410,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.676,
+            "neurons": 61493,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.049,
+          "input_neurons_per_million": 4410,
+          "output_usd_per_million": 0.676,
+          "output_neurons_per_million": 61493
+        },
+        "display": "$0.049 / input \xB7 $0.676 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 162620,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/llama-3.2-11b-vision-instruct/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/meta/llama-3.2-11b-vision-instruct",
+        "llama-3.2-11b-vision-instruct"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 33.2,
+        "tier": "D",
+        "basis": [
+          "11B parameters",
+          "128k context",
+          "reasoning",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 50,
+          "context": 63,
+          "recency": 45,
+          "price": 46,
+          "override": null
+        },
+        "rank": 48
+      }
+    },
+    {
+      "id": "@cf/qwen/qwen3-30b-a3b-fp8",
+      "name": "qwen3-30b-a3b-fp8",
+      "author": "Qwen",
+      "task": "text-generation",
+      "description": "Qwen3 is the latest generation of large language models in Qwen series, offering a comprehensive suite of dense and mixture-of-experts (MoE) models. Built upon extensive training, Qwen3 delivers groundbreaking advancements in reasoning, instruction-following, agent capabilities, and multilingual support.",
+      "context_window": 32768,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": true
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.051,
+            "neurons": 4625,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.335,
+            "neurons": 30475,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.051,
+          "input_neurons_per_million": 4625,
+          "output_usd_per_million": 0.335,
+          "output_neurons_per_million": 30475
+        },
+        "display": "$0.051 / input \xB7 $0.335 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 328137,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/qwen3-30b-a3b-fp8/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/qwen/qwen3-30b-a3b-fp8",
+        "qwen3-30b-a3b-fp8"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 32.8,
+        "tier": "D",
+        "basis": [
+          "3B active",
+          "33k context",
+          "reasoning",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 68,
+          "context": 38,
+          "recency": 45,
+          "price": 33,
+          "override": null
+        },
+        "rank": 49
+      }
+    },
+    {
+      "id": "@cf/mistralai/mistral-small-3.1-24b-instruct",
+      "name": "mistral-small-3.1-24b-instruct",
+      "author": "MistralAI",
+      "task": "text-generation",
+      "description": "Building upon Mistral Small 3 (2501), Mistral Small 3.1 (2503) adds state-of-the-art vision understanding and enhances long context capabilities up to 128k tokens without compromising text performance. With 24 billion parameters, this model achieves top-tier capabilities in both text and vision tasks.",
+      "context_window": 128e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.351,
+            "neurons": 31876,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.555,
+            "neurons": 50488,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.351,
+          "input_neurons_per_million": 31876,
+          "output_usd_per_million": 0.555,
+          "output_neurons_per_million": 50488
+        },
+        "display": "$0.351 / input \xB7 $0.555 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 198066,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/mistral-small-3.1-24b-instruct/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/mistralai/mistral-small-3.1-24b-instruct",
+        "mistral-small-3.1-24b-instruct"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 32.4,
+        "tier": "D",
+        "basis": [
+          "24B parameters",
+          "128k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 48,
+          "context": 63,
+          "recency": 45,
+          "price": 42,
+          "override": null
+        },
+        "rank": 50
+      }
+    },
+    {
+      "id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      "name": "llama-3.3-70b-instruct-fp8-fast",
+      "author": "Meta",
+      "task": "text-generation",
+      "description": "Llama 3.3 70B quantized to fp8 precision, optimized to be faster.",
+      "context_window": 24e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.293,
+            "neurons": 26668,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 2.253,
+            "neurons": 204805,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.293,
+          "input_neurons_per_million": 26668,
+          "output_usd_per_million": 2.253,
+          "output_neurons_per_million": 204805
+        },
+        "display": "$0.293 / input \xB7 $2.253 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 48826,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/llama-3.3-70b-instruct-fp8-fast/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "llama-3.3-70b-instruct-fp8-fast"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 30.3,
+        "tier": "D",
+        "basis": [
+          "70B parameters",
+          "24k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 48,
+          "context": 32,
+          "recency": 45,
+          "price": 67,
+          "override": null
+        },
+        "rank": 51
+      }
+    },
+    {
+      "id": "@cf/qwen/qwq-32b",
+      "name": "qwq-32b",
+      "author": "Qwen",
+      "task": "text-generation",
+      "description": "QwQ is the reasoning model of the Qwen series. Compared with conventional instruction-tuned models, QwQ, which is capable of thinking and reasoning, can achieve significantly enhanced performance in downstream tasks, especially hard problems. QwQ-32B is the medium-sized reasoning model, which is capable of achieving competitive performance against state-of-the-art reasoning models, e.g., DeepSeek-R1, o1-mini.",
+      "context_window": 24e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": true,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.66,
+            "neurons": 6e4,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1,
+            "neurons": 90909,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.66,
+          "input_neurons_per_million": 6e4,
+          "output_usd_per_million": 1,
+          "output_neurons_per_million": 90909
+        },
+        "display": "$0.66 / input \xB7 $1 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 11e4,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/qwq-32b/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/qwen/qwq-32b",
+        "qwq-32b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 29.4,
+        "tier": "D",
+        "basis": [
+          "32B parameters",
+          "24k context",
+          "reasoning",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 50,
+          "context": 32,
+          "recency": 45,
+          "price": 53,
+          "override": null
+        },
+        "rank": 52
+      }
+    },
+    {
+      "id": "@cf/utter-project/eurollm-9b-it",
+      "name": "eurollm-9b-it",
+      "author": "utter-project",
+      "task": "text-generation",
+      "description": '"EuroLLM-9B is a 9B parameter model trained on 4 trillion tokens divided across the considered languages and several data sources: Web data, parallel data (en-xx and xx-en), and high-quality datasets. For access, please fill out this form: https://forms.gle/kgvmkr6ucHN3xNuH6"',
+      "context_window": 32e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/eurollm-9b-it/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/utter-project/eurollm-9b-it",
+        "eurollm-9b-it"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 28.9,
+        "tier": "D",
+        "basis": [
+          "9B parameters",
+          "32k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 48,
+          "context": 38,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 53
+      }
+    },
+    {
+      "id": "@cf/aisingapore/gemma-sea-lion-v4-27b-it",
+      "name": "gemma-sea-lion-v4-27b-it",
+      "author": "aisingapore",
+      "task": "text-generation",
+      "description": "SEA-LION stands for Southeast Asian Languages In One Network, which is a collection of Large Language Models (LLMs) which have been pretrained and instruct-tuned for the Southeast Asia (SEA) region.",
+      "context_window": 128e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.351,
+            "neurons": 31876,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.555,
+            "neurons": 50488,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.351,
+          "input_neurons_per_million": 31876,
+          "output_usd_per_million": 0.555,
+          "output_neurons_per_million": 50488
+        },
+        "display": "$0.351 / input \xB7 $0.555 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 198066,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/gemma-sea-lion-v4-27b-it/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/aisingapore/gemma-sea-lion-v4-27b-it",
+        "gemma-sea-lion-v4-27b-it"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 27.9,
+        "tier": "D",
+        "basis": [
+          "27B parameters",
+          "128k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 63,
+          "recency": 45,
+          "price": 42,
+          "override": null
+        },
+        "rank": 54
+      }
+    },
+    {
+      "id": "@cf/cloudflare/clef",
+      "name": "clef",
+      "author": "Cloudflare",
+      "task": "text-generation",
+      "description": "Clef is a 27B multimodal decision model that turns a state and a schema of typed questions into decisions. It reads the state as text, JSON, images, or video, and returns a probability for every allowed option of every question.",
+      "context_window": 65536,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.24,
+            "neurons": 21818,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.24,
+          "input_neurons_per_million": 21818
+        },
+        "display": "$0.24 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 458337,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/clef/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/cloudflare/clef",
+        "clef"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 26.3,
+        "tier": "D",
+        "basis": [
+          "27B parameters",
+          "66k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 51,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 55
+      }
+    },
+    {
+      "id": "@cf/cloudflare/clef-omni",
+      "name": "clef-omni",
+      "author": "Cloudflare",
+      "task": "text-generation",
+      "description": "Clef-omni is a multimodal decision model built on a 30B-parameter mixture-of-experts (3B active) backbone. It turns a state and a schema of typed questions into decisions, reads the state as text, JSON, images, audio, or video, and returns a probability for every allowed option of every question.",
+      "context_window": 64e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.15,
+            "neurons": 13636,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.15,
+          "input_neurons_per_million": 13636
+        },
+        "display": "$0.15 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 733352,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/clef-omni/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/cloudflare/clef-omni",
+        "clef-omni"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 26.3,
+        "tier": "D",
+        "basis": [
+          "30B parameters",
+          "64k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 50,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 56
+      }
+    },
+    {
+      "id": "@cf/llava-hf/llava-1.5-7b-hf",
+      "name": "llava-1.5-7b-hf",
+      "author": "llava-hf",
+      "task": "image-to-text",
+      "description": "LLaVA is an open-source chatbot trained by fine-tuning LLaMA/Vicuna on GPT-generated multimodal instruction-following data. It is an auto-regressive language model, based on the transformer architecture.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": true,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/llava-1.5-7b-hf/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/llava-hf/llava-1.5-7b-hf",
+        "llava-1.5-7b-hf"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 25.8,
+        "tier": "D",
+        "basis": [
+          "7B parameters",
+          "context unknown",
+          "vision",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 40,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 57
+      }
+    },
+    {
+      "id": "@cf/meta/llama-3.2-3b-instruct",
+      "name": "llama-3.2-3b-instruct",
+      "author": "Meta",
+      "task": "text-generation",
+      "description": "The Llama 3.2 instruction-tuned text only models are optimized for multilingual dialogue use cases, including agentic retrieval and summarization tasks.",
+      "context_window": 8e4,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": true
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.051,
+            "neurons": 4625,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.335,
+            "neurons": 30475,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.051,
+          "input_neurons_per_million": 4625,
+          "output_usd_per_million": 0.335,
+          "output_neurons_per_million": 30475
+        },
+        "display": "$0.051 / input \xB7 $0.335 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 328137,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/llama-3.2-3b-instruct/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/meta/llama-3.2-3b-instruct",
+        "llama-3.2-3b-instruct"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 25.7,
+        "tier": "D",
+        "basis": [
+          "3B parameters",
+          "80k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 54,
+          "recency": 45,
+          "price": 33,
+          "override": null
+        },
+        "rank": 58
+      }
+    },
+    {
+      "id": "@cf/qwen/qwen2.5-coder-32b-instruct",
+      "name": "qwen2.5-coder-32b-instruct",
+      "author": "Qwen",
+      "task": "text-generation",
+      "description": '"Qwen2.5-Coder is the latest series of Code-Specific Qwen large language models (formerly known as CodeQwen). As of now, Qwen2.5-Coder has covered six mainstream model sizes, 0.5, 1.5, 3, 7, 14, 32 billion parameters, to meet the needs of different developers. Qwen2.5-Coder brings the following improvements upon CodeQwen1.5:"',
+      "context_window": 32768,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.66,
+            "neurons": 6e4,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 1,
+            "neurons": 90909,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.66,
+          "input_neurons_per_million": 6e4,
+          "output_usd_per_million": 1,
+          "output_neurons_per_million": 90909
+        },
+        "display": "$0.66 / input \xB7 $1 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 11e4,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/qwen2.5-coder-32b-instruct/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/qwen/qwen2.5-coder-32b-instruct",
+        "qwen2.5-coder-32b-instruct"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 25.2,
+        "tier": "D",
+        "basis": [
+          "32B parameters",
+          "33k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 38,
+          "recency": 45,
+          "price": 53,
+          "override": null
+        },
+        "rank": 59
+      }
+    },
+    {
+      "id": "@cf/meta/llama-3.2-1b-instruct",
+      "name": "llama-3.2-1b-instruct",
+      "author": "Meta",
+      "task": "text-generation",
+      "description": "The Llama 3.2 instruction-tuned text only models are optimized for multilingual dialogue use cases, including agentic retrieval and summarization tasks.",
+      "context_window": 6e4,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": true
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.027,
+            "neurons": 2457,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.201,
+            "neurons": 18252,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.027,
+          "input_neurons_per_million": 2457,
+          "output_usd_per_million": 0.201,
+          "output_neurons_per_million": 18252
+        },
+        "display": "$0.027 / input \xB7 $0.201 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 547885,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/llama-3.2-1b-instruct/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/meta/llama-3.2-1b-instruct",
+        "llama-3.2-1b-instruct"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 24,
+        "tier": "D",
+        "basis": [
+          "1B parameters",
+          "60k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 49,
+          "recency": 45,
+          "price": 24,
+          "override": null
+        },
+        "rank": 60
+      }
+    },
+    {
+      "id": "@cf/meta/llama-guard-3-8b",
+      "name": "llama-guard-3-8b",
+      "author": "Meta",
+      "task": "text-generation",
+      "description": "Llama Guard 3 is a Llama-3.1-8B pretrained model, fine-tuned for content safety classification. Similar to previous versions, it can be used to classify content in both LLM inputs (prompt classification) and in LLM responses (response classification). It acts as an LLM \u2013 it generates text in its output that indicates whether a given prompt or response is safe or unsafe, and if unsafe, it also lists the content categories violated.",
+      "context_window": 131072,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.484,
+            "neurons": 44003,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.03,
+            "neurons": 2730,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.484,
+          "input_neurons_per_million": 44003,
+          "output_usd_per_million": 0.03,
+          "output_neurons_per_million": 2730
+        },
+        "display": "$0.484 / input \xB7 $0.03 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 3663003,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/llama-guard-3-8b/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/meta/llama-guard-3-8b",
+        "llama-guard-3-8b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 23.7,
+        "tier": "D",
+        "basis": [
+          "8B parameters",
+          "131k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 63,
+          "recency": 45,
+          "price": 0,
+          "override": null
+        },
+        "rank": 61
+      }
+    },
+    {
+      "id": "@cf/cloudflare/clef-flash",
+      "name": "clef-flash",
+      "author": "Cloudflare",
+      "task": "text-generation",
+      "description": "Clef-flash is a fast 9B multimodal decision model that turns a state and a schema of typed questions into decisions. It reads the state as text, JSON, images, or video, and returns a probability for every allowed option of every question.",
+      "context_window": 24576,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.038,
+            "neurons": 3455,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.038,
+          "input_neurons_per_million": 3455
+        },
+        "display": "$0.038 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 2894356,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/clef-flash/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/cloudflare/clef-flash",
+        "clef-flash"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 23.7,
+        "tier": "D",
+        "basis": [
+          "9B parameters",
+          "25k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 33,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 62
+      }
+    },
+    {
+      "id": "@cf/black-forest-labs/flux-2-klein-9b",
+      "name": "flux-2-klein-9b",
+      "author": "Black Forest Labs",
+      "task": "text-to-image",
+      "description": "FLUX.2 [klein] 9B is a 9 billion parameter model that can generate images from text descriptions and supports multi-reference editing capabilities.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "image_megapixel",
+            "usd": 0.015,
+            "neurons": 1363.64,
+            "unit": "per first MP (1024x1024)"
+          },
+          {
+            "kind": "image_megapixel",
+            "usd": 2e-3,
+            "neurons": 181.82,
+            "unit": "per subsequent MP"
+          },
+          {
+            "kind": "image",
+            "usd": 2e-3,
+            "neurons": 181.82,
+            "unit": "per input image MP"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.015 / MP \xB7 $0.002 / MP \xB7 $0.002 / image",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-9b/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/black-forest-labs/flux-2-klein-9b",
+        "flux-2-klein-9b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 23.3,
+        "tier": "D",
+        "basis": [
+          "9B parameters",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 63
+      }
+    },
+    {
+      "id": "@cf/black-forest-labs/flux-2-klein-4b",
+      "name": "flux-2-klein-4b",
+      "author": "Black Forest Labs",
+      "task": "text-to-image",
+      "description": "FLUX.2 [klein] is an ultra-fast, distilled image model. It unifies image generation and editing in a single model, delivering state-of-the-art quality enabling interactive workflows, real-time previews, and latency-critical applications.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "image_tile",
+            "usd": 59e-6,
+            "neurons": 5.37,
+            "unit": "per input 512x512 tile"
+          },
+          {
+            "kind": "image_tile",
+            "usd": 287e-6,
+            "neurons": 26.05,
+            "unit": "per output 512x512 tile"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.000059 / tile \xB7 $0.000287 / tile",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/black-forest-labs/flux-2-klein-4b",
+        "flux-2-klein-4b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 23.3,
+        "tier": "D",
+        "basis": [
+          "4B parameters",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 64
+      }
+    },
+    {
+      "id": "@cf/pfnet/plamo-embedding-1b",
+      "name": "plamo-embedding-1b",
+      "author": "pfnet",
+      "task": "text-embeddings",
+      "description": '"PLaMo-Embedding-1B is a Japanese text embedding model developed by Preferred Networks, Inc.\\n\\nIt can convert Japanese text input into numerical vectors and can be used for a wide range of applications, including information retrieval, text classification, and clustering."',
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.019,
+            "neurons": 1689,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.019,
+          "input_neurons_per_million": 1689
+        },
+        "display": "$0.019 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 5920663,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/plamo-embedding-1b/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/embeddings",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/pfnet/plamo-embedding-1b",
+        "plamo-embedding-1b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 23.3,
+        "tier": "D",
+        "basis": [
+          "1B parameters",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 65
+      }
+    },
+    {
+      "id": "@cf/meta/llama-3.1-8b-instruct-fp8",
+      "name": "llama-3.1-8b-instruct-fp8",
+      "author": "Meta",
+      "task": "text-generation",
+      "description": "Llama 3.1 8B quantized to FP8 precision",
+      "context_window": 32e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.152,
+            "neurons": 13778,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.287,
+            "neurons": 26128,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.152,
+          "input_neurons_per_million": 13778,
+          "output_usd_per_million": 0.287,
+          "output_neurons_per_million": 26128
+        },
+        "display": "$0.152 / input \xB7 $0.287 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 382731,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/llama-3.1-8b-instruct-fp8/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/meta/llama-3.1-8b-instruct-fp8",
+        "llama-3.1-8b-instruct-fp8"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 23,
+        "tier": "D",
+        "basis": [
+          "8B parameters",
+          "32k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 38,
+          "recency": 45,
+          "price": 31,
+          "override": null
+        },
+        "rank": 66
+      }
+    },
+    {
+      "id": "@cf/mistral/mistral-7b-instruct-v0.2-lora",
+      "name": "mistral-7b-instruct-v0.2-lora",
+      "author": "MistralAI",
+      "task": "text-generation",
+      "description": "The Mistral-7B-Instruct-v0.2 Large Language Model (LLM) is an instruct fine-tuned version of the Mistral-7B-v0.2.",
+      "context_window": 15e3,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/mistral-7b-instruct-v0.2-lora/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/mistral/mistral-7b-instruct-v0.2-lora",
+        "mistral-7b-instruct-v0.2-lora"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 22.3,
+        "tier": "D",
+        "basis": [
+          "7B parameters",
+          "15k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 24,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 67
+      }
+    },
+    {
+      "id": "@cf/ai4bharat/indictrans2-en-indic-1B",
+      "name": "indictrans2-en-indic-1B",
+      "author": "ai4bharat",
+      "task": "translation",
+      "description": "IndicTrans2 is the first open-source transformer-based multilingual NMT model that supports high-quality translations across all the 22 scheduled Indic languages",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": true
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.342,
+            "neurons": 31050,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.342,
+            "neurons": 31050,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.342,
+          "input_neurons_per_million": 31050,
+          "output_usd_per_million": 0.342,
+          "output_neurons_per_million": 31050
+        },
+        "display": "$0.342 / input \xB7 $0.342 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 322061,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/indictrans2-en-indic-1B/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/ai4bharat/indictrans2-en-indic-1B",
+        "indictrans2-en-indic-1B"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 22.1,
+        "tier": "D",
+        "basis": [
+          "1B parameters",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 34,
+          "override": null
+        },
+        "rank": 68
+      }
+    },
+    {
+      "id": "@cf/meta/m2m100-1.2b",
+      "name": "m2m100-1.2b",
+      "author": "Meta",
+      "task": "translation",
+      "description": "Multilingual encoder-decoder (seq-to-seq) model trained for Many-to-Many multilingual translation",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": true
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.342,
+            "neurons": 31050,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 0.342,
+            "neurons": 31050,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.342,
+          "input_neurons_per_million": 31050,
+          "output_usd_per_million": 0.342,
+          "output_neurons_per_million": 31050
+        },
+        "display": "$0.342 / input \xB7 $0.342 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 322061,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/m2m100-1.2b/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/meta/m2m100-1.2b",
+        "m2m100-1.2b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 22.1,
+        "tier": "D",
+        "basis": [
+          "1.2B parameters",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 34,
+          "override": null
+        },
+        "rank": 69
+      }
+    },
+    {
+      "id": "@cf/google/gemma-2b-it-lora",
+      "name": "gemma-2b-it-lora",
+      "author": "Google",
+      "task": "text-generation",
+      "description": "This is a Gemma-2B base model that Cloudflare dedicates for inference with LoRA adapters. Gemma is a family of lightweight, state-of-the-art open models from Google, built from the same research and technology used to create the Gemini models.",
+      "context_window": 8192,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/gemma-2b-it-lora/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/google/gemma-2b-it-lora",
+        "gemma-2b-it-lora"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 20.7,
+        "tier": "D",
+        "basis": [
+          "2B parameters",
+          "8k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 13,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 70
+      }
+    },
+    {
+      "id": "@cf/meta-llama/llama-2-7b-chat-hf-lora",
+      "name": "llama-2-7b-chat-hf-lora",
+      "author": "Meta",
+      "task": "text-generation",
+      "description": '"This is a Llama2 base model that Cloudflare dedicated for inference with LoRA adapters. Llama 2 is a collection of pretrained and fine-tuned generative text models ranging in scale from 7 billion to 70 billion parameters. This is the repository for the 7B fine-tuned model, optimized for dialogue use cases and converted for the Hugging Face Transformers format. "',
+      "context_window": 8192,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/llama-2-7b-chat-hf-lora/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/meta-llama/llama-2-7b-chat-hf-lora",
+        "llama-2-7b-chat-hf-lora"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 20.7,
+        "tier": "D",
+        "basis": [
+          "7B parameters",
+          "8k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 13,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 71
+      }
+    },
+    {
+      "id": "@cf/qwen/qwen3-embedding-0.6b",
+      "name": "qwen3-embedding-0.6b",
+      "author": "Qwen",
+      "task": "text-embeddings",
+      "description": '"The Qwen3 Embedding model series is the latest proprietary model of the Qwen family, specifically designed for text embedding and ranking tasks. "',
+      "context_window": 8192,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.012,
+            "neurons": 1075,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.012,
+          "input_neurons_per_million": 1075
+        },
+        "display": "$0.012 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 9302325,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/qwen3-embedding-0.6b/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/embeddings",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/qwen/qwen3-embedding-0.6b",
+        "qwen3-embedding-0.6b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 20.7,
+        "tier": "D",
+        "basis": [
+          "0.6B parameters",
+          "8k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 13,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 72
+      }
+    },
+    {
+      "id": "@cf/google/gemma-7b-it-lora",
+      "name": "gemma-7b-it-lora",
+      "author": "Google",
+      "task": "text-generation",
+      "description": '"  This is a Gemma-7B base model that Cloudflare dedicates for inference with LoRA adapters. Gemma is a family of lightweight, state-of-the-art open models from Google, built from the same research and technology used to create the Gemini models."',
+      "context_window": 3500,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/gemma-7b-it-lora/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/google/gemma-7b-it-lora",
+        "gemma-7b-it-lora"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 18.8,
+        "tier": "D",
+        "basis": [
+          "7B parameters",
+          "4k context",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 0,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 73
+      }
+    }
+  ]
+};
+
+// src/catalog/index.js
+var CATALOG_KEY = "catalog:cache:v2";
+var PRICING_KEY = "pricing:cache:v2";
+var CATALOG_TTL_MS = 15 * 60 * 1e3;
+var PRICING_TTL_MS = 6 * 60 * 60 * 1e3;
+var inflight = null;
+async function fetchJson(url, init = {}) {
+  const response = await fetch(url, init);
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Invalid JSON from ${url}: ${text.slice(0, 160)}`);
+  }
+  if (!response.ok || data?.success === false) {
+    const message = data?.errors?.[0]?.message || text.slice(0, 200);
+    throw new Error(`Cloudflare API ${response.status}: ${message}`);
+  }
+  return data;
+}
+function shuffle(items) {
+  const copy = [...items];
+  for (let i = copy.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+async function fetchModelsPage(account, page, format) {
+  const params = new URLSearchParams({
+    per_page: "100",
+    page: String(page),
+    hide_experimental: "false",
+    include_deprecated: "false"
+  });
+  if (format) params.set("format", format);
+  const url = `https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/models/search?${params}`;
+  const data = await fetchJson(url, {
+    headers: {
+      Authorization: `Bearer ${account.apiToken}`,
+      Accept: "application/json"
+    }
+  });
+  return {
+    models: Array.isArray(data.result) ? data.result : Array.isArray(data.data) ? data.data : [],
+    openrouter: format === "openrouter" || Array.isArray(data.data)
+  };
+}
+async function fetchAllModels(env) {
+  const accounts = shuffle(await getActiveAccounts(env)).slice(0, 3);
+  if (accounts.length === 0) throw new Error("No active Cloudflare account configured");
+  let lastError = null;
+  for (const account of accounts) {
+    for (const format of ["openrouter", null]) {
+      try {
+        const models = [];
+        let openrouter = false;
+        for (let page = 1; page <= 10; page += 1) {
+          const result = await fetchModelsPage(account, page, format);
+          openrouter = result.openrouter;
+          models.push(...result.models);
+          if (result.models.length < 100) break;
+        }
+        if (models.length > 0) {
+          return {
+            models,
+            openrouter,
+            account: { id: account.id, name: account.name, accountId: account.accountId }
+          };
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+  }
+  throw lastError || new Error("Unable to fetch models");
+}
+async function getPricing(env, { force = false } = {}) {
+  const now = Date.now();
+  let cached = null;
+  try {
+    cached = await env.KV.get(PRICING_KEY, "json");
+  } catch {
+    cached = null;
+  }
+  if (!force && cached && now - cached.fetched_at < PRICING_TTL_MS) return cached;
+  try {
+    const response = await fetch(PRICING_URL, {
+      headers: { Accept: "text/markdown, text/plain;q=0.9, */*;q=0.5", "User-Agent": "WorkersAI2API/2.0" },
+      cf: { cacheEverything: true, cacheTtl: 3600 }
+    });
+    if (!response.ok) throw new Error(`Pricing docs ${response.status}`);
+    const markdown = await response.text();
+    const parsed = parsePricingMarkdown(markdown);
+    const record = { ...parsed, fetched_at: now };
+    await env.KV.put(PRICING_KEY, JSON.stringify(record), { expirationTtl: 7 * 24 * 60 * 60 });
+    return record;
+  } catch (error) {
+    if (cached) return { ...cached, stale: true, error: error.message };
+    const fallback = catalog_snapshot_default.pricing || { models: {}, paidOnly: [], freeDailyNeurons: 1e4 };
+    return { ...fallback, fetched_at: 0, stale: true, error: error.message };
+  }
+}
+function snapshotById() {
+  const map = /* @__PURE__ */ new Map();
+  for (const model of catalog_snapshot_default.models || []) map.set(model.id, model);
+  return map;
+}
+function mergeWithSnapshot(model, snapshotMap) {
+  const base = snapshotMap.get(model.id);
+  if (!base) return model;
+  return {
+    ...base,
+    ...model,
+    // Prefer live API values, fall back to snapshot metadata when absent.
+    name: model.name || base.name,
+    description: model.description || base.description,
+    context_window: model.context_window || base.context_window,
+    max_output_tokens: model.max_output_tokens || base.max_output_tokens,
+    capabilities: { ...base.capabilities || {}, ...model.capabilities || {} },
+    pricing: model.pricing?.items?.length ? model.pricing : base.pricing,
+    requires_paid: model.requires_paid || base.requires_paid,
+    free: model.free && base.free !== false,
+    free_daily_output_tokens: model.free_daily_output_tokens || base.free_daily_output_tokens,
+    aliases: [.../* @__PURE__ */ new Set([...base.aliases || [], ...model.aliases || []])]
+  };
+}
+async function buildCatalog(env) {
+  const settings = await getSettings(env);
+  const freeQuota = Number(settings.dailyNeurons) || 1e4;
+  const snapshotMap = snapshotById();
+  let pricing;
+  let live;
+  try {
+    [pricing, live] = await Promise.allSettled([getPricing(env), fetchAllModels(env)]).then((results) => [
+      results[0].status === "fulfilled" ? results[0].value : null,
+      results[1].status === "fulfilled" ? results[1].value : null
+    ]);
+  } catch {
+    pricing = null;
+    live = null;
+  }
+  const paidOnly = new Set(pricing?.paidOnly || []);
+  const pricingMap = pricing?.models || {};
+  let models = [];
+  let source = "bundled-snapshot";
+  if (live?.models?.length) {
+    const normalize2 = live.openrouter ? normalizeOpenRouterModel : normalizeApiModel;
+    models = live.models.map((raw) => normalize2(raw, {
+      paidOnly,
+      pricing: pricingMap[String(raw.id)],
+      freeQuota
+    })).filter(Boolean);
+    if (models.length > 0) source = "cloudflare-models-api";
+  }
+  if (models.length === 0) {
+    models = (catalog_snapshot_default.models || []).map((model) => ({
+      ...model,
+      pricing: pricingMap[model.id] || model.pricing,
+      requires_paid: model.requires_paid || paidOnly.has(model.id),
+      free: !(model.requires_paid || paidOnly.has(model.id)) && !model.deprecated
+    }));
+  }
+  const byId = /* @__PURE__ */ new Map();
+  for (const model of models) {
+    const merged = mergeWithSnapshot(model, snapshotMap);
+    merged.requires_paid = Boolean(merged.requires_paid || paidOnly.has(merged.id));
+    merged.free = !merged.requires_paid && !merged.deprecated;
+    byId.set(merged.id, merged);
+  }
+  for (const base of catalog_snapshot_default.models || []) {
+    if (!byId.has(base.id)) {
+      const requiresPaid = base.requires_paid || paidOnly.has(base.id);
+      byId.set(base.id, {
+        ...base,
+        pricing: pricingMap[base.id] || base.pricing,
+        requires_paid: requiresPaid,
+        free: !requiresPaid && !base.deprecated
+      });
+    }
+  }
+  const ranked = rankModels([...byId.values()], settings.benchmarks || {});
+  const now = Date.now();
+  return {
+    models: ranked,
+    meta: {
+      source,
+      fetched_at: now,
+      pricing_updated_at: pricing?.updatedAt || null,
+      pricing_fetched_at: pricing?.fetched_at || 0,
+      pricing_stale: Boolean(pricing?.stale),
+      pricing_error: pricing?.error || null,
+      free_daily_neurons: freeQuota,
+      total_models: ranked.length,
+      free_models: ranked.filter((model) => model.free).length,
+      paid_models: ranked.filter((model) => model.requires_paid).length,
+      account: live?.account || null,
+      stale: false,
+      version: catalog_snapshot_default.generated_at || null
+    }
+  };
+}
+async function refresh(env) {
+  if (inflight) return inflight;
+  inflight = (async () => {
+    try {
+      const result = await buildCatalog(env);
+      const ttl = result.meta.source === "cloudflare-models-api" ? 7 * 24 * 60 * 60 : 60 * 60;
+      await env.KV.put(CATALOG_KEY, JSON.stringify(result), { expirationTtl: ttl });
+      return result;
+    } finally {
+      inflight = null;
+    }
+  })();
+  return inflight;
+}
+async function getCatalog(env, ctx, { force = false } = {}) {
+  let cached = null;
+  try {
+    cached = await env.KV.get(CATALOG_KEY, "json");
+  } catch {
+    cached = null;
+  }
+  const age = cached ? Date.now() - cached.meta.fetched_at : Infinity;
+  if (!force && cached && age < CATALOG_TTL_MS) return cached;
+  if (!force && cached) {
+    ctx?.waitUntil?.(refresh(env).catch(() => {
+    }));
+    return { ...cached, meta: { ...cached.meta, stale: true } };
+  }
+  try {
+    return await refresh(env);
+  } catch (error) {
+    if (cached) return { ...cached, meta: { ...cached.meta, stale: true, error: error.message } };
+    return {
+      models: (catalog_snapshot_default.models || []).map((model) => ({ ...model })),
+      meta: {
+        source: "bundled-snapshot",
+        fetched_at: Date.now(),
+        free_daily_neurons: 1e4,
+        total_models: (catalog_snapshot_default.models || []).length,
+        free_models: (catalog_snapshot_default.models || []).filter((model) => model.free).length,
+        paid_models: (catalog_snapshot_default.models || []).filter((model) => model.requires_paid).length,
+        stale: true,
+        error: error.message
+      }
+    };
+  }
+}
+function findModel(catalog, requested, customAliases = {}) {
+  if (!requested) return null;
+  const needle = String(requested).trim().toLowerCase();
+  const exact = catalog.models.find((model) => model.id.toLowerCase() === needle);
+  if (exact) return exact;
+  const alias = Object.entries(customAliases || {}).find(([key]) => key.toLowerCase() === needle);
+  if (alias) {
+    const target = catalog.models.find((model) => model.id === alias[1] || shortModelId(model.id) === alias[1]);
+    if (target) return target;
+  }
+  const shortMatches = catalog.models.filter((model) => shortModelId(model.id).toLowerCase() === needle);
+  if (shortMatches.length === 1) return shortMatches[0];
+  const unique = catalog.models.filter((model) => model.id.toLowerCase().includes(needle));
+  return unique.length === 1 ? unique[0] : null;
+}
+function publicModel(model) {
+  return {
+    id: model.id,
+    object: "model",
+    created: model.created_unix || 0,
+    owned_by: model.author || "cloudflare",
+    name: model.name,
+    task: model.task,
+    context_window: model.context_window,
+    max_output_tokens: model.max_output_tokens,
+    capabilities: model.capabilities,
+    modalities: model.modalities,
+    pricing: model.pricing,
+    free: model.free,
+    requires_paid: model.requires_paid,
+    free_daily_output_tokens: model.free_daily_output_tokens,
+    performance: model.performance,
+    endpoints: model.endpoints,
+    aliases: model.aliases,
+    docs_url: model.docs_url
+  };
 }
 
-// ----------------------------------------------------
-// 管理员身份验证（同时支持 Cookie 和 Authorization 请求头）
-// ----------------------------------------------------
-async function checkAdminAuth(request, env) {
-	// 1. 先从 Cookie 里取登录令牌（浏览器访问时走这里）
-	const cookies = request.headers.get('Cookie') || '';
-	const cookieMatch = cookies.match(/admin_token=([^;]+)/);
-	let token = cookieMatch ? cookieMatch[1] : null;
-
-	// 2. Cookie 里没有的话，再从 Authorization 请求头里取（API 工具调用时走这里）
-	if (!token) {
-		const authHeader = request.headers.get('Authorization');
-		if (authHeader && authHeader.startsWith('Bearer ')) {
-			token = authHeader.substring(7);
-		}
-	}
-
-	if (!token) return false;
-
-	const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
-
-	if (!expectedPassword) return false; // 还没配置管理员密码
-
-	const expectedHash = await sha256(expectedPassword);
-	return token === expectedHash;
+// src/proxy/models.js
+async function loadCatalog(env, ctx, { force = false } = {}) {
+  return getCatalog(env, ctx, { force });
+}
+function resolveModel(catalog, requested, settings, { task = null, freeOnly = true } = {}) {
+  const model = findModel(catalog, requested, settings?.aliases || {});
+  if (!model) {
+    const needle = String(requested || "").toLowerCase();
+    const suggestions = catalog.models.filter((item) => item.free && (!task || item.task === task)).filter((item) => !needle || item.id.toLowerCase().includes(needle.slice(0, 3))).slice(0, 5).map((item) => item.id);
+    const error = new RequestError(
+      `Model "${requested}" was not found in the live Workers AI catalog. Call GET /v1/models for the current list.`,
+      { status: 404, code: "model_not_found", extra: { suggestions } }
+    );
+    throw error;
+  }
+  if (freeOnly && model.requires_paid) {
+    throw new RequestError(
+      `Model "${model.id}" requires a Workers Paid plan or AI Gateway prepaid credits and is not available in the free catalog.`,
+      { status: 403, code: "model_requires_paid_plan" }
+    );
+  }
+  if (task && model.task !== task) {
+    throw new RequestError(
+      `Model "${model.id}" is a ${model.task} model, not ${task}.`,
+      { status: 400, code: "model_task_mismatch" }
+    );
+  }
+  return model;
+}
+async function catalogResponse(env, ctx, {
+  includePaid = false,
+  task = null,
+  search = null,
+  sort = "performance",
+  limit = null
+} = {}) {
+  const catalog = await loadCatalog(env, ctx);
+  let models = catalog.models.filter((model) => model.free || includePaid);
+  if (task) models = models.filter((model) => model.task === task);
+  if (search) {
+    const needle = String(search).toLowerCase();
+    models = models.filter((model) => model.id.toLowerCase().includes(needle) || model.name.toLowerCase().includes(needle) || model.description.toLowerCase().includes(needle));
+  }
+  const sorters = {
+    performance: (a, b) => (b.performance?.score || 0) - (a.performance?.score || 0),
+    price: (a, b) => {
+      const av = Number(a.pricing?.tokens?.output_usd_per_million ?? a.pricing?.items?.[0]?.usd ?? Infinity);
+      const bv = Number(b.pricing?.tokens?.output_usd_per_million ?? b.pricing?.items?.[0]?.usd ?? Infinity);
+      return av - bv;
+    },
+    context: (a, b) => (b.context_window || 0) - (a.context_window || 0),
+    name: (a, b) => a.name.localeCompare(b.name),
+    updated: (a, b) => (Date.parse(b.created_at || 0) || 0) - (Date.parse(a.created_at || 0) || 0)
+  };
+  models = [...models].sort(sorters[sort] || sorters.performance);
+  if (limit) models = models.slice(0, limit);
+  return {
+    object: "list",
+    data: models.map(publicModel),
+    meta: {
+      ...catalog.meta,
+      returned: models.length,
+      include_paid: includePaid,
+      sort
+    }
+  };
 }
 
-// 校验管理员的登录 Cookie（用于页面访问的权限判断）
-async function verifyAdminCookie(request, env) {
-	const cookies = request.headers.get('Cookie') || '';
-	const cookieMatch = cookies.match(/admin_token=([^;]+)/);
-	if (!cookieMatch) return false;
-
-	const token = cookieMatch[1];
-
-	const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
-	if (!expectedPassword) return false;
-
-	const expectedHash = await sha256(expectedPassword);
-	return token === expectedHash;
+// src/quota.js
+var NEURONS_PER_USD = 1e6 / 11;
+var FALLBACK_INPUT_NEURONS_PER_MILLION = 5e4;
+var FALLBACK_OUTPUT_NEURONS_PER_MILLION = 15e4;
+function dailyLimit(settings, env) {
+  const configured = Number(settings?.dailyNeurons) || Number(env?.FREE_DAILY_NEURONS) || 1e4;
+  return Math.max(0, configured);
+}
+function tokenRates(model) {
+  const tokens = model?.pricing?.tokens || {};
+  return {
+    input: Number(tokens.input_neurons_per_million) || FALLBACK_INPUT_NEURONS_PER_MILLION,
+    output: Number(tokens.output_neurons_per_million) || FALLBACK_OUTPUT_NEURONS_PER_MILLION,
+    cached: Number(tokens.cached_input_neurons_per_million) || null
+  };
+}
+function costForTokens(tokens, rates) {
+  return Math.max(1, Math.ceil(
+    tokens.input / 1e6 * rates.input + tokens.cached / 1e6 * (rates.cached || rates.input) + tokens.output / 1e6 * rates.output
+  ));
+}
+function estimateChatNeurons(model, body, settings) {
+  const rates = tokenRates(model);
+  const promptTokens = estimateTokens(body?.messages || body?.prompt || "") + estimateTokens(body?.tools || null);
+  const requested = Number(body?.max_tokens ?? body?.max_completion_tokens);
+  const fallbackOutput = Math.min(
+    Number(settings?.defaultMaxOutputTokens) || 1024,
+    Number(model?.max_output_tokens) || 1024
+  );
+  const outputTokens = Number.isFinite(requested) && requested > 0 ? requested : fallbackOutput;
+  return costForTokens({ input: promptTokens, cached: 0, output: outputTokens }, rates);
+}
+function estimateEmbeddingNeurons(model, body) {
+  const rates = tokenRates(model);
+  const tokens = estimateTokens(body?.input || "");
+  return costForTokens({ input: tokens, cached: 0, output: 0 }, rates);
+}
+function estimateImageNeurons(model, body) {
+  const items = model?.pricing?.items || [];
+  const steps = Math.max(1, Number(body?.steps) || 4);
+  const perStep = items.find((item) => item.kind === "step")?.neurons || 0;
+  const perTile = items.find((item) => item.kind === "image_tile")?.neurons || items.find((item) => item.kind === "image")?.neurons || 0;
+  const estimate = perStep * steps + perTile;
+  return Math.max(1, Math.ceil(estimate || 1e3));
+}
+function estimateSpeechNeurons(model, body) {
+  const items = model?.pricing?.items || [];
+  const chars = String(body?.input || body?.prompt || "").length;
+  const perKChar = items.find((item) => item.kind === "character")?.neurons;
+  const perMinute = items.find((item) => item.kind === "audio_minute")?.neurons;
+  if (perKChar) return Math.max(1, Math.ceil(chars / 1e3 * perKChar));
+  if (perMinute) return Math.max(1, Math.ceil(perMinute));
+  return 1e3;
+}
+function estimateTranscriptionNeurons(model) {
+  const perMinute = (model?.pricing?.items || []).find((item) => item.kind === "audio_minute")?.neurons;
+  return Math.max(1, Math.ceil(perMinute || 1e3));
+}
+function estimateNeuronsForTask(model, task, body, settings) {
+  switch (task) {
+    case "chat":
+      return estimateChatNeurons(model, body, settings);
+    case "embeddings":
+      return estimateEmbeddingNeurons(model, body);
+    case "image":
+      return estimateImageNeurons(model, body);
+    case "speech":
+      return estimateSpeechNeurons(model, body);
+    case "transcription":
+      return estimateTranscriptionNeurons(model);
+    default: {
+      const rates = tokenRates(model);
+      const inputTokens = estimateTokens(body);
+      return Math.max(1e3, costForTokens({ input: inputTokens, cached: 0, output: 0 }, rates));
+    }
+  }
+}
+function actualChatNeurons(model, usage) {
+  if (!usage) return null;
+  const rates = tokenRates(model);
+  const prompt = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+  const completion = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+  if (!prompt && !completion) return null;
+  const cached = Number(
+    usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens ?? 0
+  );
+  return costForTokens({
+    input: Math.max(0, prompt - cached),
+    cached: Math.max(0, cached),
+    output: completion
+  }, rates);
+}
+function estimateTokensFromText(text) {
+  if (!text) return 0;
+  return Math.ceil(String(text).length / 3.6);
+}
+function quotaStub(env, accountId, day) {
+  if (!env.QUOTA) return null;
+  const id = env.QUOTA.idFromName(`${accountId}:${day}`);
+  return env.QUOTA.get(id);
+}
+async function callBackend(env, accountId, day, action, payload) {
+  const stub = quotaStub(env, accountId, day);
+  if (stub) {
+    const response = await stub.fetch(`https://quota.internal/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ day, ...payload })
+    });
+    return response.json();
+  }
+  return kvBackend(env, accountId, day, action, payload);
+}
+async function kvBackend(env, accountId, day, action, payload) {
+  const key = `quota:${accountId}:${day}`;
+  const limit = Math.max(0, Number(payload.limit) || 0);
+  let record = { used: 0, reserved: 0 };
+  try {
+    record = await env.KV.get(key, "json") || record;
+  } catch {
+    record = { used: 0, reserved: 0 };
+  }
+  const remaining = () => Math.max(0, limit - record.used - record.reserved);
+  switch (action) {
+    case "reserve": {
+      const amount = Math.max(0, Math.ceil(Number(payload.amount) || 0));
+      if (record.used + record.reserved + amount > limit) {
+        return { ok: false, used: record.used, reserved: record.reserved, remaining: remaining(), limit };
+      }
+      record.reserved += amount;
+      break;
+    }
+    case "settle": {
+      record.reserved = Math.max(0, record.reserved - Math.max(0, Math.ceil(Number(payload.reserved) || 0)));
+      record.used += Math.max(0, Math.ceil(Number(payload.actual) || 0));
+      break;
+    }
+    case "reconcile": {
+      record.used = Math.max(record.used, Math.max(0, Math.ceil(Number(payload.used) || 0)));
+      break;
+    }
+    case "exhaust": {
+      record.used = limit;
+      record.reserved = 0;
+      break;
+    }
+    case "status":
+      break;
+    default:
+      return { ok: false, error: "not found" };
+  }
+  record.updatedAt = Date.now();
+  await env.KV.put(key, JSON.stringify(record), { expirationTtl: 172800 });
+  return {
+    ok: true,
+    used: record.used,
+    reserved: record.reserved,
+    remaining: remaining(),
+    limit
+  };
+}
+async function reserveQuota(env, accountId, amount, limit, day = utcDay()) {
+  try {
+    return await callBackend(env, accountId, day, "reserve", { amount, limit });
+  } catch (error) {
+    return { ok: false, error: `Quota backend unavailable: ${error.message}`, remaining: 0, limit };
+  }
+}
+async function settleQuota(env, accountId, reserved, actual, limit, day = utcDay()) {
+  try {
+    return await callBackend(env, accountId, day, "settle", { reserved, actual, limit });
+  } catch {
+    return { ok: false };
+  }
+}
+async function reconcileQuota(env, accountId, used, limit, day = utcDay()) {
+  try {
+    return await callBackend(env, accountId, day, "reconcile", { used, limit });
+  } catch {
+    return { ok: false };
+  }
+}
+async function exhaustQuota(env, accountId, limit, day = utcDay()) {
+  try {
+    return await callBackend(env, accountId, day, "exhaust", { limit });
+  } catch {
+    return { ok: false };
+  }
+}
+async function quotaStatus(env, accountId, limit, day = utcDay()) {
+  try {
+    return await callBackend(env, accountId, day, "status", { limit });
+  } catch (error) {
+    return { ok: false, error: error.message, used: 0, remaining: 0, limit };
+  }
 }
 
-// ----------------------------------------------------
-// 代理接口的鉴权工具函数
-// ----------------------------------------------------
-async function checkProxyAuth(request, env) {
-	const apiKeys = await getApiKeys(env);
-	if (apiKeys.length === 0) {
-		return true; // 没配置任何密钥 = 不校验，谁都能用
-	}
-
-	// 先检查 x-api-key 头
-	const xApiKey = request.headers.get('x-api-key');
-	if (xApiKey && apiKeys.some(k => k.key === xApiKey)) {
-		return true;
-	}
-
-	// 再检查 Authorization: Bearer 头
-	const authHeader = request.headers.get('Authorization');
-	if (authHeader && authHeader.startsWith('Bearer ')) {
-		const token = authHeader.substring(7);
-		return apiKeys.some(k => k.key === token);
-	}
-
-	return false;
-}
-
-// ----------------------------------------------------
-// 用量统计的缓存工具函数
-// ----------------------------------------------------
-async function getCachedSummary(env) {
-	const cached = await env.KV.get('cache_usage_summary');
-	if (cached) {
-		try {
-			const data = JSON.parse(cached);
-			if (Date.now() - data.timestamp < 300000) { // 缓存有效期 5 分钟
-				return data;
-			}
-		} catch (e) { }
-	}
-	return null;
-}
-
-async function setCachedSummary(env, summaryData) {
-	const data = {
-		...summaryData,
-		timestamp: Date.now()
-	};
-	await env.KV.put('cache_usage_summary', JSON.stringify(data));
-}
-
-async function refreshAccountsUsage(env, accounts, limit = 20) {
-	const cachedDetailsRaw = await env.KV.get('cache_usage_details');
-	let cacheMap = {};
-	if (cachedDetailsRaw) {
-		try {
-			cacheMap = JSON.parse(cachedDetailsRaw) || {};
-		} catch (e) {
-			cacheMap = {};
-		}
-	}
-
-	// 按最后更新的时间戳升序排序（时间戳为 0 或不存在的最先更新）
-	const sortedAccounts = [...accounts].sort((a, b) => {
-		const tA = cacheMap[a.id]?.timestamp || 0;
-		const tB = cacheMap[b.id]?.timestamp || 0;
-		return tA - tB;
-	});
-
-	const accountsToUpdate = sortedAccounts.slice(0, limit);
-
-	const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-	sevenDaysAgo.setUTCHours(0, 0, 0, 0);
-	const startSevenDays = sevenDaysAgo.toISOString().split('.')[0] + 'Z';
-
-	const todayUTC = new Date();
-	todayUTC.setUTCHours(0, 0, 0, 0);
-	const startToday = todayUTC.toISOString().split('.')[0] + 'Z';
-
-	const promises = accountsToUpdate.map(async (account) => {
-		try {
-			const [todayGroups, historyGroups] = await Promise.all([
-				queryGraphQL(account.accountId, account.apiToken, startToday),
-				queryGraphQL(account.accountId, account.apiToken, startSevenDays)
-			]);
-			const todayParsed = processAnalytics(todayGroups);
-			const historyParsed = processAnalytics(historyGroups);
-
-			cacheMap[account.id] = {
-				status: 'active',
-				error: null,
-				usageToday: todayParsed.todayTotalNeurons,
-				modelsToday: todayParsed.todayModels,
-				history: historyParsed.history,
-				timestamp: Date.now()
-			};
-		} catch (e) {
-			console.error(`Error querying GraphQL for ${account.name}:`, e);
-			cacheMap[account.id] = {
-				status: 'error',
-				error: e.message,
-				usageToday: cacheMap[account.id]?.usageToday || 0,
-				modelsToday: cacheMap[account.id]?.modelsToday || [],
-				history: cacheMap[account.id]?.history || [],
-				timestamp: Date.now() // 即使出错也更新时间戳，以便其他账号轮转刷新
-			};
-		}
-	});
-
-	await Promise.all(promises);
-	await env.KV.put('cache_usage_details', JSON.stringify(cacheMap));
-	return cacheMap;
-}
-
-// ----------------------------------------------------
-// Cloudflare GraphQL 用量分析查询
-// ----------------------------------------------------
-async function queryGraphQL(accountId, apiToken, startDateTime) {
-	const query = `
+// src/usage.js
+var USAGE_KEY = "usage:cloud:v2";
+var SUMMARY_KEY = "usage:summary:v2";
+var SUMMARY_TTL_MS = 3e4;
+async function queryGraphQL(account, startDateTime) {
+  const query = `
 		query GetAIUsage($accountId: String!, $start: String!) {
 			viewer {
 				accounts(filter: { accountTag: $accountId }) {
@@ -353,5176 +8769,2261 @@ async function queryGraphQL(accountId, apiToken, startDateTime) {
 						limit: 1000
 					) {
 						count
-						sum {
-							totalNeurons
-						}
-						dimensions {
-							date
-							modelId
-						}
+						sum { totalNeurons }
+						dimensions { date modelId }
 					}
 				}
 			}
 		}
 	`;
-	const response = await fetch(`https://api.cloudflare.com/client/v4/graphql`, {
-		method: 'POST',
-		headers: {
-			'Authorization': `Bearer ${apiToken}`,
-			'Content-Type': 'application/json'
-		},
-		body: JSON.stringify({
-			query,
-			variables: {
-				accountId,
-				start: startDateTime
-			}
-		})
-	});
-
-	if (!response.ok) {
-		throw new Error(`GraphQL API error: ${response.statusText}`);
-	}
-
-	const result = await response.json();
-	if (result.errors && result.errors.length > 0) {
-		throw new Error(result.errors[0].message);
-	}
-
-	return result?.data?.viewer?.accounts?.[0]?.aiInferenceAdaptiveGroups || [];
+  const response = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${account.apiToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ query, variables: { accountId: account.accountId, start: startDateTime } })
+  });
+  if (!response.ok) throw new Error(`GraphQL ${response.status}: ${response.statusText}`);
+  const result = await response.json();
+  if (result.errors?.length) throw new Error(result.errors[0].message);
+  return result?.data?.viewer?.accounts?.[0]?.aiInferenceAdaptiveGroups || [];
+}
+function processGroups(groups) {
+  const today = utcDay();
+  const history = {};
+  for (let i = 6; i >= 0; i -= 1) {
+    const date = new Date(Date.now() - i * 864e5).toISOString().slice(0, 10);
+    history[date] = 0;
+  }
+  const models = {};
+  let todayTotal = 0;
+  for (const group of groups) {
+    const date = group.dimensions?.date;
+    const model = group.dimensions?.modelId || "unknown";
+    const neurons = Number(group.sum?.totalNeurons) || 0;
+    if (date === today) {
+      todayTotal += neurons;
+      models[model] = models[model] || { model, neurons: 0, requests: 0 };
+      models[model].neurons += neurons;
+      models[model].requests += Number(group.count) || 0;
+    }
+    if (history[date] !== void 0) history[date] += neurons;
+  }
+  return {
+    todayTotal,
+    models: Object.values(models).sort((a, b) => b.neurons - a.neurons),
+    history: Object.keys(history).sort().map((date) => ({ date, neurons: history[date] }))
+  };
+}
+async function refreshCloudUsage(env, { limit = 10 } = {}) {
+  const accounts = await getActiveAccounts(env);
+  const settings = await getSettings(env);
+  const dayLimit = dailyLimit(settings, env);
+  const today = utcDay();
+  const startToday = `${today}T00:00:00Z`;
+  const startWeek = new Date(Date.parse(`${today}T00:00:00Z`) - 6 * 864e5).toISOString().split(".")[0] + "Z";
+  const details = {};
+  await Promise.all(accounts.slice(0, limit).map(async (account) => {
+    try {
+      const [todayGroups, weekGroups] = await Promise.all([
+        queryGraphQL(account, startToday),
+        queryGraphQL(account, startWeek)
+      ]);
+      const parsed = processGroups(todayGroups);
+      const week = processGroups(weekGroups);
+      details[account.id] = {
+        status: "ok",
+        cloudUsed: parsed.todayTotal,
+        models: parsed.models,
+        history: week.history,
+        error: null,
+        checkedAt: Date.now()
+      };
+      await reconcileQuota(env, account.id, parsed.todayTotal, dayLimit);
+    } catch (error) {
+      details[account.id] = {
+        status: "error",
+        cloudUsed: null,
+        models: [],
+        history: [],
+        error: error.message,
+        checkedAt: Date.now()
+      };
+    }
+  }));
+  const record = { accounts: details, fetchedAt: Date.now() };
+  await env.KV.put(USAGE_KEY, JSON.stringify(record), { expirationTtl: 86400 });
+  return record;
+}
+async function getCloudUsage(env, { force = false } = {}) {
+  if (!force) {
+    const cached = await env.KV.get(USAGE_KEY, "json").catch(() => null);
+    if (cached && Date.now() - cached.fetchedAt < 5 * 6e4) return cached;
+    if (cached) return cached;
+  }
+  return refreshCloudUsage(env);
+}
+async function getUsageSummary(env, ctx, { force = false } = {}) {
+  const settings = await getSettings(env);
+  const limit = dailyLimit(settings, env);
+  const accounts = await getActiveAccounts(env);
+  if (!force) {
+    const cached = await env.KV.get(SUMMARY_KEY, "json").catch(() => null);
+    if (cached && Date.now() - cached.fetchedAt < SUMMARY_TTL_MS && cached.limit === limit) return cached;
+  }
+  const local = await Promise.all(accounts.map(async (account) => {
+    const status = await quotaStatus(env, account.id, limit);
+    return {
+      id: account.id,
+      name: account.name,
+      accountId: account.accountId,
+      used: status.used || 0,
+      reserved: status.reserved || 0,
+      remaining: status.remaining ?? limit,
+      limit,
+      error: status.error || null
+    };
+  }));
+  const cloud = await getCloudUsage(env, { force: false }).catch(() => null);
+  const models = /* @__PURE__ */ new Map();
+  for (const account of accounts) {
+    const detail = cloud?.accounts?.[account.id];
+    for (const item of detail?.models || []) {
+      const existing = models.get(item.model) || { model: item.model, neurons: 0, requests: 0 };
+      existing.neurons += item.neurons;
+      existing.requests += item.requests;
+      models.set(item.model, existing);
+    }
+  }
+  const used = local.reduce((sum, item) => sum + item.used, 0);
+  const reserved = local.reduce((sum, item) => sum + item.reserved, 0);
+  const totalLimit = accounts.length * limit;
+  const summary = {
+    totalNeuronsToday: used,
+    cloudNeuronsToday: Object.values(cloud?.accounts || {}).reduce((sum, item) => sum + (item.cloudUsed || 0), 0),
+    reservedNeurons: reserved,
+    totalAccounts: accounts.length,
+    totalLimit,
+    usagePercentage: totalLimit > 0 ? Math.round(used / totalLimit * 1e4) / 100 : 0,
+    remainingNeurons: Math.max(0, totalLimit - used - reserved),
+    modelsToday: [...models.values()].sort((a, b) => b.neurons - a.neurons),
+    accounts: local,
+    quotaBackend: env.QUOTA ? "durable-object" : "kv",
+    cloudUsageError: cloud ? void 0 : "Cloud analytics unavailable; using local accounting.",
+    fetchedAt: Date.now(),
+    limit
+  };
+  await env.KV.put(SUMMARY_KEY, JSON.stringify(summary), { expirationTtl: 3600 });
+  return summary;
 }
 
-function processAnalytics(groups) {
-	const todayStr = new Date().toISOString().split('T')[0];
-
-	let todayTotalNeurons = 0;
-	const todayModelsMap = {};
-	const historyMap = {};
-
-	// 先把最近 7 天的历史数据全部初始化为 0
-	for (let i = 6; i >= 0; i--) {
-		const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
-		const dStr = d.toISOString().split('T')[0];
-		historyMap[dStr] = 0;
-	}
-
-	for (const group of groups) {
-		const date = group.dimensions.date;
-		const model = group.dimensions.modelId;
-		const neurons = group.sum.totalNeurons || 0;
-		const count = group.count || 0;
-
-		if (date === todayStr) {
-			todayTotalNeurons += neurons;
-			if (!todayModelsMap[model]) {
-				todayModelsMap[model] = { model, neurons: 0, requests: 0 };
-			}
-			todayModelsMap[model].neurons += neurons;
-			todayModelsMap[model].requests += count;
-		}
-
-		if (historyMap[date] !== undefined) {
-			historyMap[date] += neurons;
-		}
-	}
-
-	const todayModels = Object.values(todayModelsMap).sort((a, b) => b.neurons - a.neurons);
-	const history = Object.keys(historyMap)
-		.sort()
-		.map(date => ({ date, neurons: historyMap[date] }));
-
-	return {
-		todayTotalNeurons,
-		todayModels,
-		history
-	};
+// src/admin.js
+async function requireAdmin(request, env) {
+  if (!await isAdmin(request, env)) {
+    throw new RequestError("Unauthorized. Sign in at /admin.", { status: 401, code: "unauthorized", type: "authentication_error" });
+  }
+}
+function publicAccount(account) {
+  return {
+    id: account.id,
+    name: account.name,
+    accountId: account.accountId,
+    status: account.status,
+    createdAt: account.createdAt,
+    tokenPreview: account.apiToken ? `\u2022\u2022\u2022\u2022${String(account.apiToken).slice(-4)}` : ""
+  };
+}
+function publicKey(key) {
+  return {
+    id: key.id,
+    name: key.name,
+    prefix: key.prefix,
+    last4: key.last4,
+    createdAt: key.createdAt,
+    lastUsedAt: key.lastUsedAt,
+    enabled: key.enabled !== false
+  };
+}
+function sanitizeSettings(settings, env, patch = {}) {
+  const maxDaily = Math.max(1, Number(env.MAX_DAILY_NEURONS) || 1e4);
+  const next = { ...settings };
+  if (patch.gatewayId !== void 0) next.gatewayId = String(patch.gatewayId || "").trim().slice(0, 120);
+  if (patch.gatewaySkipCache !== void 0) next.gatewaySkipCache = patch.gatewaySkipCache === true;
+  if (patch.allowPublic !== void 0) next.allowPublic = patch.allowPublic === true;
+  if (patch.defaultMaxOutputTokens !== void 0) {
+    next.defaultMaxOutputTokens = Math.min(131072, Math.max(1, Number(patch.defaultMaxOutputTokens) || 1024));
+  }
+  if (patch.dailyNeurons !== void 0) {
+    const value = Number(patch.dailyNeurons);
+    if (!Number.isFinite(value) || value < 1) throw new RequestError("dailyNeurons must be a positive number", { status: 400 });
+    if (value > maxDaily) {
+      throw new RequestError(`dailyNeurons cannot exceed ${maxDaily.toLocaleString()} (the free allowance guard). Set MAX_DAILY_NEURONS only on a paid plan.`, {
+        status: 400,
+        code: "quota_limit_exceeded"
+      });
+    }
+    next.dailyNeurons = value;
+  }
+  if (patch.aliases !== void 0) {
+    if (!patch.aliases || typeof patch.aliases !== "object" || Array.isArray(patch.aliases)) {
+      throw new RequestError("aliases must be an object mapping alias -> @cf/model", { status: 400 });
+    }
+    const aliases = {};
+    for (const [alias, target] of Object.entries(patch.aliases)) {
+      if (!/^[@a-zA-Z0-9._/-]+$/.test(alias) || !String(target).startsWith("@cf/")) {
+        throw new RequestError(`Invalid alias: ${alias}`, { status: 400 });
+      }
+      aliases[alias] = String(target);
+    }
+    next.aliases = aliases;
+  }
+  if (patch.benchmarks !== void 0) {
+    if (!patch.benchmarks || typeof patch.benchmarks !== "object" || Array.isArray(patch.benchmarks)) {
+      throw new RequestError("benchmarks must be an object mapping model id -> 0-100", { status: 400 });
+    }
+    const benchmarks = {};
+    for (const [id, score] of Object.entries(patch.benchmarks)) {
+      const value = Number(score);
+      if (!id.startsWith("@cf/") || !Number.isFinite(value) || value < 0 || value > 100) {
+        throw new RequestError(`Invalid benchmark entry: ${id}`, { status: 400 });
+      }
+      benchmarks[id] = value;
+    }
+    next.benchmarks = benchmarks;
+  }
+  return next;
+}
+async function handleAdminApi(request, env, ctx) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const method = request.method;
+  if (path === "/api/health" && method === "GET") {
+    const settings = await getSettings(env);
+    return json({
+      ok: true,
+      version: "2.0.0",
+      configured: hasAdminPassword(env),
+      kv: Boolean(env.KV),
+      quota: env.QUOTA ? "durable-object" : "kv",
+      daily_neurons: dailyLimit(settings, env),
+      ai_gateway: Boolean(settings.gatewayId)
+    });
+  }
+  if (path === "/api/auth/status" && method === "GET") {
+    return json({
+      configured: hasAdminPassword(env),
+      authenticated: await isAdmin(request, env)
+    });
+  }
+  if (path === "/api/auth/login" && method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    if (!hasAdminPassword(env)) {
+      throw new RequestError("ADMIN_PASSWORD is not configured on this deployment.", { status: 503, code: "not_configured" });
+    }
+    if (!timingSafeEqual(String(body.password || ""), String(env.ADMIN_PASSWORD).trim())) {
+      throw new RequestError("Incorrect password.", { status: 401, code: "invalid_password", type: "authentication_error" });
+    }
+    const token = await adminToken(env);
+    const secure = new URL(request.url).protocol === "https:";
+    return json({ ok: true }, { headers: { "Set-Cookie": adminCookie(token, { secure }) } });
+  }
+  if (path === "/api/auth/logout" && method === "POST") {
+    const secure = new URL(request.url).protocol === "https:";
+    return json({ ok: true }, { headers: { "Set-Cookie": adminCookie("", { clear: true, secure }) } });
+  }
+  if (path === "/api/catalog" && method === "GET") {
+    const data = await catalogResponse(env, ctx, {
+      includePaid: url.searchParams.get("include_paid") === "1",
+      task: url.searchParams.get("task"),
+      search: url.searchParams.get("search"),
+      sort: url.searchParams.get("sort") || "performance",
+      limit: url.searchParams.get("limit") ? Number(url.searchParams.get("limit")) : null
+    });
+    return json(data);
+  }
+  if (path === "/api/stats" && method === "GET") {
+    const summary = await getUsageSummary(env, ctx);
+    return json({
+      total_accounts: summary.totalAccounts,
+      usage_percentage: summary.usagePercentage,
+      free_daily_neurons: summary.limit,
+      quota_backend: summary.quotaBackend
+    });
+  }
+  await requireAdmin(request, env);
+  if (path === "/api/usage/summary" && method === "GET") {
+    return json(await getUsageSummary(env, ctx));
+  }
+  if (path === "/api/admin/overview" && method === "GET") {
+    const config = await getConfig(env, { force: true });
+    const usage = await getUsageSummary(env, ctx);
+    return json({
+      version: "2.0.0",
+      accounts: config.accounts.map(publicAccount),
+      keys: config.apiKeys.map(publicKey),
+      settings: { ...config.settings },
+      usage,
+      environment: {
+        adminPassword: hasAdminPassword(env),
+        kv: Boolean(env.KV),
+        quota: env.QUOTA ? "durable-object" : "kv",
+        maxDailyNeurons: Number(env.MAX_DAILY_NEURONS) || 1e4
+      }
+    });
+  }
+  if (path === "/api/admin/catalog" && method === "GET") {
+    return json(await catalogResponse(env, ctx, {
+      includePaid: true,
+      task: url.searchParams.get("task"),
+      search: url.searchParams.get("search"),
+      sort: url.searchParams.get("sort") || "performance",
+      limit: url.searchParams.get("limit") ? Number(url.searchParams.get("limit")) : null
+    }));
+  }
+  if (path === "/api/admin/catalog/refresh" && method === "POST") {
+    const data = await catalogResponse(env, ctx, { includePaid: true, sort: "performance" });
+    return json(data);
+  }
+  if (path === "/api/admin/accounts" && method === "GET") {
+    return json({ accounts: (await getAccounts(env)).map(publicAccount) });
+  }
+  if (path === "/api/admin/accounts" && method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    const accountId = String(body.accountId || "").trim();
+    const apiToken = String(body.apiToken || "").trim();
+    const name = String(body.name || "").trim() || "Cloudflare account";
+    if (!/^[a-f0-9]{32}$/i.test(accountId)) throw new RequestError("accountId must be the 32-character Cloudflare account ID.", { status: 400 });
+    if (apiToken.length < 20) throw new RequestError("apiToken looks too short.", { status: 400 });
+    let created;
+    await updateConfig(env, (config) => {
+      if (config.accounts.some((item) => item.accountId === accountId)) {
+        throw new RequestError("This Cloudflare account is already configured.", { status: 409, code: "duplicate_account" });
+      }
+      created = {
+        id: randomId("acc_"),
+        name,
+        accountId,
+        apiToken,
+        status: "active",
+        createdAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      config.accounts.push(created);
+      return config;
+    });
+    ctx?.waitUntil?.(catalogResponse(env, ctx, { includePaid: true }).catch(() => {
+    }));
+    return json({ account: publicAccount(created) }, { status: 201 });
+  }
+  const accountMatch = path.match(/^\/api\/admin\/accounts\/([^/]+)$/);
+  if (accountMatch) {
+    const id = decodeURIComponent(accountMatch[1]);
+    if (method === "PATCH" || method === "PUT") {
+      const body = await request.json().catch(() => ({}));
+      let updated;
+      await updateConfig(env, (config) => {
+        const account = config.accounts.find((item) => item.id === id);
+        if (!account) throw new RequestError("Account not found.", { status: 404 });
+        if (body.name !== void 0) account.name = String(body.name).trim().slice(0, 80) || account.name;
+        if (body.apiToken) account.apiToken = String(body.apiToken).trim();
+        if (body.status) account.status = body.status === "disabled" ? "disabled" : "active";
+        updated = account;
+        return config;
+      });
+      return json({ account: publicAccount(updated) });
+    }
+    if (method === "DELETE") {
+      await updateConfig(env, (config) => {
+        config.accounts = config.accounts.filter((item) => item.id !== id);
+        return config;
+      });
+      return json({ ok: true });
+    }
+  }
+  if (path === "/api/admin/accounts/test" && method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    const accountId = String(body.accountId || "").trim();
+    const token = String(body.apiToken || "").trim();
+    if (!accountId || !token) throw new RequestError("accountId and apiToken are required.", { status: 400 });
+    const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search?per_page=1`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.success === false) {
+      return json({
+        ok: false,
+        status: response.status,
+        error: data.errors?.[0]?.message || response.statusText
+      }, { status: 200 });
+    }
+    return json({ ok: true, models: Array.isArray(data.result) ? data.result.length : 0 });
+  }
+  if (path === "/api/admin/keys" && method === "GET") {
+    return json({ keys: (await getConfig(env)).apiKeys.map(publicKey) });
+  }
+  if (path === "/api/admin/keys" && method === "POST") {
+    const body = await request.json().catch(() => ({}));
+    const plaintext = `sk-wa-${randomId("")}`;
+    const hash = await sha256Hex(plaintext);
+    const record = {
+      id: randomId("key_"),
+      name: String(body.name || "API key").trim().slice(0, 80),
+      hash,
+      prefix: plaintext.slice(0, 10),
+      last4: plaintext.slice(-4),
+      createdAt: (/* @__PURE__ */ new Date()).toISOString(),
+      lastUsedAt: null,
+      enabled: true
+    };
+    await updateConfig(env, (config) => {
+      config.apiKeys.push(record);
+      return config;
+    });
+    return json({ key: publicKey(record), plaintext }, { status: 201 });
+  }
+  const keyMatch = path.match(/^\/api\/admin\/keys\/([^/]+)$/);
+  if (keyMatch) {
+    const id = decodeURIComponent(keyMatch[1]);
+    if (method === "PATCH" || method === "PUT") {
+      const body = await request.json().catch(() => ({}));
+      let updated;
+      await updateConfig(env, (config) => {
+        const key = config.apiKeys.find((item) => item.id === id);
+        if (!key) throw new RequestError("Key not found.", { status: 404 });
+        if (body.name !== void 0) key.name = String(body.name).trim().slice(0, 80) || key.name;
+        if (body.enabled !== void 0) key.enabled = body.enabled === true;
+        updated = key;
+        return config;
+      });
+      return json({ key: publicKey(updated) });
+    }
+    if (method === "DELETE") {
+      await updateConfig(env, (config) => {
+        config.apiKeys = config.apiKeys.filter((item) => item.id !== id);
+        return config;
+      });
+      return json({ ok: true });
+    }
+  }
+  if (path === "/api/admin/settings" && method === "GET") {
+    return json({ settings: await getSettings(env) });
+  }
+  if (path === "/api/admin/settings" && (method === "PUT" || method === "PATCH")) {
+    const body = await request.json().catch(() => ({}));
+    let saved;
+    await updateConfig(env, (config) => {
+      config.settings = sanitizeSettings(config.settings, env, body);
+      saved = config.settings;
+      return config;
+    });
+    return json({ settings: saved });
+  }
+  if (path === "/api/admin/usage" && method === "GET") {
+    const force = url.searchParams.get("force") === "1";
+    if (force) await refreshCloudUsage(env, { limit: 20 }).catch(() => null);
+    return json(await getUsageSummary(env, ctx, { force: true }));
+  }
+  throw new RequestError(`Admin API route not found: ${path}`, { status: 404, code: "not_found" });
 }
 
-// ----------------------------------------------------
-// OpenAI 兼容代理接口（/v1/）的处理函数
-// ----------------------------------------------------
-async function handleV1Proxy(request, env, ctx) {
-	const url = new URL(request.url);
-
-	// 1. 校验调用密钥（API Key）
-	if (!await checkProxyAuth(request, env)) {
-		// /v1/messages 返回 Anthropic 格式错误，其他路径返回 OpenAI 格式
-		if (url.pathname === '/v1/messages') {
-			return new Response(JSON.stringify({
-				type: 'error',
-				error: {
-					type: 'authentication_error',
-					message: 'Invalid x-api-key or Authorization header.'
-				}
-			}), { status: 401, headers: { 'Content-Type': 'application/json' } });
-		}
-		return new Response(JSON.stringify({
-			error: {
-				message: "Incorrect or missing API key. Configure keys in the dashboard.",
-				type: "invalid_request_error",
-				param: null,
-				code: "invalid_api_key"
-			}
-		}), { status: 401, headers: { 'Content-Type': 'application/json' } });
-	}
-
-	// 2. 获取模型列表接口（/v1/models）
-	if (url.pathname === '/v1/models' && request.method === 'GET') {
-		const customMap = await getCustomModelMap(env);
-		const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
-
-		const modelsData = Object.keys(combinedMap).map(id => {
-			const isEmbedding = id.includes('embedding');
-			return {
-				id,
-				object: 'model',
-				created: 1686935000,
-				owned_by: isEmbedding ? 'openai' : 'meta'
-			};
-		});
-
-
-		return new Response(JSON.stringify({
-			object: 'list',
-			data: modelsData
-		}), { headers: { 'Content-Type': 'application/json' } });
-	}
-
-	// 3. 对话补全 / 文本补全 接口
-	if ((url.pathname === '/v1/chat/completions' || url.pathname === '/v1/completions') && request.method === 'POST') {
-		return handleCompletions(request, env, url.pathname);
-	}
-
-	// 4. Anthropic Messages API 接口（/v1/messages）
-	if (url.pathname === '/v1/messages' && request.method === 'POST') {
-		return handleMessages(request, env);
-	}
-
-	// 向量嵌入接口
-	if (url.pathname === '/v1/embeddings' && request.method === 'POST') {
-		return handleEmbeddings(request, env);
-	}
-
-	return new Response(JSON.stringify({
-		error: { message: `Path not found: ${url.pathname}`, type: "invalid_request_error" }
-	}), { status: 404, headers: { 'Content-Type': 'application/json' } });
+// src/proxy/inference.js
+var InferenceError = class extends Error {
+  constructor(message, { status = 502, code = "upstream_error", headers = {}, extra = {} } = {}) {
+    super(message);
+    this.name = "InferenceError";
+    this.status = status;
+    this.code = code;
+    this.headers = headers;
+    this.extra = extra;
+  }
+  toResponse() {
+    return openAIError(this.message, {
+      status: this.status,
+      type: this.status === 429 ? "insufficient_quota" : "upstream_error",
+      code: this.code,
+      extra: this.extra
+    });
+  }
+};
+function shuffle2(items) {
+  const copy = [...items];
+  for (let i = copy.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+function upstreamPath(task, model, endpoint = "openai") {
+  if (endpoint === "responses") return "/ai/v1/responses";
+  if (endpoint === "native" || !model.openai_compatible) return `/ai/run/${model.id}`;
+  if (task === "embeddings") return "/ai/v1/embeddings";
+  return "/ai/v1/chat/completions";
+}
+function parseCloudflareError(text) {
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+  }
+  const code = data?.errors?.[0]?.code ?? data?.error?.code ?? null;
+  const message = data?.errors?.[0]?.message || data?.error?.message || data?.message || String(text || "").slice(0, 500) || "Unknown upstream error";
+  return { code, message, data };
+}
+function classifyError(status, parsed) {
+  const code = Number(parsed.code);
+  if (code === 3036 || /daily free allocation/i.test(parsed.message)) {
+    return { retry: true, exhaust: true, status: 429, code: "insufficient_quota", message: "The daily free allocation of 10,000 neurons is exhausted for this account. It resets at 00:00 UTC." };
+  }
+  if (code === 5035 || /requires a workers paid plan/i.test(parsed.message)) {
+    return { retry: true, status: 403, code: "model_requires_paid_plan", message: "This model requires a Workers Paid plan or AI Gateway prepaid credits and is excluded from the free catalog." };
+  }
+  if (code === 3040 || /capacity temporarily exceeded/i.test(parsed.message)) {
+    return { retry: true, status: 429, code: "capacity_exceeded", message: "Workers AI capacity is temporarily exceeded. Please retry." };
+  }
+  if (code === 5007 || code === 3042 || status === 404) {
+    return { retry: false, status: 404, code: "model_not_found", message: parsed.message };
+  }
+  if (status === 413 || code === 3006) {
+    return { retry: false, status: 413, code: "request_too_large", message: parsed.message };
+  }
+  if (status === 400 || status === 422) {
+    return { retry: false, status: 400, code: "invalid_request", message: parsed.message };
+  }
+  if (status === 401 || status === 403) {
+    return { retry: true, status: 403, code: "account_forbidden", message: parsed.message };
+  }
+  if (status === 429) {
+    return { retry: true, status: 429, code: "rate_limited", message: parsed.message };
+  }
+  return { retry: status >= 500, status: 502, code: "upstream_error", message: parsed.message };
+}
+async function runInference(request, env, ctx, {
+  model,
+  task,
+  body,
+  stream = false,
+  endpoint = "openai",
+  rawBody = null,
+  contentType = "application/json"
+}) {
+  const settings = await getSettings(env);
+  const accounts = shuffle2(await getActiveAccounts(env));
+  if (accounts.length === 0) {
+    throw new InferenceError("No active Cloudflare account configured. Add one in the admin panel.", {
+      status: 503,
+      code: "no_accounts"
+    });
+  }
+  const limit = Number(settings.dailyNeurons) || 1e4;
+  const estimate = estimateNeuronsForTask(model, task, body, settings);
+  const promptTokens = estimateTokens(body?.messages || body?.input || body?.prompt || "");
+  const path = upstreamPath(task, model, endpoint);
+  if (estimate > limit) {
+    throw new InferenceError(
+      `This request needs an estimated ${estimate.toLocaleString()} neurons, which is more than the entire daily free allowance (${limit.toLocaleString()}). Reduce the prompt or max_tokens.`,
+      { status: 429, code: "insufficient_quota", extra: { estimated_neurons: estimate, daily_limit: limit } }
+    );
+  }
+  const exhausted = [];
+  let lastError = null;
+  for (const account of accounts) {
+    const reservation = await reserveQuota(env, account.id, estimate, limit);
+    if (!reservation.ok) {
+      exhausted.push({
+        account: account.name,
+        remaining: reservation.remaining ?? 0,
+        used: reservation.used ?? 0,
+        limit
+      });
+      continue;
+    }
+    let settled = false;
+    const settle = async (actual, usage = null) => {
+      if (settled) return null;
+      settled = true;
+      const value = Math.max(0, Math.ceil(Number(actual) || 0));
+      const status = await settleQuota(env, account.id, estimate, value, limit);
+      if (usage) {
+        status.usage = usage;
+      }
+      return status;
+    };
+    const headers = new Headers({
+      Authorization: `Bearer ${account.apiToken}`,
+      "Content-Type": contentType,
+      Accept: stream ? "text/event-stream" : "application/json"
+    });
+    if (settings.gatewayId) headers.set("cf-aig-gateway-id", String(settings.gatewayId));
+    if (settings.gatewaySkipCache) headers.set("cf-aig-skip-cache", "true");
+    const affinity = request.headers.get("x-session-affinity");
+    if (affinity) headers.set("x-session-affinity", affinity);
+    for (const name of ["cf-aig-cache-ttl", "cf-aig-cache-key", "cf-aig-skip-cache"]) {
+      const value = request.headers.get(name);
+      if (value && settings.gatewayId) headers.set(name, value);
+    }
+    let response;
+    try {
+      response = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${account.accountId}${path}`,
+        {
+          method: "POST",
+          headers,
+          body: rawBody ?? JSON.stringify(body)
+        }
+      );
+    } catch (error) {
+      await settle(0);
+      lastError = new InferenceError(`Connection to Cloudflare failed: ${error.message}`, { status: 502 });
+      continue;
+    }
+    if (response.ok) {
+      return {
+        response,
+        account,
+        model,
+        estimate,
+        limit,
+        promptTokens,
+        settle
+      };
+    }
+    const text = await response.text();
+    const parsed = parseCloudflareError(text);
+    const decision = classifyError(response.status, parsed);
+    await settle(0);
+    if (decision.exhaust) await exhaustQuota(env, account.id, limit);
+    lastError = new InferenceError(decision.message, {
+      status: decision.status,
+      code: decision.code,
+      extra: { upstream_code: parsed.code, account: account.name }
+    });
+    if (!decision.retry) throw lastError;
+  }
+  if (exhausted.length > 0 && exhausted.length === accounts.length) {
+    throw new InferenceError(
+      `All ${accounts.length} Cloudflare account(s) have used their daily free allocation of ${limit.toLocaleString()} neurons. Resets at 00:00 UTC.`,
+      {
+        status: 429,
+        code: "insufficient_quota",
+        extra: { accounts: exhausted, daily_limit: limit }
+      }
+    );
+  }
+  throw lastError || new InferenceError("All Cloudflare accounts failed", { status: 502 });
+}
+async function settleFromJson(result, dataExceptUsage) {
+  const usage = dataExceptUsage?.usage || dataExceptUsage?.result?.usage || null;
+  const actual = actualChatNeurons(result.model, usage);
+  const status = await result.settle(actual ?? result.estimate, usage);
+  return { actual: actual ?? result.estimate, status };
+}
+function inferenceHeaders(result, extra = {}) {
+  const headers = new Headers(extra);
+  headers.set("x-workers-ai-model", result.model.id);
+  headers.set("x-workers-ai-account", result.account.name);
+  headers.set("x-quota-limit", String(result.limit));
+  return headers;
+}
+function instrumentStream(result, { requestedModel, extraHeaders = {} } = {}) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let usage = null;
+  const transform = new TransformStream({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(payload);
+          if (parsed.usage) usage = parsed.usage;
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (typeof delta === "string") text += delta;
+          if (typeof parsed.choices?.[0]?.text === "string") text += parsed.choices[0].text;
+          if (parsed.model) parsed.model = requestedModel || parsed.model;
+        } catch {
+        }
+      }
+    },
+    async flush() {
+      const actual = actualChatNeurons(result.model, usage) ?? Math.max(
+        1,
+        Math.ceil((result.promptTokens || 0) / 1e6 * 5e4 + estimateTokensFromText(text) / 1e6 * 15e4)
+      );
+      await result.settle(actual, usage);
+    }
+  });
+  const headers = inferenceHeaders(result, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    ...extraHeaders
+  });
+  return new Response(result.response.body.pipeThrough(transform), { status: 200, headers });
 }
 
-// ----------------------------------------------------
-// 可复用的核心 API 调用函数
-// 将 OpenAI Chat Completions 格式的请求发送到 Cloudflare AI 网关，
-// 支持多账号负载均衡和故障自动切换。
-// 返回格式：{ success: true, data: cfJson } 或 { success: false, error: "..." }
-// ----------------------------------------------------
-async function callOpenAICompatibleAPI(cfPayload, env, stream) {
-	const accounts = await getAccounts(env);
-	const activeAccounts = accounts.filter(a => a.status === 'active');
-	if (activeAccounts.length === 0) {
-		return { success: false, error: "No active Cloudflare accounts configured. Add them in the WebUI." };
-	}
-
-	const shuffledAccounts = [...activeAccounts].sort(() => Math.random() - 0.5);
-	let lastError = null;
-
-	for (const account of shuffledAccounts) {
-		try {
-			const cfResponse = await fetch(
-				`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/v1/chat/completions`,
-				{
-					method: 'POST',
-					headers: {
-						'Authorization': `Bearer ${account.apiToken}`,
-						'Content-Type': 'application/json',
-					},
-					body: JSON.stringify(cfPayload),
-				}
-			);
-
-			if (cfResponse.ok) {
-				if (stream) {
-					return { success: true, stream: cfResponse.body };
-				} else {
-					const cfJson = await cfResponse.json();
-					return { success: true, data: cfJson };
-				}
-			} else {
-				const errorText = await cfResponse.text();
-				lastError = `CF API returned ${cfResponse.status}: ${errorText}`;
-			}
-		} catch (e) {
-			lastError = `Connection error: ${e.message}`;
-		}
-	}
-
-	return { success: false, error: `All Cloudflare accounts failed. Last error: ${lastError}` };
+// src/proxy/chat.js
+var PASSTHROUGH_FIELDS = [
+  "temperature",
+  "top_p",
+  "n",
+  "stop",
+  "max_tokens",
+  "max_completion_tokens",
+  "presence_penalty",
+  "frequency_penalty",
+  "logit_bias",
+  "logprobs",
+  "top_logprobs",
+  "seed",
+  "user",
+  "tools",
+  "tool_choice",
+  "parallel_tool_calls",
+  "response_format",
+  "metadata",
+  "modalities",
+  "audio",
+  "prediction",
+  "reasoning_effort",
+  "web_search_options",
+  "store",
+  "chat_template_kwargs",
+  "options"
+];
+async function handleChat(request, env, ctx, model, { legacyCompletions = false } = {}) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    throw new RequestError("Invalid JSON body", { status: 400 });
+  }
+  const requestedModel = String(body.model || model.id);
+  const stream = body.stream === true;
+  if (legacyCompletions) {
+    if (stream) {
+      throw new RequestError("Streaming is not supported on /v1/completions. Use /v1/chat/completions.", {
+        status: 400,
+        code: "stream_not_supported"
+      });
+    }
+    if (body.prompt == null) {
+      throw new RequestError("prompt is required", { status: 400, code: "missing_prompt" });
+    }
+    const prompt = Array.isArray(body.prompt) ? body.prompt.join("\n") : String(body.prompt);
+    body.messages = [{ role: "user", content: prompt }];
+  }
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    throw new RequestError("messages must be a non-empty array", { status: 400, code: "invalid_messages", param: "messages" });
+  }
+  const upstreamBody = {
+    model: model.id,
+    messages: body.messages,
+    stream
+  };
+  for (const field of PASSTHROUGH_FIELDS) {
+    if (body[field] !== void 0) upstreamBody[field] = body[field];
+  }
+  if (stream) {
+    upstreamBody.stream_options = { include_usage: true, ...body.stream_options || {} };
+  }
+  const result = await runInference(request, env, ctx, {
+    model,
+    task: "chat",
+    body: upstreamBody,
+    stream
+  });
+  if (stream) {
+    return instrumentStream(result, { requestedModel });
+  }
+  let data;
+  try {
+    data = await result.response.json();
+  } catch {
+    const text = await result.response.text().catch(() => "");
+    await result.settle(result.estimate);
+    throw new RequestError(`Cloudflare returned a non-JSON response: ${text.slice(0, 200)}`, { status: 502, code: "upstream_invalid_response" });
+  }
+  const settlement = await settleFromJson(result, data);
+  const headers = inferenceHeaders(result, { "Content-Type": "application/json; charset=utf-8" });
+  headers.set("x-quota-remaining", String(settlement.status?.remaining ?? 0));
+  if (legacyCompletions) {
+    return json(toTextCompletion(data, requestedModel), { headers });
+  }
+  if (data.model !== void 0) data.model = requestedModel;
+  if (data.usage && settlement.actual) data.usage.estimated_neurons = settlement.actual;
+  return json(data, { headers });
+}
+function toTextCompletion(data, requestedModel) {
+  const choices = (data.choices || []).map((choice, index) => ({
+    text: choice.message?.content ?? choice.text ?? "",
+    index: choice.index ?? index,
+    logprobs: null,
+    finish_reason: choice.finish_reason ?? "stop"
+  }));
+  return {
+    id: data.id || `cmpl_${Date.now()}`,
+    object: "text_completion",
+    created: data.created || Math.floor(Date.now() / 1e3),
+    model: requestedModel,
+    choices,
+    usage: data.usage
+  };
+}
+async function handleResponses(request, env, ctx, model) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    throw new RequestError("Invalid JSON body", { status: 400 });
+  }
+  if (body.stream === true) {
+    throw new RequestError("The Responses API only supports stream: false on Workers AI.", { status: 400, code: "stream_not_supported" });
+  }
+  if (!model.id.includes("gpt-oss")) {
+    throw new RequestError("The /v1/responses endpoint is only available for @cf/openai/gpt-oss-20b and @cf/openai/gpt-oss-120b.", {
+      status: 400,
+      code: "unsupported_model"
+    });
+  }
+  const upstreamBody = { ...body, model: model.id, stream: false };
+  const result = await runInference(request, env, ctx, {
+    model,
+    task: "chat",
+    body: upstreamBody,
+    endpoint: "responses"
+  });
+  const data = await result.response.json();
+  const settlement = await settleFromJson(result, data);
+  const headers = inferenceHeaders(result, { "Content-Type": "application/json; charset=utf-8" });
+  headers.set("x-quota-remaining", String(settlement.status?.remaining ?? 0));
+  if (data.model) data.model = body.model || model.id;
+  return json(data, { headers });
 }
 
-// 共享的模型名解析函数：根据用户传入的模型名，映射到 Cloudflare 实际模型
-async function resolveModelName(model, env) {
-	if (model.startsWith('@cf/')) return model;
-	const customMap = await getCustomModelMap(env);
-	const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
-	return combinedMap[model] || '@cf/zai-org/glm-4.7-flash';
+// src/proxy/embeddings.js
+async function handleEmbeddings(request, env, ctx, model) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    throw new RequestError("Invalid JSON body", { status: 400 });
+  }
+  if (body.input == null) {
+    throw new RequestError("input is required", { status: 400, code: "missing_input", param: "input" });
+  }
+  if (model.task !== "text-embeddings") {
+    throw new RequestError(`Model "${model.id}" is not an embeddings model.`, { status: 400, code: "model_task_mismatch" });
+  }
+  const upstreamBody = { model: model.id, input: body.input };
+  if (body.encoding_format) upstreamBody.encoding_format = body.encoding_format;
+  if (body.user) upstreamBody.user = body.user;
+  const result = await runInference(request, env, ctx, {
+    model,
+    task: "embeddings",
+    body: upstreamBody
+  });
+  const data = await result.response.json();
+  const usage = data.usage || null;
+  const actual = usage?.prompt_tokens ? Math.ceil(usage.prompt_tokens / 1e6 * (model.pricing?.tokens?.input_neurons_per_million || 5e4)) : result.estimate;
+  const settlement = await result.settle(Math.max(1, actual), usage || { prompt_tokens: null, total_tokens: null });
+  const headers = inferenceHeaders(result, { "Content-Type": "application/json; charset=utf-8" });
+  headers.set("x-quota-remaining", String(settlement?.remaining ?? 0));
+  if (data.model) data.model = body.model || model.id;
+  return json(data, { headers });
 }
 
-// 对话补全 / 文本补全 的代理处理函数
-async function handleCompletions(request, env, pathname) {
-	let body;
-	try {
-		body = await request.json();
-	} catch (e) {
-		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400 });
-	}
-
-	const { model, messages, prompt, stream } = body;
-
-	if (pathname === '/v1/chat/completions' && !messages) {
-		return new Response(JSON.stringify({ error: { message: "messages field is required", type: "invalid_request_error" } }), { status: 400 });
-	}
-	if (pathname === '/v1/completions' && !prompt) {
-		return new Response(JSON.stringify({ error: { message: "prompt field is required", type: "invalid_request_error" } }), { status: 400 });
-	}
-
-	// 解析模型名映射
-	const cfModel = await resolveModelName(model, env);
-
-	// 构造发给 Cloudflare 的请求体
-	const cfPayload = {
-		model: cfModel,
-		messages: pathname === '/v1/chat/completions' ? messages : [{ role: 'user', content: prompt }],
-		stream: !!stream,
-	};
-
-	const passthroughFields = [
-		'temperature', 'max_tokens', 'top_p', 'n',
-		'stop', 'presence_penalty', 'frequency_penalty',
-		'logprobs', 'top_logprobs', 'seed', 'user',
-		'tools', 'tool_choice', 'parallel_tool_calls',
-		'response_format',
-	];
-	for (const field of passthroughFields) {
-		if (body[field] !== undefined) cfPayload[field] = body[field];
-	}
-
-	const result = await callOpenAICompatibleAPI(cfPayload, env, stream);
-
-	if (!result.success) {
-		return new Response(JSON.stringify({
-			error: { message: result.error, type: "server_error" }
-		}), { status: 502, headers: { 'Content-Type': 'application/json' } });
-	}
-
-	if (stream) {
-		const transformedStream = passthroughStream(result.stream, model);
-		return new Response(transformedStream, {
-			headers: {
-				'Content-Type': 'text/event-stream',
-				'Cache-Control': 'no-cache',
-				'Connection': 'keep-alive',
-				'Transfer-Encoding': 'chunked',
-			},
-		});
-	} else {
-		const cfJson = result.data;
-		if (cfJson.model !== undefined) cfJson.model = model;
-		return new Response(JSON.stringify(cfJson), {
-			headers: { 'Content-Type': 'application/json' },
-		});
-	}
+// src/proxy/media.js
+function parseSize(size, fallback = 1024) {
+  const match = String(size || "").match(/(\d+)\s*[x×]\s*(\d+)/i);
+  if (!match) return { width: fallback, height: fallback };
+  return { width: Number(match[1]), height: Number(match[2]) };
+}
+async function handleImages(request, env, ctx, model) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    throw new RequestError("Invalid JSON body", { status: 400 });
+  }
+  if (!body.prompt) {
+    throw new RequestError("prompt is required", { status: 400, code: "missing_prompt", param: "prompt" });
+  }
+  const count = Math.min(4, Math.max(1, Number(body.n) || 1));
+  const { width, height } = parseSize(body.size);
+  const data = [];
+  let lastResult = null;
+  for (let index = 0; index < count; index += 1) {
+    const upstreamBody = {
+      prompt: String(body.prompt),
+      width,
+      height,
+      steps: Number(body.steps ?? body.num_steps ?? 4)
+    };
+    if (body.seed != null) upstreamBody.seed = Number(body.seed) + index;
+    if (body.negative_prompt) upstreamBody.negative_prompt = body.negative_prompt;
+    if (body.guidance != null) upstreamBody.guidance = Number(body.guidance);
+    const result = await runInference(request, env, ctx, {
+      model,
+      task: "image",
+      body: upstreamBody
+    });
+    const response = await result.response.json();
+    const image = response?.result?.image || response?.image || response?.result?.images?.[0];
+    if (!image) {
+      await result.settle(result.estimate);
+      throw new RequestError("Cloudflare returned no image data.", { status: 502, code: "upstream_invalid_response" });
+    }
+    await result.settle(result.estimate);
+    lastResult = result;
+    data.push({
+      b64_json: image,
+      url: response?.result?.url || void 0,
+      revised_prompt: body.prompt
+    });
+  }
+  const headers = inferenceHeaders(lastResult, { "Content-Type": "application/json; charset=utf-8" });
+  return json({
+    created: Math.floor(Date.now() / 1e3),
+    data,
+    model: body.model || model.id
+  }, { headers });
+}
+async function handleRun(request, env, ctx, model) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    throw new RequestError("Invalid JSON body", { status: 400 });
+  }
+  const inputs = body.inputs ?? body.input ?? body;
+  const result = await runInference(request, env, ctx, {
+    model,
+    task: "generic",
+    body: inputs,
+    endpoint: "native"
+  });
+  const response = await result.response.json();
+  await result.settle(result.estimate);
+  const headers = inferenceHeaders(result, { "Content-Type": "application/json; charset=utf-8" });
+  return json({
+    model: body.model || model.id,
+    task: model.task,
+    result: response?.result ?? response,
+    raw: response
+  }, { headers });
+}
+async function handleRerank(request, env, ctx, model) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    throw new RequestError("Invalid JSON body", { status: 400 });
+  }
+  if (!body.query) throw new RequestError("query is required", { status: 400, code: "missing_query" });
+  if (!Array.isArray(body.documents) || body.documents.length === 0) {
+    throw new RequestError("documents must be a non-empty array", { status: 400, code: "missing_documents" });
+  }
+  const documents = body.documents.map((document) => typeof document === "string" ? document : document.text || document.content || "");
+  const topN = Math.min(documents.length, Math.max(1, Number(body.top_n || body.top_k) || documents.length));
+  const result = await runInference(request, env, ctx, {
+    model,
+    task: "generic",
+    body: { query: body.query, contexts: documents.map((text) => ({ text })), top_k: topN },
+    endpoint: "native"
+  });
+  const data = await result.response.json();
+  await result.settle(result.estimate);
+  const raw = data?.result?.response || data?.result || data?.response || [];
+  const results = (Array.isArray(raw) ? raw : []).map((item) => {
+    const index = Number(item.id ?? item.index);
+    return {
+      index: Number.isFinite(index) ? index : null,
+      relevance_score: Number(item.score ?? item.relevance_score ?? 0),
+      ...body.return_documents === false ? {} : { document: documents[index] ?? null }
+    };
+  }).filter((item) => item.index != null).sort((a, b) => b.relevance_score - a.relevance_score).slice(0, topN);
+  const headers = inferenceHeaders(result, { "Content-Type": "application/json; charset=utf-8" });
+  return json({ id: `rerank_${Date.now()}`, model: body.model || model.id, results }, { headers });
 }
 
-// ----------------------------------------------------
-// Anthropic Messages API → OpenAI Chat Completions 格式转换
-// ----------------------------------------------------
-function convertAnthropicToOpenAI(anthropicBody) {
-	const openaiBody = {};
-
-	// model 直接映射
-	openaiBody.model = anthropicBody.model;
-
-	// max_tokens 直接映射
-	if (anthropicBody.max_tokens !== undefined) {
-		openaiBody.max_tokens = anthropicBody.max_tokens;
-	}
-
-	// stream 直接映射
-	if (anthropicBody.stream !== undefined) {
-		openaiBody.stream = anthropicBody.stream;
-	}
-
-	// temperature 直接映射
-	if (anthropicBody.temperature !== undefined) {
-		openaiBody.temperature = anthropicBody.temperature;
-	}
-
-	// top_p 直接映射
-	if (anthropicBody.top_p !== undefined) {
-		openaiBody.top_p = anthropicBody.top_p;
-	}
-
-	// stop_sequences → stop
-	if (anthropicBody.stop_sequences !== undefined) {
-		openaiBody.stop = anthropicBody.stop_sequences;
-	}
-
-	// 构建 OpenAI 格式的 messages 数组
-	const openaiMessages = [];
-
-	// Anthropic system 字段 → OpenAI system role message (插入到 messages 最前面)
-	if (anthropicBody.system) {
-		let systemContent = '';
-		if (typeof anthropicBody.system === 'string') {
-			systemContent = anthropicBody.system;
-		} else if (Array.isArray(anthropicBody.system)) {
-			// system 为数组格式：[{type: "text", text: "..."}, ...]
-			for (const block of anthropicBody.system) {
-				if (block.type === 'text' && block.text) {
-					systemContent += block.text + '\n';
-				}
-			}
-			systemContent = systemContent.trim();
-		}
-		if (systemContent) {
-			openaiMessages.push({ role: 'system', content: systemContent });
-		}
-	}
-
-	// 转换 messages
-	for (const msg of anthropicBody.messages) {
-		const role = msg.role;
-		const content = msg.content;
-
-		// Anthropic 的 content 可能是字符串或数组
-		if (typeof content === 'string') {
-			openaiMessages.push({ role, content });
-		} else if (Array.isArray(content)) {
-
-			// assistant 消息：text 和 tool_use 需合并为一条消息（Bug #4）
-			if (role === 'assistant') {
-				let textContent = '';
-				const toolCalls = [];
-
-				for (const block of content) {
-					if (block.type === 'text') {
-						textContent += block.text || '';
-					} else if (block.type === 'tool_use') {
-						toolCalls.push({
-							id: block.id,
-							type: 'function',
-							function: {
-								name: block.name,
-								arguments: JSON.stringify(block.input || {})
-							}
-						});
-					}
-				}
-
-				const assistantMsg = { role: 'assistant', content: textContent || null };
-				if (toolCalls.length > 0) {
-					assistantMsg.tool_calls = toolCalls;
-				}
-				openaiMessages.push(assistantMsg);
-				continue;
-			}
-
-			// user 消息：先处理 tool_result，再处理 text/image（Bug #5）
-			if (role === 'user') {
-				// 先处理 tool_result 块
-				for (const block of content) {
-					if (block.type === 'tool_result') {
-						let resultContent = '';
-						if (typeof block.content === 'string') {
-							resultContent = block.content;
-						} else if (Array.isArray(block.content)) {
-							for (const c of block.content) {
-								if (c.type === 'text' && c.text) {
-									resultContent += c.text;
-								}
-							}
-						}
-						const toolMsg = {
-							role: 'tool',
-							tool_call_id: block.tool_use_id,
-							content: resultContent
-						};
-						if (block.name) toolMsg.name = block.name;
-						openaiMessages.push(toolMsg);
-					}
-				}
-
-				// 再处理剩余的 text 和 image 块
-				const openaiContentParts = [];
-				for (const block of content) {
-					if (block.type === 'text') {
-						openaiContentParts.push({ type: 'text', text: block.text || '' });
-					} else if (block.type === 'image') {
-						// Anthropic image source → OpenAI image_url
-						const source = block.source || {};
-						let imageUrl = '';
-						if (source.type === 'url' && source.url) {
-							// URL 类型图片（Bug #3）
-							imageUrl = source.url;
-						} else if (source.data) {
-							const mediaType = source.media_type || 'image/png';
-							imageUrl = `data:${mediaType};base64,${source.data}`;
-						}
-						if (imageUrl) {
-							openaiContentParts.push({
-								type: 'image_url',
-								image_url: { url: imageUrl }
-							});
-						}
-					}
-				}
-
-				if (openaiContentParts.length > 0) {
-					openaiMessages.push({ role: 'user', content: openaiContentParts });
-				}
-				continue;
-			}
-
-			// 兜底：其他角色只处理 text 块
-			const openaiContentParts = [];
-			for (const block of content) {
-				if (block.type === 'text') {
-					openaiContentParts.push({ type: 'text', text: block.text || '' });
-				}
-			}
-			if (openaiContentParts.length > 0) {
-				openaiMessages.push({ role, content: openaiContentParts });
-			}
-		}
-	}
-
-	// 确保第一条消息是 user（OpenAI 要求第一条消息必须是 user 或 system）
-	// 如果第一条是 assistant（来自 Anthropic 的多轮 tool calling），在它前面插入一条占位 user 消息
-	const firstNonSystemMsg = openaiMessages.find(m => m.role !== 'system');
-	if (firstNonSystemMsg && firstNonSystemMsg.role === 'assistant') {
-		// 找到 system 消息后的位置，插入一条空的 user 消息
-		const systemCount = openaiMessages.filter(m => m.role === 'system').length;
-		openaiMessages.splice(systemCount, 0, {
-			role: 'user',
-			content: '_'
-		});
-	}
-
-	openaiBody.messages = openaiMessages;
-
-	// tools 字段转换：Anthropic 格式 → OpenAI 格式
-	if (anthropicBody.tools && Array.isArray(anthropicBody.tools)) {
-		openaiBody.tools = anthropicBody.tools.map(tool => ({
-			type: 'function',
-			function: {
-				name: tool.name,
-				description: tool.description || '',
-				parameters: tool.input_schema || {}
-			}
-		}));
-	}
-
-	// tool_choice 转换
-	if (anthropicBody.tool_choice) {
-		const tc = anthropicBody.tool_choice;
-		if (tc.type === 'auto') {
-			openaiBody.tool_choice = 'auto';
-		} else if (tc.type === 'any') {
-			openaiBody.tool_choice = 'required';
-		} else if (tc.type === 'tool' && tc.name) {
-			openaiBody.tool_choice = { type: 'function', function: { name: tc.name } };
-		}
-	}
-
-	return openaiBody;
+// src/proxy/audio.js
+async function handleTranscription(request, env, ctx, model) {
+  let form;
+  try {
+    form = await request.formData();
+  } catch {
+    throw new RequestError('Expected multipart/form-data with an audio "file" field.', { status: 400, code: "invalid_form_data" });
+  }
+  const file = form.get("file");
+  if (!file || typeof file.arrayBuffer !== "function") {
+    throw new RequestError("file is required", { status: 400, code: "missing_file", param: "file" });
+  }
+  if (file.size > 25 * 1024 * 1024) {
+    throw new RequestError("Audio file is larger than the 25 MB limit.", { status: 413, code: "request_too_large" });
+  }
+  const language = form.get("language");
+  const prompt = form.get("prompt");
+  const responseFormat = form.get("response_format") || "json";
+  const temperature = form.get("temperature");
+  const body = {};
+  if (language) body.language = String(language);
+  if (prompt) body.prompt = String(prompt);
+  if (temperature) body.temperature = Number(temperature);
+  if (responseFormat === "verbose_json") body.vtt = true;
+  const result = await runInference(request, env, ctx, {
+    model,
+    task: "transcription",
+    body,
+    endpoint: "native",
+    rawBody: await file.arrayBuffer(),
+    contentType: file.type || "audio/mpeg"
+  });
+  const contentType = result.response.headers.get("Content-Type") || "";
+  let data;
+  if (contentType.includes("json")) {
+    data = await result.response.json();
+  } else {
+    const text2 = await result.response.text();
+    data = { text: text2 };
+  }
+  const output = data?.result ?? data;
+  const text = output?.text ?? "";
+  await result.settle(result.estimate, null);
+  const headers = inferenceHeaders(result, { "Content-Type": "application/json; charset=utf-8" });
+  if (responseFormat === "text") {
+    headers.set("Content-Type", "text/plain; charset=utf-8");
+    return new Response(text, { headers });
+  }
+  if (responseFormat === "vtt") {
+    headers.set("Content-Type", "text/vtt; charset=utf-8");
+    return new Response(output?.vtt || text, { headers });
+  }
+  if (responseFormat === "srt") {
+    headers.set("Content-Type", "application/x-subrip; charset=utf-8");
+    return new Response(output?.vtt ? vttToSrt(output.vtt) : text, { headers });
+  }
+  if (responseFormat === "verbose_json") {
+    return json({
+      task: "transcribe",
+      language: language || null,
+      duration: output?.duration ?? null,
+      text,
+      segments: output?.segments || null,
+      words: output?.words || null
+    }, { headers });
+  }
+  return json({ text }, { headers });
+}
+function vttToSrt(vtt) {
+  return String(vtt).replace(/^WEBVTT[^\n]*\n+/i, "").replace(/(\d{2}:\d{2}:\d{2})\.(\d{3})/g, "$1,$2").replace(/\n{3,}/g, "\n\n").trim();
+}
+async function handleSpeech(request, env, ctx, model) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    throw new RequestError("Invalid JSON body", { status: 400 });
+  }
+  if (!body.input) {
+    throw new RequestError("input is required", { status: 400, code: "missing_input", param: "input" });
+  }
+  let input;
+  if (model.id.includes("melotts")) {
+    input = { prompt: String(body.input), lang: body.language || body.lang || "en" };
+  } else if (model.id.includes("aura")) {
+    input = { text: String(body.input) };
+    if (body.voice) input.voice = String(body.voice);
+  } else {
+    input = { prompt: String(body.input) };
+  }
+  const result = await runInference(request, env, ctx, {
+    model,
+    task: "speech",
+    body: input,
+    endpoint: "native"
+  });
+  const upstreamType = result.response.headers.get("Content-Type") || "audio/mpeg";
+  if (upstreamType.includes("json")) {
+    const data = await result.response.json();
+    const audio = data?.result?.audio || data?.audio || data?.result;
+    await result.settle(result.estimate);
+    if (typeof audio === "string") {
+      const bytes = Uint8Array.from(atob(audio), (char) => char.charCodeAt(0));
+      return new Response(bytes, {
+        headers: inferenceHeaders(result, { "Content-Type": "audio/mpeg" })
+      });
+    }
+    throw new RequestError("Cloudflare returned an unexpected TTS payload.", { status: 502, code: "upstream_invalid_response" });
+  }
+  const transform = new TransformStream({
+    async flush() {
+      await result.settle(result.estimate);
+    }
+  });
+  const headers = inferenceHeaders(result, { "Content-Type": upstreamType });
+  headers.set("Content-Disposition", 'inline; filename="speech.mp3"');
+  return new Response(result.response.body.pipeThrough(transform), { headers });
 }
 
-// ----------------------------------------------------
-// OpenAI Chat Completion 响应 → Anthropic Messages 格式转换
-// ----------------------------------------------------
-function convertOpenAIToAnthropic(openaiResponse, originalModel) {
-	const choice = openaiResponse.choices?.[0] || {};
-	const message = choice.message || {};
+// src/proxy/anthropic.js
+function blockText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((block) => block.type === "text").map((block) => block.text || "").join("");
+}
+function anthropicToOpenAI(body) {
+  const messages = [];
+  if (body.system) {
+    messages.push({ role: "system", content: blockText(body.system) });
+  }
+  for (const message of body.messages || []) {
+    const role = message.role;
+    const content = message.content;
+    if (role === "assistant") {
+      let text2 = "";
+      const toolCalls = [];
+      for (const block of Array.isArray(content) ? content : [{ type: "text", text: content }]) {
+        if (block.type === "text") text2 += block.text || "";
+        else if (block.type === "tool_use") {
+          toolCalls.push({
+            id: block.id,
+            type: "function",
+            function: { name: block.name, arguments: JSON.stringify(block.input || {}) }
+          });
+        }
+      }
+      const assistant = { role: "assistant", content: text2 || null };
+      if (toolCalls.length) assistant.tool_calls = toolCalls;
+      messages.push(assistant);
+      continue;
+    }
+    if (role === "user") {
+      const parts = [];
+      for (const block of Array.isArray(content) ? content : [{ type: "text", text: content }]) {
+        if (block.type === "tool_result") {
+          messages.push({
+            role: "tool",
+            tool_call_id: block.tool_use_id,
+            content: blockText(block.content)
+          });
+        } else if (block.type === "text") {
+          parts.push({ type: "text", text: block.text || "" });
+        } else if (block.type === "image") {
+          const source = block.source || {};
+          const url = source.type === "url" && source.url ? source.url : source.data ? `data:${source.media_type || "image/png"};base64,${source.data}` : null;
+          if (url) parts.push({ type: "image_url", image_url: { url } });
+        }
+      }
+      if (parts.length) messages.push({ role: "user", content: parts });
+      continue;
+    }
+    const text = blockText(content);
+    if (text) messages.push({ role, content: text });
+  }
+  if (messages.length && messages[0].role === "assistant") {
+    messages.unshift({ role: "user", content: "_" });
+  }
+  const openai = {
+    messages,
+    max_tokens: body.max_tokens,
+    stream: body.stream === true
+  };
+  if (body.temperature !== void 0) openai.temperature = body.temperature;
+  if (body.top_p !== void 0) openai.top_p = body.top_p;
+  if (body.stop_sequences !== void 0) openai.stop = body.stop_sequences;
+  if (body.metadata?.user_id) openai.user = body.metadata.user_id;
+  if (Array.isArray(body.tools) && body.tools.length) {
+    openai.tools = body.tools.map((tool) => ({
+      type: "function",
+      function: {
+        name: tool.name,
+        description: tool.description || "",
+        parameters: tool.input_schema || { type: "object", properties: {} }
+      }
+    }));
+  }
+  if (body.tool_choice) {
+    if (body.tool_choice.type === "auto") openai.tool_choice = "auto";
+    else if (body.tool_choice.type === "any") openai.tool_choice = "required";
+    else if (body.tool_choice.type === "tool" && body.tool_choice.name) {
+      openai.tool_choice = { type: "function", function: { name: body.tool_choice.name } };
+    }
+  }
+  return openai;
+}
+function stopReason(finishReason) {
+  if (finishReason === "tool_calls") return "tool_use";
+  if (finishReason === "length") return "max_tokens";
+  if (finishReason === "content_filter") return "end_turn";
+  return "end_turn";
+}
+function openAIToAnthropic(data, model) {
+  const choice = data.choices?.[0] || {};
+  const message = choice.message || {};
+  const content = [];
+  if (message.content) content.push({ type: "text", text: message.content });
+  for (const call of message.tool_calls || []) {
+    let input = {};
+    try {
+      input = typeof call.function?.arguments === "string" ? JSON.parse(call.function.arguments) : call.function?.arguments || {};
+    } catch {
+      input = {};
+    }
+    content.push({ type: "tool_use", id: call.id, name: call.function?.name, input });
+  }
+  if (content.length === 0) content.push({ type: "text", text: "" });
+  return {
+    id: `msg_${crypto.randomUUID()}`,
+    type: "message",
+    role: "assistant",
+    content,
+    model,
+    stop_reason: stopReason(choice.finish_reason),
+    stop_sequence: null,
+    usage: {
+      input_tokens: data.usage?.prompt_tokens || 0,
+      output_tokens: data.usage?.completion_tokens || 0
+    }
+  };
+}
+async function handleAnthropicMessages(request, env, ctx, model) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    throw new AnthropicError("Invalid JSON body.", 400, "invalid_request_error");
+  }
+  if (!Array.isArray(body.messages)) {
+    throw new AnthropicError("messages field is required and must be an array.", 400, "invalid_request_error");
+  }
+  if (!body.max_tokens) {
+    throw new AnthropicError("max_tokens is required.", 400, "invalid_request_error");
+  }
+  const requestedModel = body.model || model.id;
+  const stream = body.stream === true;
+  const openaiBody = anthropicToOpenAI({ ...body, messages: body.messages });
+  openaiBody.model = model.id;
+  if (stream) openaiBody.stream_options = { include_usage: true };
+  const result = await runInference(request, env, ctx, {
+    model,
+    task: "chat",
+    body: openaiBody,
+    stream
+  });
+  const headers = inferenceHeaders(result, {
+    "Content-Type": stream ? "text/event-stream; charset=utf-8" : "application/json; charset=utf-8",
+    "Cache-Control": stream ? "no-cache, no-transform" : "no-store",
+    "anthropic-version": request.headers.get("anthropic-version") || "2023-06-01"
+  });
+  if (stream) {
+    return new Response(anthropicStream(result, requestedModel), { headers });
+  }
+  const data = await result.response.json();
+  const usage = data.usage || null;
+  const actual = actualChatNeurons(model, usage) ?? result.estimate;
+  const settlement = await result.settle(Math.max(1, actual), usage);
+  headers.set("x-quota-remaining", String(settlement?.remaining ?? 0));
+  return json(openAIToAnthropic(data, requestedModel), { headers });
+}
+function handleAnthropicCountTokens(request, env, ctx, model) {
+  return request.json().then((body) => {
+    const text = JSON.stringify(body.messages || "") + JSON.stringify(body.system || "") + JSON.stringify(body.tools || "");
+    return json({ input_tokens: estimateTokens(text) });
+  }).catch(() => {
+    throw new AnthropicError("Invalid JSON body.", 400, "invalid_request_error");
+  });
+}
+var AnthropicError = class extends Error {
+  constructor(message, status = 400, type = "invalid_request_error") {
+    super(message);
+    this.status = status;
+    this.type = type;
+  }
+  toResponse() {
+    return json({ type: "error", error: { type: this.type, message: this.message } }, { status: this.status });
+  }
+};
+function anthropicStream(result, model) {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+  let started = false;
+  let finished = false;
+  let blockIndex = -1;
+  let openBlock = null;
+  let toolBlockIndex = -1;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let text = "";
+  let toolArgs = "";
+  let finishReason = null;
+  const emit = (controller, event, data) => {
+    controller.enqueue(encoder.encode(`event: ${event}
+data: ${JSON.stringify(data)}
 
-	const anthropicResponse = {
-		id: `msg_${crypto.randomUUID()}`,
-		type: 'message',
-		role: 'assistant',
-		content: [],
-		model: originalModel,
-		stop_reason: null,
-		stop_sequence: null,
-		usage: {
-			input_tokens: openaiResponse.usage?.prompt_tokens || 0,
-			output_tokens: openaiResponse.usage?.completion_tokens || 0
-		}
-	};
-
-	// 文本内容 → text block
-	if (message.content) {
-		anthropicResponse.content.push({
-			type: 'text',
-			text: message.content
-		});
-	}
-
-	// tool_calls → tool_use blocks
-	if (message.tool_calls && Array.isArray(message.tool_calls)) {
-		for (const tc of message.tool_calls) {
-			let inputObj = {};
-			try {
-				inputObj = typeof tc.function.arguments === 'string'
-					? JSON.parse(tc.function.arguments)
-					: tc.function.arguments;
-			} catch (_) {
-				inputObj = {};
-			}
-			anthropicResponse.content.push({
-				type: 'tool_use',
-				id: tc.id,
-				name: tc.function.name,
-				input: inputObj
-			});
-		}
-	}
-
-	// finish_reason → stop_reason 映射
-	const finishReason = choice.finish_reason;
-	if (finishReason === 'stop') {
-		anthropicResponse.stop_reason = 'end_turn';
-	} else if (finishReason === 'tool_calls') {
-		anthropicResponse.stop_reason = 'tool_use';
-	} else if (finishReason === 'length') {
-		anthropicResponse.stop_reason = 'max_tokens';
-	} else {
-		anthropicResponse.stop_reason = finishReason || 'end_turn';
-	}
-
-	return anthropicResponse;
+`));
+  };
+  const start = (controller) => {
+    if (started) return;
+    started = true;
+    emit(controller, "message_start", {
+      type: "message_start",
+      message: {
+        id: `msg_${crypto.randomUUID()}`,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+      }
+    });
+  };
+  const closeBlock = (controller) => {
+    if (openBlock == null) return;
+    emit(controller, "content_block_stop", { type: "content_block_stop", index: blockIndex });
+    openBlock = null;
+  };
+  const finish = async (controller) => {
+    if (finished) return;
+    finished = true;
+    start(controller);
+    closeBlock(controller);
+    emit(controller, "message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason(finishReason), stop_sequence: null },
+      usage: { output_tokens: outputTokens }
+    });
+    emit(controller, "message_stop", { type: "message_stop" });
+    const usage = { prompt_tokens: inputTokens, completion_tokens: outputTokens };
+    const actual = actualChatNeurons(result.model, usage) ?? result.estimate;
+    await result.settle(Math.max(1, actual), usage);
+  };
+  const transform = new TransformStream({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        let event;
+        try {
+          event = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (event.usage) {
+          inputTokens = event.usage.prompt_tokens || inputTokens;
+          outputTokens = event.usage.completion_tokens || outputTokens;
+        }
+        const choice = event.choices?.[0];
+        if (!choice) continue;
+        const delta = choice.delta || {};
+        start(controller);
+        if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) {
+          for (const call of delta.tool_calls) {
+            const isNew = toolBlockIndex !== call.index;
+            if (isNew) {
+              closeBlock(controller);
+              blockIndex += 1;
+              toolBlockIndex = call.index;
+              openBlock = "tool";
+              toolArgs = "";
+              emit(controller, "content_block_start", {
+                type: "content_block_start",
+                index: blockIndex,
+                content_block: {
+                  type: "tool_use",
+                  id: call.id || `tool_${crypto.randomUUID()}`,
+                  name: call.function?.name || "",
+                  input: {}
+                }
+              });
+            }
+            const args = call.function?.arguments;
+            if (args) {
+              toolArgs += args;
+              emit(controller, "content_block_delta", {
+                type: "content_block_delta",
+                index: blockIndex,
+                delta: { type: "input_json_delta", partial_json: args }
+              });
+            }
+          }
+        } else if (typeof delta.content === "string" && delta.content.length) {
+          if (openBlock !== "text") {
+            closeBlock(controller);
+            blockIndex += 1;
+            openBlock = "text";
+            emit(controller, "content_block_start", {
+              type: "content_block_start",
+              index: blockIndex,
+              content_block: { type: "text", text: "" }
+            });
+          }
+          text += delta.content;
+          emit(controller, "content_block_delta", {
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "text_delta", text: delta.content }
+          });
+        }
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+      }
+    },
+    async flush(controller) {
+      await finish(controller);
+    }
+  });
+  return result.response.body.pipeThrough(transform);
 }
 
-// ----------------------------------------------------
-// OpenAI 错误响应 → Anthropic 错误格式转换
-// ----------------------------------------------------
-function convertOpenAIErrorToAnthropic(openaiError, statusCode) {
-	return {
-		type: 'error',
-		error: {
-			type: 'api_error',
-			message: openaiError?.error?.message || openaiError?.message || 'Unknown error'
-		}
-	};
+// src/ui/pages.js
+var BASE_CSS = `
+:root{color-scheme:light dark;--bg:#f7f7f5;--panel:#ffffff;--panel-2:#f1f1ee;--ink:#141518;--muted:#6b6f76;--line:#deded8;--accent:#e85d04;--accent-ink:#fff;--ok:#0f7b4f;--warn:#a15c00;--bad:#b42318;--shadow:0 1px 2px rgba(0,0,0,.05),0 12px 32px rgba(0,0,0,.06)}
+@media (prefers-color-scheme:dark){:root{--bg:#0c0d0f;--panel:#141619;--panel-2:#1b1e22;--ink:#eceef0;--muted:#9aa0a8;--line:#2a2e34;--accent:#ff7a1a;--accent-ink:#141518;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--shadow:0 1px 2px rgba(0,0,0,.4),0 18px 48px rgba(0,0,0,.28)}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+a{color:inherit}code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+.nav{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
+.nav .wrap{display:flex;align-items:center;gap:16px;height:62px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.02em;text-decoration:none}
+.brand .mark{width:26px;height:26px;border-radius:7px;background:var(--accent);display:grid;place-items:center;color:var(--accent-ink);font-size:15px;font-weight:800}
+.nav .spacer{flex:1}
+.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 10px;font-size:12px;color:var(--muted);background:var(--panel)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 18%,transparent)}
+.dot.off{background:var(--bad);box-shadow:none}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:9px;padding:9px 14px;font:600 13px/1 inherit;cursor:pointer;text-decoration:none;transition:.15s}
+.btn:hover{border-color:var(--muted)}.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}.btn.primary:hover{filter:brightness(1.06)}
+.btn.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 35%,var(--line))}
+.btn.sm{padding:6px 10px;font-size:12px;border-radius:7px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.hero{padding:74px 0 48px;border-bottom:1px solid var(--line)}
+.eyebrow{font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 16px}
+h1{font-size:clamp(38px,6vw,68px);line-height:1.02;letter-spacing:-.045em;margin:0 0 18px;max-width:900px;font-weight:750}
+.hero p.lead{font-size:18px;color:var(--muted);max-width:660px;margin:0 0 28px}
+.endpoint{display:flex;align-items:stretch;gap:0;max-width:660px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--panel);box-shadow:var(--shadow)}
+.endpoint code{flex:1;padding:14px 16px;font-size:13px;overflow:auto;white-space:nowrap;display:flex;align-items:center}
+.endpoint button{border:0;border-left:1px solid var(--line);border-radius:0;background:var(--panel-2);padding:0 16px;font-weight:600;font-size:12px;cursor:pointer;color:var(--ink)}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-top:34px}
+.stat{background:var(--panel);padding:18px 20px}.stat b{display:block;font-size:26px;letter-spacing:-.03em}.stat span{font-size:12px;color:var(--muted)}
+section.block{padding:54px 0}
+.block-head{display:flex;align-items:end;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:18px}
+.block-head h2{font-size:28px;letter-spacing:-.03em;margin:0}.block-head p{margin:6px 0 0;color:var(--muted);font-size:14px}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+input,select,textarea{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:9px 11px;min-width:0}
+input:focus,select:focus,textarea:focus{outline:2px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:1px}
+textarea{width:100%;min-height:90px;resize:vertical;font-family:ui-monospace,monospace;font-size:12.5px}
+.table-wrap{border:1px solid var(--line);border-radius:14px;overflow:auto;background:var(--panel);box-shadow:var(--shadow)}
+table{width:100%;border-collapse:collapse;font-size:13.5px;min-width:900px}
+th{text-align:left;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:12px 14px;border-bottom:1px solid var(--line);background:var(--panel-2);position:sticky;top:0}
+td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}tbody tr:hover{background:color-mix(in srgb,var(--accent) 5%,transparent)}
+.model-name{font-weight:650;letter-spacing:-.01em}.model-id{font-size:11.5px;color:var(--muted);word-break:break-all}
+.badge{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:6px;padding:2px 6px;font-size:10.5px;font-weight:600;color:var(--muted);margin:1px 3px 1px 0;white-space:nowrap}
+.badge.hot{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
+.badge.paid{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,var(--line))}
+.rank{display:inline-grid;place-items:center;width:26px;height:26px;border-radius:8px;background:var(--panel-2);font:700 11px/1 ui-monospace,monospace;color:var(--muted)}
+.tier{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:6px;font:800 11px/1 ui-monospace,monospace}
+.tier.S{background:#111;color:#fff}.tier.A{background:var(--accent);color:var(--accent-ink)}.tier.B{background:color-mix(in srgb,var(--accent) 25%,var(--panel-2))}.tier.C{background:var(--panel-2);color:var(--muted)}.tier.D{background:transparent;border:1px solid var(--line);color:var(--muted)}
+.price{font-family:ui-monospace,monospace;font-size:12px;white-space:nowrap}
+.muted{color:var(--muted)}.small{font-size:12px}.nowrap{white-space:nowrap}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;box-shadow:var(--shadow)}
+.card h3{margin:0 0 8px;font-size:16px;letter-spacing:-.01em}.card p{margin:0 0 14px;color:var(--muted);font-size:13.5px}
+.card a{font-weight:600;text-decoration:none;color:var(--accent);font-size:13px}
+.usage-bar{height:9px;border-radius:99px;background:var(--panel-2);overflow:hidden;border:1px solid var(--line)}
+.usage-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),#f0a35e);width:0;transition:width .4s}
+.grid2{display:grid;grid-template-columns:1.15fr .85fr;gap:18px}
+.list{list-style:none;margin:0;padding:0}.list li{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}.list li:last-child{border-bottom:0}
+.note{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--panel);border-radius:0 10px 10px 0;padding:12px 14px;font-size:13px;color:var(--muted)}
+footer{border-top:1px solid var(--line);padding:28px 0 48px;color:var(--muted);font-size:12.5px}
+.login{min-height:100vh;display:grid;place-items:center;padding:24px}
+.login .card{width:100%;max-width:400px}
+.field{display:block;margin-bottom:14px}.field span{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px}
+.field input{width:100%}
+.msg{font-size:12.5px;padding:9px 11px;border-radius:8px;margin:10px 0;display:none}.msg.show{display:block}
+.msg.ok{background:color-mix(in srgb,var(--ok) 12%,transparent);color:var(--ok)}.msg.err{background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad)}
+.app{display:grid;grid-template-columns:210px 1fr;min-height:calc(100vh - 62px)}
+.side{border-right:1px solid var(--line);padding:22px 14px;background:var(--panel)}
+.side button{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:none;border:0;border-radius:8px;padding:9px 11px;font:600 13px/1 inherit;color:var(--muted);cursor:pointer;margin-bottom:2px}
+.side button:hover{background:var(--panel-2);color:var(--ink)}.side button.active{background:var(--panel-2);color:var(--ink);box-shadow:inset 2px 0 0 var(--accent)}
+.main{padding:28px 30px 60px;min-width:0}
+.tab{display:none}.tab.active{display:block}
+.main h2{font-size:24px;letter-spacing:-.03em;margin:0 0 4px}.main .sub{color:var(--muted);font-size:13px;margin:0 0 22px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px}.kpi b{display:block;font-size:22px;letter-spacing:-.03em}.kpi span{font-size:11.5px;color:var(--muted)}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.form{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;align-items:end}
+.form .wide{grid-column:1/-1}
+.row-actions{display:flex;gap:6px;flex-wrap:wrap}
+.tiny{font-size:11.5px;color:var(--muted)}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:8px;font-size:13px}.kv dt{color:var(--muted)}.kv dd{margin:0;word-break:break-all}
+pre.code{background:var(--panel-2);border:1px solid var(--line);border-radius:9px;padding:12px;overflow:auto;font-size:12px}
+details summary{cursor:pointer;font-weight:600;font-size:13px}
+@media(max-width:900px){.stats,.cards,.kpis{grid-template-columns:1fr 1fr}.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--line);display:flex;gap:6px;overflow:auto;padding:12px}.side button{width:auto;white-space:nowrap}.main{padding:20px 18px 48px}.split,.grid2,.form{grid-template-columns:1fr}h1{font-size:42px}}
+@media(max-width:560px){.stats,.cards,.kpis{grid-template-columns:1fr}.wrap{padding:0 16px}.hero{padding:48px 0 34px}.endpoint code{font-size:11px}}
+.docs{max-width:860px;padding:52px 0 72px}
+.docs h1{font-size:38px;margin-bottom:10px}
+.docs h2{font-size:22px;letter-spacing:-.02em;margin:34px 0 10px}
+.docs h3{font-size:16px;margin:22px 0 8px}
+.docs p,.docs li{color:var(--muted);font-size:14.5px}
+.docs strong{color:var(--ink)}
+.docs code{background:var(--panel-2);border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:12.5px}
+.docs pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;overflow:auto;font-size:12.5px;line-height:1.55}
+.docs pre code{background:none;border:0;padding:0}
+.docs table{min-width:0;font-size:13px;margin:12px 0}
+.docs th,.docs td{padding:9px 11px}
+.docs ul{padding-left:20px}
+.docs .callout{border-left:3px solid var(--accent);background:var(--panel);padding:12px 15px;border-radius:0 8px 8px 0;margin:18px 0;font-size:13.5px;color:var(--muted)}
+`;
+var CLIENT_HELPERS = `
+const $=(s,r=document)=>r.querySelector(s);const $$=(s,r=document)=>[...r.querySelectorAll(s)];
+const esc=(v)=>String(v??'').replace(/[&<>"']/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(path,opt={}){const r=await fetch(path,{...opt,headers:{'Content-Type':'application/json',...(opt.headers||{})}});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error?.message||d.error||('HTTP '+r.status));return d}
+function nf(n){return Number(n||0).toLocaleString('en-US')}
+function money(v){return Number(v)<0.01?'$'+Number(v).toFixed(4):'$'+Number(v).toFixed(3)}
+function priceOf(m){const t=m.pricing?.tokens||{};if(t.input_usd_per_million!=null||t.output_usd_per_million!=null){const inP=t.input_usd_per_million!=null?money(t.input_usd_per_million):'\u2014';const outP=t.output_usd_per_million!=null?money(t.output_usd_per_million):'\u2014';return inP+' in \xB7 '+outP+' out /M'}return m.pricing?.display||'\u2014'}
+function taskLabel(t){return {'text-generation':'Text','text-embeddings':'Embeddings','text-to-image':'Image','automatic-speech-recognition':'Speech \u2192 text','text-to-speech':'Text \u2192 speech','text-classification':'Classification','image-to-text':'Image \u2192 text','translation':'Translation','summarization':'Summarization','image-classification':'Image classification','object-detection':'Object detection'}[t]||t}
+function caps(m){const c=m.capabilities||{};return [c.reasoning&&'reasoning',c.function_calling&&'tools',c.vision&&'vision',c.audio_input&&'audio in',c.audio_output&&'audio out',c.structured_output&&'JSON'].filter(Boolean)}
+function tier(m){return m.performance?.tier||'C'}
+function setMsg(el,text,ok=true){el.textContent=text;el.className='msg show '+(ok?'ok':'err')}
+function copyText(text){return navigator.clipboard.writeText(text)}
+`;
+function shell({ title, body, script = "", authenticated = null }) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title><meta name="description" content="OpenAI-compatible gateway for every free Cloudflare Workers AI model.">
+<style>${BASE_CSS}</style></head><body>${body}
+${authenticated === null ? "" : `<script>window.__AUTHENTICATED__=${authenticated ? "true" : "false"};</script>`}
+<script>${CLIENT_HELPERS}${script}</script></body></html>`;
+}
+var NAV = `<header class="nav"><div class="wrap">
+<a class="brand" href="/"><span class="mark">W</span> Workers AI2API</a>
+<span class="pill"><span class="dot" id="health-dot"></span><span id="health-text">checking</span></span>
+<span class="spacer"></span>
+<a class="btn sm" href="/admin">Admin</a>
+</div></header>`;
+var LANDING_SCRIPT = `
+const state={models:[],meta:{},task:''};
+async function load(){
+  try{
+    const [cat,stats]=await Promise.all([api('/api/catalog?include_paid=0'),api('/api/stats').catch(()=>({}))]);
+    state.models=cat.data||[];state.meta=cat.meta||{};
+    $('#health-text').textContent=state.meta.stale?'catalog cached':'catalog live';
+    $('#health-dot').className='dot'+(state.meta.stale?' off':'');
+    $('#stat-models').textContent=nf(state.meta.free_models??state.models.length);
+    $('#stat-neurons').textContent=nf(state.meta.free_daily_neurons||10000);
+    $('#stat-accounts').textContent=nf(stats.total_accounts||0);
+    $('#stat-usage').textContent=(stats.usage_percentage??0)+'%';
+    const tasks=[...new Set(state.models.map(m=>m.task))].sort();
+    $('#task-filter').innerHTML='<option value="">All tasks</option>'+tasks.map(t=>'<option value="'+esc(t)+'">'+esc(taskLabel(t))+'</option>').join('');
+    render();
+  }catch(e){$('#health-text').textContent='offline';$('#error').textContent=e.message;$('#error').className='msg show err'}
+}
+function render(){
+  const q=($('#search').value||'').toLowerCase();const task=$('#task-filter').value;
+  let rows=state.models.filter(m=>(!task||m.task===task)&&(!q||(m.id+' '+m.name+' '+m.description).toLowerCase().includes(q)));
+  const sort=$('#sort').value;
+  const cmp={performance:(a,b)=>(b.performance?.score||0)-(a.performance?.score||0),price:(a,b)=>{const av=a.pricing?.tokens?.output_usd_per_million??a.pricing?.items?.[0]?.usd??Infinity;const bv=b.pricing?.tokens?.output_usd_per_million??b.pricing?.items?.[0]?.usd??Infinity;return av-bv},context:(a,b)=>(b.context_window||0)-(a.context_window||0),name:(a,b)=>a.name.localeCompare(b.name)};
+  rows=[...rows].sort(cmp[sort]||cmp.performance);
+  $('#model-rows').innerHTML=rows.map((m,i)=>{
+    const t=m.performance||{};const c=caps(m);
+    return '<tr><td><span class="rank">'+(t.rank||i+1)+'</span></td>'+
+      '<td><div class="model-name">'+esc(m.name)+'</div><div class="model-id">'+esc(m.id)+'</div></td>'+
+      '<td><span class="badge">'+esc(taskLabel(m.task))+'</span></td>'+
+      '<td class="nowrap">'+(m.context_window?nf(m.context_window)+' tok':'\u2014')+'</td>'+
+      '<td>'+(c.length?c.map(x=>'<span class="badge">'+esc(x)+'</span>').join(''):'<span class="muted">\u2014</span>')+'</td>'+
+      '<td class="price">'+esc(priceOf(m))+'</td>'+
+      '<td class="nowrap">'+(m.free_daily_output_tokens?nf(m.free_daily_output_tokens)+' tok/day':'\u2014')+'</td>'+
+      '<td><span class="tier '+tier(m)+'">'+tier(m)+'</span> <span class="tiny">'+(t.score??'\u2014')+'</span></td></tr>';
+  }).join('')||'<tr><td colspan="8" class="muted" style="padding:24px">No models match this filter.</td></tr>';
+  $('#model-count').textContent=rows.length+' of '+state.models.length+' free models';
+}
+$('#task-filter').addEventListener('change',render);$('#sort').addEventListener('change',render);$('#search').addEventListener('input',render);
+$('#copy').addEventListener('click',async()=>{try{await copyText($('#endpoint').textContent.trim());$('#copy').textContent='Copied';setTimeout(()=>$('#copy').textContent='Copy',1400)}catch{}});
+$('#endpoint').textContent=location.origin+'/v1';
+load();
+`;
+async function handleLandingPage() {
+  const body = `${NAV}
+<main>
+<section class="hero"><div class="wrap">
+<p class="eyebrow">Independent \xB7 Cloudflare Workers AI</p>
+<h1>Every free Workers AI model.<br>One OpenAI-compatible endpoint.</h1>
+<p class="lead">A dynamic model catalog, per-account free-neuron accounting, and streaming chat, embeddings, images, audio and Anthropic Messages \u2014 deployed at the edge.</p>
+<div class="endpoint"><code id="endpoint">/v1</code><button id="copy">Copy</button></div>
+<div class="stats">
+<div class="stat"><b id="stat-models">\u2014</b><span>free models, live catalog</span></div>
+<div class="stat"><b id="stat-neurons">10,000</b><span>free neurons / account / day</span></div>
+<div class="stat"><b id="stat-accounts">\u2014</b><span>accounts connected</span></div>
+<div class="stat"><b id="stat-usage">\u2014</b><span>of daily quota used</span></div>
+</div>
+<div id="error" class="msg err"></div>
+</div></section>
+<section class="block" id="models"><div class="wrap">
+<div class="block-head"><div><h2>Free model catalog</h2><p id="model-count">Loading\u2026</p></div>
+<div class="toolbar"><input id="search" placeholder="Search models\u2026" style="width:210px"><select id="task-filter"><option value="">All tasks</option></select><select id="sort"><option value="performance">Performance</option><option value="price">Price</option><option value="context">Context</option><option value="name">Name</option></select></div></div>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Model</th><th>Task</th><th>Context</th><th>Capabilities</th><th>Price (USD)</th><th>Free daily output</th><th>Tier</th></tr></thead><tbody id="model-rows"><tr><td colspan="8" style="padding:24px" class="muted">Loading live catalog\u2026</td></tr></tbody></table></div>
+<p class="tiny" style="margin-top:10px">Ranking is a transparent estimate from parameters, capabilities, context, recency and price. Paid-only models are hidden. Prices come from Cloudflare's live pricing page; the free allowance is 10,000 neurons per account per UTC day.</p>
+</div></section>
+<section class="block"><div class="wrap"><div class="cards">
+<div class="card"><h3>Workers AI vs AI Gateway</h3><p>One runs models and bills neurons. The other is a control layer for caching, logs, retries and unified billing.</p><a href="/docs/workers-ai-vs-ai-gateway">Read the analysis \u2192</a></div>
+<div class="card"><h3>OpenAI-compatible API</h3><p><code>/v1/chat/completions</code>, embeddings, images, audio, rerank, Anthropic Messages and a generic <code>/v1/run</code>.</p><a href="/docs/api">Endpoint reference \u2192</a></div>
+<div class="card"><h3>Hard free-tier guard</h3><p>Atomic per-account reservations stop requests before the 10,000-neuron daily allocation is exceeded.</p><a href="/docs/free-tier">How accounting works \u2192</a></div>
+</div></div></section>
+</main>
+<footer><div class="wrap">Workers AI2API v2 \xB7 Independent project, not affiliated with Cloudflare. Model data and prices belong to Cloudflare.</div></footer>`;
+  return shell({ title: "Workers AI2API \u2014 OpenAI-compatible Workers AI gateway", body, script: LANDING_SCRIPT });
+}
+var ADMIN_LOGIN = `<div class="login"><div class="card">
+<div class="brand" style="margin-bottom:18px"><span class="mark">W</span> Workers AI2API</div>
+<h2 style="font-size:22px;letter-spacing:-.03em;margin:0 0 4px">Admin sign in</h2>
+<p class="sub" style="margin:0 0 18px">Use the <code>ADMIN_PASSWORD</code> configured on this deployment.</p>
+<form id="login-form"><label class="field"><span>Password</span><input type="password" id="password" autocomplete="current-password" required autofocus></label>
+<button class="btn primary" style="width:100%" type="submit">Sign in</button></form>
+<div id="login-msg" class="msg"></div>
+<p class="tiny" style="margin-top:16px"><a href="/">\u2190 Back to public site</a></p>
+</div></div>`;
+var ADMIN_SCRIPT = `
+const state={overview:null,catalog:null,tab:'overview'};
+function showLogin(){bindLogin()}
+function bindLogin(){$('#login-form')?.addEventListener('submit',async(e)=>{e.preventDefault();try{await api('/api/auth/login',{method:'POST',body:JSON.stringify({password:$('#password').value})});location.reload()}catch(err){setMsg($('#login-msg'),err.message,false)}})}
+async function boot(){
+  if(!window.__AUTHENTICATED__){showLogin();return}
+  $('#logout').addEventListener('click',async()=>{await api('/api/auth/logout',{method:'POST'});location.reload()});
+  $$('.side button').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tab)));
+  bindOverview();bindModels();bindAccounts();bindKeys();bindSettings();
+  await Promise.all([loadOverview(),loadModels()]);
+}
+function switchTab(tab){state.tab=tab;$$('.side button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));$$('.tab').forEach(t=>t.classList.toggle('active',t.id==='tab-'+tab));if(tab==='usage')loadOverview();if(tab==='models')loadModels();if(tab==='accounts')loadAccounts();if(tab==='keys')loadKeys();if(tab==='settings')loadSettings()}
+async function loadOverview(){
+  try{const d=await api('/api/admin/overview');state.overview=d;const u=d.usage;
+    $('#kpi-used').textContent=nf(u.totalNeuronsToday);$('#kpi-limit').textContent=nf(u.totalLimit);$('#kpi-remaining').textContent=nf(u.remainingNeurons);$('#kpi-accounts').textContent=nf(u.totalAccounts);
+    $('#usage-pct').textContent=(u.usagePercentage||0)+'%';$('#usage-bar').style.width=Math.min(100,u.usagePercentage||0)+'%';
+    $('#usage-note').textContent='Local atomic accounting: '+nf(u.totalNeuronsToday)+' used + '+nf(u.reservedNeurons)+' reserved. Cloud analytics: '+nf(u.cloudNeuronsToday)+'. Backend: '+u.quotaBackend+'.';
+    $('#account-usage').innerHTML=(u.accounts||[]).map(a=>'<li><span>'+esc(a.name)+'<br><span class="tiny mono">'+esc(a.accountId)+'</span></span><span class="price">'+nf(a.used)+' / '+nf(a.limit)+(a.error?' <span class="badge paid">error</span>':'')+'</span></li>').join('')||'<li class="muted">No active accounts.</li>';
+    $('#model-usage').innerHTML=(u.modelsToday||[]).slice(0,8).map(m=>'<li><span class="mono small">'+esc(m.model)+'</span><span class="price">'+nf(m.neurons)+' n</span></li>').join('')||'<li class="muted">No cloud usage data yet.</li>';
+    $('#env-info').innerHTML='<dt>Version</dt><dd>'+esc(d.version)+'</dd><dt>KV</dt><dd>'+(d.environment.kv?'bound':'missing')+'</dd><dt>Quota</dt><dd>'+esc(d.environment.quota)+'</dd><dt>Max daily</dt><dd>'+nf(d.environment.maxDailyNeurons)+'</dd><dt>Admin password</dt><dd>'+(d.environment.adminPassword?'set':'missing')+'</dd>';
+  }catch(e){location.reload()}
+}
+function bindOverview(){$('#refresh-usage').addEventListener('click',async(e)=>{e.target.disabled=true;e.target.textContent='Refreshing\u2026';try{const d=await api('/api/admin/usage?force=1');$('#usage-note').textContent='Refreshed. Local '+nf(d.totalNeuronsToday)+' n; cloud '+nf(d.cloudNeuronsToday)+' n.';await loadOverview()}catch(err){alert(err.message)}finally{e.target.disabled=false;e.target.textContent='Refresh analytics'}})}
+async function loadModels(){
+  try{const cat=await api('/api/admin/catalog');state.catalog=cat;
+    $('#catalog-meta').textContent='Source: '+(cat.meta.source||'?')+' \xB7 '+(cat.meta.free_models||0)+' free / '+(cat.meta.paid_models||0)+' paid \xB7 updated '+new Date(cat.meta.fetched_at).toLocaleString();
+    const tasks=[...new Set(cat.data.map(m=>m.task))].sort();
+    $('#model-task').innerHTML='<option value="">All tasks</option>'+tasks.map(t=>'<option value="'+esc(t)+'">'+esc(taskLabel(t))+'</option>').join('');
+    renderAdminModels();
+  }catch(e){$('#catalog-meta').textContent=e.message}
+}
+function renderAdminModels(){
+  const cat=state.catalog;if(!cat)return;const q=($('#model-search').value||'').toLowerCase();const task=$('#model-task').value;const paid=$('#model-paid').checked;
+  let models=cat.data.filter(m=>(!task||m.task===task)&&(paid||m.free)&&(!q||(m.id+' '+m.name+' '+m.description).toLowerCase().includes(q)));
+  $('#admin-model-rows').innerHTML=models.map(m=>{
+    const t=m.performance||{};
+    return '<tr><td><span class="rank">'+(t.rank||'\u2014')+'</span></td><td><div class="model-name">'+esc(m.name)+'</div><div class="model-id">'+esc(m.id)+'</div>'+(m.requires_paid?'<span class="badge paid">paid plan</span>':'')+'</td>'+
+    '<td><span class="badge">'+esc(taskLabel(m.task))+'</span></td><td class="nowrap">'+(m.context_window?nf(m.context_window):'\u2014')+'</td><td>'+caps(m).map(x=>'<span class="badge">'+esc(x)+'</span>').join('')+'</td>'+
+    '<td class="price">'+esc(priceOf(m))+'</td><td class="nowrap">'+nf(m.pricing?.tokens?.output_neurons_per_million)+' n/M</td><td><span class="tier '+tier(m)+'">'+tier(m)+'</span> '+(t.score??'\u2014')+'</td></tr>';
+  }).join('')||'<tr><td colspan="8" class="muted" style="padding:20px">No models.</td></tr>';
+  $('#admin-model-count').textContent=models.length+' models';
+}
+function bindModels(){
+  ['#model-search','#model-task','#model-paid'].forEach(s=>$(s)?.addEventListener('input',renderAdminModels));
+  $('#refresh-catalog').addEventListener('click',async(e)=>{e.target.disabled=true;e.target.textContent='Refreshing\u2026';try{state.catalog=await api('/api/admin/catalog/refresh',{method:'POST'});renderAdminModels();$('#catalog-meta').textContent='Source: '+state.catalog.meta.source+' \xB7 updated '+new Date(state.catalog.meta.fetched_at).toLocaleString()}catch(err){alert(err.message)}finally{e.target.disabled=false;e.target.textContent='Refresh catalog'}});
+}
+async function loadAccounts(){
+  try{const d=await api('/api/admin/accounts');$('#account-rows').innerHTML=d.accounts.map(a=>'<tr><td><div class="model-name">'+esc(a.name)+'</div><div class="model-id">'+esc(a.accountId)+'</div></td><td class="mono tiny">'+esc(a.tokenPreview)+'</td><td><span class="badge '+(a.status==='active'?'':'paid')+'">'+esc(a.status)+'</span></td><td>'+new Date(a.createdAt).toLocaleDateString()+'</td><td class="row-actions"><button class="btn sm" data-toggle-account="'+esc(a.id)+'" data-status="'+(a.status==='active'?'disabled':'active')+'">'+(a.status==='active'?'Disable':'Enable')+'</button><button class="btn sm danger" data-del-account="'+esc(a.id)+'">Delete</button></td></tr>').join('')||'<tr><td colspan="5" class="muted" style="padding:20px">No accounts yet.</td></tr>';
+    $$('[data-del-account]').forEach(b=>b.onclick=async()=>{if(!confirm('Remove this account?'))return;await api('/api/admin/accounts/'+encodeURIComponent(b.dataset.delAccount),{method:'DELETE'});loadAccounts();loadOverview()});
+    $$('[data-toggle-account]').forEach(b=>b.onclick=async()=>{await api('/api/admin/accounts/'+encodeURIComponent(b.dataset.toggleAccount),{method:'PATCH',body:JSON.stringify({status:b.dataset.status})});loadAccounts()});
+  }catch(e){alert(e.message)}
+}
+function bindAccounts(){
+  $('#account-form').addEventListener('submit',async(e)=>{e.preventDefault();const f=new FormData(e.target);try{await api('/api/admin/accounts',{method:'POST',body:JSON.stringify({name:f.get('name'),accountId:f.get('accountId'),apiToken:f.get('apiToken')})});setMsg($('#account-msg'),'Account added.',true);e.target.reset();loadAccounts();loadOverview()}catch(err){setMsg($('#account-msg'),err.message,false)}});
+  $('#test-account').addEventListener('click',async()=>{const f=new FormData($('#account-form'));try{const d=await api('/api/admin/accounts/test',{method:'POST',body:JSON.stringify({accountId:f.get('accountId'),apiToken:f.get('apiToken')})});setMsg($('#account-msg'),d.ok?'Token works. Models visible: '+d.models:(d.error||'Token failed'),d.ok)}catch(err){setMsg($('#account-msg'),err.message,false)}});
+}
+async function loadKeys(){
+  try{const d=await api('/api/admin/keys');$('#key-rows').innerHTML=d.keys.map(k=>'<tr><td><div class="model-name">'+esc(k.name)+'</div><div class="model-id">'+esc(k.prefix)+'\u2026'+esc(k.last4)+'</div></td><td><span class="badge '+(k.enabled?'':'paid')+'">'+(k.enabled?'active':'disabled')+'</span></td><td class="tiny">'+(k.lastUsedAt?new Date(k.lastUsedAt).toLocaleString():'never')+'</td><td>'+new Date(k.createdAt).toLocaleDateString()+'</td><td class="row-actions"><button class="btn sm" data-toggle-key="'+esc(k.id)+'" data-enabled="'+(!k.enabled)+'">'+(k.enabled?'Disable':'Enable')+'</button><button class="btn sm danger" data-del-key="'+esc(k.id)+'">Delete</button></td></tr>').join('')||'<tr><td colspan="5" class="muted" style="padding:20px">No API keys yet.</td></tr>';
+    $$('[data-del-key]').forEach(b=>b.onclick=async()=>{if(!confirm('Delete this key?'))return;await api('/api/admin/keys/'+encodeURIComponent(b.dataset.delKey),{method:'DELETE'});loadKeys()});
+    $$('[data-toggle-key]').forEach(b=>b.onclick=async()=>{await api('/api/admin/keys/'+encodeURIComponent(b.dataset.toggleKey),{method:'PATCH',body:JSON.stringify({enabled:b.dataset.enabled==='true'})});loadKeys()});
+  }catch(e){alert(e.message)}
+}
+function bindKeys(){
+  $('#key-form').addEventListener('submit',async(e)=>{e.preventDefault();const f=new FormData(e.target);try{const d=await api('/api/admin/keys',{method:'POST',body:JSON.stringify({name:f.get('name')})});e.target.reset();$('#new-key').style.display='block';$('#new-key-value').textContent=d.plaintext;setMsg($('#key-msg'),'Key created. Copy it now; it is not shown again.',true);loadKeys()}catch(err){setMsg($('#key-msg'),err.message,false)}});
+  $('#copy-key').addEventListener('click',async()=>{await copyText($('#new-key-value').textContent);$('#copy-key').textContent='Copied';setTimeout(()=>$('#copy-key').textContent='Copy',1200)});
+}
+async function loadSettings(){
+  try{const d=await api('/api/admin/settings');const s=d.settings;
+    $('#gateway-id').value=s.gatewayId||'';$('#allow-public').checked=!!s.allowPublic;$('#daily-neurons').value=s.dailyNeurons||10000;$('#default-max').value=s.defaultMaxOutputTokens||1024;
+    $('#aliases').value=JSON.stringify(s.aliases||{},null,2);$('#benchmarks').value=JSON.stringify(s.benchmarks||{},null,2);
+  }catch(e){alert(e.message)}
+}
+function bindSettings(){
+  $('#settings-form').addEventListener('submit',async(e)=>{e.preventDefault();
+    let aliases,benchmarks;try{aliases=JSON.parse($('#aliases').value||'{}');benchmarks=JSON.parse($('#benchmarks').value||'{}')}catch(err){setMsg($('#settings-msg'),'Invalid JSON: '+err.message,false);return}
+    try{await api('/api/admin/settings',{method:'PUT',body:JSON.stringify({gatewayId:$('#gateway-id').value,allowPublic:$('#allow-public').checked,dailyNeurons:Number($('#daily-neurons').value),defaultMaxOutputTokens:Number($('#default-max').value),aliases,benchmarks})});setMsg($('#settings-msg'),'Settings saved.',true);loadOverview()}catch(err){setMsg($('#settings-msg'),err.message,false)}});
+}
+boot();
+`;
+function adminBody(authenticated) {
+  if (!authenticated) return ADMIN_LOGIN;
+  return `${NAV}
+<div class="app">
+<aside class="side">
+<button data-tab="overview" class="active">Overview</button>
+<button data-tab="models">Models</button>
+<button data-tab="accounts">Accounts</button>
+<button data-tab="keys">API keys</button>
+<button data-tab="settings">Settings</button>
+<button id="logout" style="margin-top:14px;color:var(--bad)">Sign out</button>
+</aside>
+<main class="main">
+<section id="tab-overview" class="tab active">
+<h2>Overview</h2><p class="sub">Free-neuron accounting, connected accounts and live usage.</p>
+<div class="kpis"><div class="kpi"><b id="kpi-used">\u2014</b><span>neurons used today</span></div><div class="kpi"><b id="kpi-limit">\u2014</b><span>daily free allowance</span></div><div class="kpi"><b id="kpi-remaining">\u2014</b><span>neurons remaining</span></div><div class="kpi"><b id="kpi-accounts">\u2014</b><span>active accounts</span></div></div>
+<div class="split">
+<div class="card"><h3>Daily quota <span id="usage-pct" class="muted"></span></h3><div class="usage-bar"><i id="usage-bar"></i></div><p class="tiny" id="usage-note" style="margin-top:10px"></p><button class="btn sm" id="refresh-usage" style="margin-top:10px">Refresh analytics</button></div>
+<div class="card"><h3>Environment</h3><dl class="kv" id="env-info"></dl></div>
+</div>
+<div class="split" style="margin-top:16px">
+<div class="card"><h3>Per account</h3><ul class="list" id="account-usage"><li class="muted">Loading\u2026</li></ul></div>
+<div class="card"><h3>Top models today</h3><ul class="list" id="model-usage"><li class="muted">Loading\u2026</li></ul></div>
+</div>
+</section>
+
+<section id="tab-models" class="tab">
+<h2>Models</h2><p class="sub" id="catalog-meta">Loading\u2026</p>
+<div class="toolbar"><input id="model-search" placeholder="Search models\u2026" style="width:220px"><select id="model-task"><option value="">All tasks</option></select><label class="pill"><input type="checkbox" id="model-paid" style="width:auto;margin-right:4px"> include paid-only</label><button class="btn sm" id="refresh-catalog">Refresh catalog</button><span class="tiny" id="admin-model-count"></span></div>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Model</th><th>Task</th><th>Context</th><th>Capabilities</th><th>Price (USD)</th><th>Neurons/M output</th><th>Tier</th></tr></thead><tbody id="admin-model-rows"></tbody></table></div>
+<p class="tiny" style="margin-top:10px">Free models are the only ones accepted by <code>/v1</code>. Paid-only models are shown for visibility and excluded by default. Prices and capabilities are refreshed from Cloudflare docs and the models API.</p>
+</section>
+
+<section id="tab-accounts" class="tab">
+<h2>Accounts</h2><p class="sub">Each Cloudflare account contributes 10,000 free neurons per UTC day. Requests fail over between accounts.</p>
+<div class="card" style="margin-bottom:16px"><h3>Add account</h3>
+<form class="form" id="account-form">
+<label class="field"><span>Name</span><input name="name" placeholder="Personal" required></label>
+<label class="field"><span>Account ID</span><input name="accountId" placeholder="32 hex characters" required></label>
+<label class="field wide"><span>API token (Workers AI Read &amp; Edit)</span><input name="apiToken" type="password" autocomplete="off" required></label>
+<div class="row-actions wide"><button class="btn primary" type="submit">Add account</button><button class="btn" type="button" id="test-account">Test token</button></div>
+</form><div id="account-msg" class="msg"></div>
+<p class="tiny">Create a token at Cloudflare Dashboard \u2192 My Profile \u2192 API Tokens \u2192 Workers AI template. Add \u201CAccount Analytics Read\u201D if you want cloud usage reconciliation.</p></div>
+<div class="table-wrap"><table><thead><tr><th>Account</th><th>Token</th><th>Status</th><th>Added</th><th>Actions</th></tr></thead><tbody id="account-rows"></tbody></table></div>
+</section>
+
+<section id="tab-keys" class="tab">
+<h2>API keys</h2><p class="sub">Keys are stored as SHA-256 hashes. The plaintext is shown once.</p>
+<div class="card" style="margin-bottom:16px"><form class="form" id="key-form"><label class="field"><span>Key name</span><input name="name" placeholder="LobeChat" required></label><button class="btn primary" type="submit">Create key</button></form><div id="key-msg" class="msg"></div>
+<div id="new-key" style="display:none;margin-top:8px"><div class="note"><div class="tiny" style="margin-bottom:6px">Copy this key now:</div><div style="display:flex;gap:8px;align-items:center"><code id="new-key-value" style="word-break:break-all;flex:1"></code><button class="btn sm" id="copy-key">Copy</button></div></div></div></div>
+<div class="table-wrap"><table><thead><tr><th>Key</th><th>Status</th><th>Last used</th><th>Created</th><th>Actions</th></tr></thead><tbody id="key-rows"></tbody></table></div>
+</section>
+
+<section id="tab-settings" class="tab">
+<h2>Settings</h2><p class="sub">AI Gateway is optional; the free-neuron guard remains authoritative.</p>
+<form id="settings-form">
+<div class="card" style="margin-bottom:16px"><h3>Runtime</h3><div class="form">
+<label class="field"><span>AI Gateway ID (optional)</span><input id="gateway-id" placeholder="default"></label>
+<label class="field"><span>Daily neurons per account</span><input id="daily-neurons" type="number" min="1" max="10000"></label>
+<label class="field"><span>Default max output tokens</span><input id="default-max" type="number" min="1" max="131072"></label>
+<label class="field"><span>Public access (no API keys)</span><input id="allow-public" type="checkbox" style="width:auto"></label>
+</div><p class="tiny">The daily cap is clamped by <code>MAX_DAILY_NEURONS</code> (default 10,000). Do not raise it on a free plan: Cloudflare will start returning error 3036.</p></div>
+<div class="card" style="margin-bottom:16px"><h3>Model aliases</h3><p class="tiny">JSON object mapping a client-facing name to an <code>@cf/</code> model id.</p><textarea id="aliases"></textarea></div>
+<div class="card" style="margin-bottom:16px"><h3>Performance overrides</h3><p class="tiny">JSON object mapping model id to a 0-100 score from your own evals. Overrides drive the performance sort.</p><textarea id="benchmarks"></textarea></div>
+<div class="row-actions"><button class="btn primary" type="submit">Save settings</button></div><div id="settings-msg" class="msg"></div>
+</form>
+</section>
+</main></div>`;
+}
+async function handleAdminPage(request, env) {
+  const authenticated = await isAdmin(request, env);
+  const setupWarning = hasAdminPassword(env) ? "" : '<div class="note" style="margin:16px 24px">Set the <code>ADMIN_PASSWORD</code> environment variable before using the admin panel.</div>';
+  const body = adminBody(authenticated) + setupWarning;
+  return shell({
+    title: authenticated ? "Admin \u2014 Workers AI2API" : "Sign in \u2014 Workers AI2API",
+    body,
+    script: ADMIN_SCRIPT,
+    authenticated
+  });
 }
 
-// ----------------------------------------------------
-// Anthropic /v1/messages 路由处理函数
-// ----------------------------------------------------
-async function handleMessages(request, env) {
-	// 认证由 handleV1Proxy 的 checkProxyAuth 统一处理（支持 x-api-key + Bearer）
+// src/ui/docs.js
+var nav = `${NAV}<div class="wrap" style="padding-top:14px"><a class="tiny" href="/">\u2190 Home</a> <span class="tiny">/</span> <a class="tiny" href="/docs/api">API</a> <span class="tiny">/</span> <a class="tiny" href="/docs/free-tier">Free tier</a> <span class="tiny">/</span> <a class="tiny" href="/docs/workers-ai-vs-ai-gateway">Workers AI vs AI Gateway</a></div>`;
+var DOCS = {
+  "workers-ai-vs-ai-gateway": {
+    title: "Workers AI vs AI Gateway \u2014 Workers AI2API",
+    html: `<article class="docs wrap">
+<h1>Workers AI vs AI Gateway</h1>
+<p>These are two different layers. Workers AI <em>runs</em> models. AI Gateway <em>controls</em> requests to models \u2014 including Workers AI and external providers. They compose; they do not replace each other.</p>
 
-	// 解析请求体
-	let anthropicBody;
-	try {
-		anthropicBody = await request.json();
-	} catch (e) {
-		return new Response(JSON.stringify({
-			type: 'error',
-			error: { type: 'invalid_request_error', message: 'Invalid JSON body.' }
-		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
-	}
+<h2>The short version</h2>
+<table><thead><tr><th></th><th>Workers AI</th><th>AI Gateway</th></tr></thead><tbody>
+<tr><td><strong>What it is</strong></td><td>Serverless inference on Cloudflare GPUs plus the model catalog.</td><td>A proxy/control plane in front of AI providers.</td></tr>
+<tr><td><strong>Runs models?</strong></td><td>Yes. Cloudflare-hosted and partner models.</td><td>No. It forwards to Workers AI, OpenAI, Anthropic, Google, etc.</td></tr>
+<tr><td><strong>Billing</strong></td><td>Neurons. $0.011 per 1,000 neurons; 10,000 free neurons per day, resets 00:00 UTC.</td><td>Gateway itself is free on the standard plan. It can enable prepaid \u201Cunified billing\u201D credits for Workers AI frontier models.</td></tr>
+<tr><td><strong>Free tier</strong></td><td>10,000 neurons/day. Some models require Workers Paid or AI Gateway prepaid credits.</td><td>Does not add free inference. Caching can avoid repeated inference cost.</td></tr>
+<tr><td><strong>Core features</strong></td><td>Model catalog, OpenAI-compatible chat/embeddings, native run API, function calling, LoRA, batch, prompt caching.</td><td>Analytics, logging, caching, rate limiting, retries/fallback, guardrails, dynamic routing, unified billing.</td></tr>
+<tr><td><strong>Auth</strong></td><td>Cloudflare API token with Workers AI permission.</td><td>Cloudflare API token; optional gateway authentication token.</td></tr>
+</tbody></table>
 
-	// 基本参数校验
-	if (!anthropicBody.messages || !Array.isArray(anthropicBody.messages)) {
-		return new Response(JSON.stringify({
-			type: 'error',
-			error: { type: 'invalid_request_error', message: 'messages field is required and must be an array.' }
-		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
-	}
-	if (!anthropicBody.max_tokens) {
-		return new Response(JSON.stringify({
-			type: 'error',
-			error: { type: 'invalid_request_error', message: 'max_tokens is required.' }
-		}), { status: 400, headers: { 'Content-Type': 'application/json' } });
-	}
+<h2>How they connect</h2>
+<p>You can send a Workers AI request through a gateway by adding the <code>cf-aig-gateway-id</code> header to the same Cloudflare API URL. The model still runs on Workers AI and still consumes neurons. The gateway only observes and controls the request.</p>
+<pre><code>POST https://api.cloudflare.com/client/v4/accounts/&lt;account_id&gt;/ai/v1/chat/completions
+Authorization: Bearer &lt;api_token&gt;
+cf-aig-gateway-id: default
 
-	// 解析模型名映射
-	const model = anthropicBody.model;
-	const cfModel = await resolveModelName(model, env);
+{"model":"@cf/zai-org/glm-4.7-flash","messages":[...]}</code></pre>
+<p>Workers AI also exposes a binding option (<code>env.AI.run(model, input, { gateway: { id, skipCache, cacheTtl } })</code>) and AI Gateway exposes its own REST base URL. This project uses the header form because it keeps the same upstream path for every account and works with the REST API.</p>
 
-	// Anthropic → OpenAI 格式转换
-	const openaiBody = convertAnthropicToOpenAI(anthropicBody);
-	openaiBody.model = cfModel;
+<h2>What this project uses</h2>
+<ul>
+<li><strong>Workers AI</strong> is the inference provider. All model calls go to <code>api.cloudflare.com/client/v4/accounts/{id}/ai/...</code>.</li>
+<li><strong>AI Gateway is optional.</strong> Set a gateway id in the admin settings and every request gains <code>cf-aig-gateway-id</code>. This gives you gateway analytics, caching and logs without changing the model or quota model.</li>
+<li>The gateway does <strong>not</strong> bypass the free-neuron limit. The local quota guard still reserves and settles neurons per account per day.</li>
+<li>Gateway caching can reduce neuron spend on repeated identical prompts. The app also forwards <code>x-session-affinity</code>, which improves Workers AI prefix-cache hit rates.</li>
+</ul>
 
-	const stream = !!anthropicBody.stream;
+<div class="callout">If you only need OpenAI-compatible access to free Workers AI models, you do not need AI Gateway. Add it when you want observability, caching, retries across providers, or prepaid billing for frontier models.</div>
 
-	const result = await callOpenAICompatibleAPI(openaiBody, env, stream);
+<h2>When to use which</h2>
+<ul>
+<li>Use <strong>Workers AI directly</strong> for simple, cost-controlled, free-tier usage \u2014 the default here.</li>
+<li>Use <strong>AI Gateway in front of Workers AI</strong> for logs, latency metrics, cache controls and rate limiting.</li>
+<li>Use <strong>AI Gateway with other providers</strong> when you want one control plane across Workers AI, OpenAI, Anthropic and others.</li>
+<li>Use <strong>AI Gateway unified billing</strong> only if you intentionally move beyond the free allocation; paid-only frontier models require it or a Workers Paid plan.</li>
+</ul>
+<p class="tiny">Sources: Cloudflare Workers AI pricing, limits, errors and OpenAI-compatibility docs; AI Gateway Workers AI provider docs. Checked October 2026.</p>
+</article>`
+  },
+  api: {
+    title: "API reference \u2014 Workers AI2API",
+    html: `<article class="docs wrap">
+<h1>API reference</h1>
+<p>Base URL: <code>https://&lt;your-worker&gt;/v1</code>. Authenticate with <code>Authorization: Bearer sk-wa-\u2026</code> or <code>x-api-key</code>. If no keys exist and <code>allowPublic</code> is off, requests are rejected.</p>
+<pre><code>curl https://your-worker/v1/models \\
+  -H "Authorization: Bearer $KEY"</code></pre>
 
-	if (!result.success) {
-		// 尝试解析 CF 错误详情
-		let errorDetail;
-		try {
-			if (result.error && result.error.includes('CF API returned')) {
-				const match = result.error.match(/CF API returned \d+: (.+)/);
-				if (match) {
-					errorDetail = JSON.parse(match[1]);
-				}
-			}
-		} catch (_) { }
+<h2>Endpoints</h2>
+<table><thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>GET</td><td><code>/v1/models</code></td><td>Dynamic free catalog, sorted by estimated performance. Supports <code>task</code>, <code>search</code>, <code>sort</code> and <code>limit</code>.</td></tr>
+<tr><td>GET</td><td><code>/v1/models/{id}</code></td><td>One model with pricing, capabilities and rank.</td></tr>
+<tr><td>POST</td><td><code>/v1/chat/completions</code></td><td>OpenAI chat, streaming SSE, tools, vision where supported.</td></tr>
+<tr><td>POST</td><td><code>/v1/completions</code></td><td>Legacy text completion adapter (non-streaming).</td></tr>
+<tr><td>POST</td><td><code>/v1/responses</code></td><td>OpenAI Responses API for GPT-OSS models (non-streaming).</td></tr>
+<tr><td>POST</td><td><code>/v1/embeddings</code></td><td>Text embeddings.</td></tr>
+<tr><td>POST</td><td><code>/v1/images/generations</code></td><td>Text-to-image, returns <code>b64_json</code>.</td></tr>
+<tr><td>POST</td><td><code>/v1/audio/transcriptions</code></td><td>Multipart audio transcription.</td></tr>
+<tr><td>POST</td><td><code>/v1/audio/speech</code></td><td>Text-to-speech, returns audio bytes.</td></tr>
+<tr><td>POST</td><td><code>/v1/rerank</code></td><td>Jina/Cohere-style rerank.</td></tr>
+<tr><td>POST</td><td><code>/v1/run</code></td><td>Generic <code>{model, inputs}</code> passthrough for any catalog task.</td></tr>
+<tr><td>POST</td><td><code>/v1/messages</code></td><td>Anthropic Messages API, including streaming and tools.</td></tr>
+<tr><td>POST</td><td><code>/v1/messages/count_tokens</code></td><td>Approximate token count.</td></tr>
+</tbody></table>
 
-		const anthropicError = convertOpenAIErrorToAnthropic(
-			errorDetail || { message: result.error },
-			502
-		);
-		return new Response(JSON.stringify(anthropicError), {
-			status: 502,
-			headers: { 'Content-Type': 'application/json' }
-		});
-	}
+<h2>Model objects</h2>
+<p><code>/v1/models</code> returns standard OpenAI fields plus live metadata:</p>
+<pre><code>{
+  "id": "@cf/zai-org/glm-4.7-flash",
+  "object": "model",
+  "owned_by": "Zhipu AI",
+  "task": "text-generation",
+  "context_window": 131072,
+  "capabilities": {"reasoning": true, "function_calling": true, ...},
+  "pricing": {
+    "tokens": {
+      "input_usd_per_million": 0.06,
+      "output_usd_per_million": 0.4,
+      "input_neurons_per_million": 5500,
+      "output_neurons_per_million": 36400
+    },
+    "display": "$0.06 / input \xB7 $0.4 / output"
+  },
+  "free": true,
+  "requires_paid": false,
+  "free_daily_output_tokens": 274725,
+  "performance": {"score": 50.9, "tier": "B", "rank": 7, "basis": [...]}
+}</code></pre>
+<p>Paid-only models are hidden from <code>/v1/models</code> and rejected by the proxy. They remain visible in the admin model browser.</p>
 
-	if (stream) {
-		// 流式：转换流
-		const transformedStream = anthropicStreamTransform(result.stream, model, anthropicBody.messages);
-		return new Response(transformedStream, {
-			headers: {
-				'Content-Type': 'text/event-stream',
-				'Cache-Control': 'no-cache',
-				'Connection': 'keep-alive',
-				'Transfer-Encoding': 'chunked',
-			},
-		});
-	} else {
-		// 非流式：转换响应
-		const openaiResponse = result.data;
-		const anthropicResponse = convertOpenAIToAnthropic(openaiResponse, model);
-		return new Response(JSON.stringify(anthropicResponse), {
-			headers: { 'Content-Type': 'application/json' },
-		});
-	}
+<h2>Chat example</h2>
+<pre><code>curl https://your-worker/v1/chat/completions \\
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "model": "@cf/zai-org/glm-4.7-flash",
+    "messages": [{"role":"user","content":"Explain neurons in one paragraph."}],
+    "stream": true
+  }'</code></pre>
+<p>Short names are accepted when unique: <code>"model":"glm-4.7-flash"</code>. Add aliases in settings if you want stable client-facing names.</p>
+
+<h2>Quota and errors</h2>
+<p>Successful responses include <code>x-workers-ai-model</code>, <code>x-workers-ai-account</code>, <code>x-quota-remaining</code> and <code>x-quota-limit</code>.</p>
+<table><thead><tr><th>Status</th><th>Code</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>401</td><td><code>invalid_api_key</code></td><td>Missing/incorrect key, or no keys exist while public access is disabled.</td></tr>
+<tr><td>403</td><td><code>model_requires_paid_plan</code></td><td>Model needs Workers Paid or AI Gateway prepaid credits.</td></tr>
+<tr><td>404</td><td><code>model_not_found</code></td><td>Not in the live free catalog.</td></tr>
+<tr><td>429</td><td><code>insufficient_quota</code></td><td>All accounts exhausted their daily free allocation (Cloudflare code 3036) or the request estimate exceeds the daily budget.</td></tr>
+<tr><td>429</td><td><code>capacity_exceeded</code></td><td>Workers AI is temporarily out of capacity (code 3040). Retry later.</td></tr>
+<tr><td>502</td><td><code>upstream_error</code></td><td>Cloudflare returned an unexpected error.</td></tr>
+</tbody></table>
+
+<h2>AI Gateway</h2>
+<p>Set a gateway id in Settings to add <code>cf-aig-gateway-id</code> to every upstream request. Optional client headers <code>cf-aig-cache-ttl</code>, <code>cf-aig-cache-key</code> and <code>cf-aig-skip-cache</code> are forwarded only when a gateway is configured. <code>x-session-affinity</code> is always forwarded to improve prefix caching.</p>
+</article>`
+  },
+  "free-tier": {
+    title: "Free-tier guard \u2014 Workers AI2API",
+    html: `<article class="docs wrap">
+<h1>The hard free-tier guard</h1>
+<p>Cloudflare gives every account <strong>10,000 neurons per day</strong> at no charge, resetting at <strong>00:00 UTC</strong>. The app treats that as a hard ceiling, not a suggestion.</p>
+
+<h2>How a request is accounted</h2>
+<ol>
+<li><strong>Estimate.</strong> The proxy estimates prompt tokens (over-estimating at ~3.6 chars/token plus 850 tokens per image) and output tokens (<code>max_tokens</code>, or the configured default). It multiplies by the model's live neuron rates.</li>
+<li><strong>Reserve.</strong> A Durable Object atomically checks <code>used + reserved + estimate \u2264 limit</code>. If it passes, the amount is reserved before any upstream call.</li>
+<li><strong>Call with failover.</strong> If an account has no quota or returns 3036, the next account is tried. Other 429/5xx errors also fail over; client errors (400/404/413) do not.</li>
+<li><strong>Settle.</strong> After the body is consumed, actual <code>usage</code> tokens are converted to neurons and the reservation is released. Streaming responses settle when the stream flushes.</li>
+<li><strong>Reconcile.</strong> The usage tab queries Cloudflare GraphQL analytics (<code>aiInferenceAdaptiveGroups</code>) and takes the higher of local and cloud usage. This catches usage from the dashboard/playground or other apps.</li>
+</ol>
+
+<div class="callout">If the Durable Object binding is missing, the app falls back to KV accounting. It still enforces the cap best-effort, but KV is not atomic under concurrency. Bind <code>QUOTA</code> for a strict guarantee.</div>
+
+<h2>Why reserve the maximum?</h2>
+<p>Cloudflare bills after inference; there is no pre-flight neuron quote. Reserving an upper bound means concurrent requests cannot collectively overshoot. If the model produces fewer tokens, the difference is released at settlement. A crash between reserve and settle leaves the reservation in place until the UTC day rolls over \u2014 a fail-safe direction.</p>
+
+<h2>What is excluded</h2>
+<p>Cloudflare marks certain models as requiring a Workers Paid plan or AI Gateway prepaid credits. They are <strong>not</strong> in the free catalog and the proxy rejects them with <code>403 model_requires_paid_plan</code>. The list is parsed from the live pricing page, not hardcoded; as of October 2026 it includes Kimi K2.6/K2.7, GLM-5.2/5.3/5.3-Flash, and DeepSeek V4 Flash/Pro variants.</p>
+
+<h2>Tuning</h2>
+<ul>
+<li><code>settings.dailyNeurons</code> defaults to 10,000 and cannot exceed <code>MAX_DAILY_NEURONS</code> (default 10,000).</li>
+<li><code>settings.defaultMaxOutputTokens</code> controls the reservation when clients omit <code>max_tokens</code>. Lower it if you see avoidable quota rejections.</li>
+<li>Larger contexts can exceed the entire daily allowance in one request. The proxy rejects those with an explicit estimate before calling upstream.</li>
+<li>With multiple accounts, the aggregate budget is <code>accounts \xD7 10,000</code>; each account is tracked separately.</li>
+</ul>
+
+<h2>What it does not do</h2>
+<p>It does not create free quota, bypass Cloudflare's rate limits, or make paid-only models free. It only ensures this app never intentionally spends past the free allocation.</p>
+</article>`
+  }
+};
+function handleDocsPage(slug) {
+  const doc = DOCS[slug];
+  if (!doc) return null;
+  const body = `${nav}<main>${doc.html}</main><footer><div class="wrap">Workers AI2API v2 \xB7 Prices and limits belong to Cloudflare.</div></footer>`;
+  return shell({ title: doc.title, body });
 }
 
-// ----------------------------------------------------
-// Anthropic SSE 流式转换
-// 将 OpenAI SSE 格式实时转换为 Anthropic SSE 格式
-// ----------------------------------------------------
-function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
-	const reader = upstreamBody.getReader();
-	const decoder = new TextDecoder();
-	const encoder = new TextEncoder();
-	let buffer = '';
-	let messageId = `msg_${crypto.randomUUID()}`;
-	let contentBlockIndex = -1;  // 首次递增后从 0 开始（Bug #8）
-	let currentToolCallId = null;
-	let currentToolName = null;
-	let currentToolArgs = '';
-	let streamStarted = false;
-	let blockStopSent = false;  // 跟踪最后一个 content block 是否已发送 stop（Bug #2）
-	let inputTokens = 0;
-	let outputTokens = 0;
+// src/quota-do.js
+var QuotaGuard = class {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+  async fetch(request) {
+    const url = new URL(request.url);
+    const body = await request.json().catch(() => ({}));
+    const day = String(body.day || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+      return Response.json({ ok: false, error: "invalid day" }, { status: 400 });
+    }
+    const limit = Math.max(0, Number(body.limit) || 0);
+    const key = `day:${day}`;
+    return this.state.blockConcurrencyWhile(async () => {
+      let record = await this.state.storage.get(key);
+      if (!record) record = { used: 0, reserved: 0, updatedAt: Date.now() };
+      const remaining = () => Math.max(0, limit - record.used - record.reserved);
+      switch (url.pathname) {
+        case "/reserve": {
+          const amount = Math.max(0, Math.ceil(Number(body.amount) || 0));
+          if (record.used + record.reserved + amount > limit) {
+            return Response.json({
+              ok: false,
+              used: record.used,
+              reserved: record.reserved,
+              remaining: remaining(),
+              limit
+            });
+          }
+          record.reserved += amount;
+          record.updatedAt = Date.now();
+          await this.state.storage.put(key, record);
+          return Response.json({
+            ok: true,
+            reserved: record.reserved,
+            used: record.used,
+            remaining: remaining(),
+            limit
+          });
+        }
+        case "/settle": {
+          const reserved = Math.max(0, Math.ceil(Number(body.reserved) || 0));
+          const actual = Math.max(0, Math.ceil(Number(body.actual) || 0));
+          record.reserved = Math.max(0, record.reserved - reserved);
+          record.used += actual;
+          record.updatedAt = Date.now();
+          await this.state.storage.put(key, record);
+          return Response.json({
+            ok: true,
+            used: record.used,
+            reserved: record.reserved,
+            remaining: remaining(),
+            limit
+          });
+        }
+        case "/reconcile": {
+          const used = Math.max(0, Math.ceil(Number(body.used) || 0));
+          record.used = Math.max(record.used, used);
+          record.updatedAt = Date.now();
+          await this.state.storage.put(key, record);
+          return Response.json({ ok: true, used: record.used, reserved: record.reserved, remaining: remaining(), limit });
+        }
+        case "/exhaust": {
+          record.used = limit;
+          record.reserved = 0;
+          record.updatedAt = Date.now();
+          await this.state.storage.put(key, record);
+          return Response.json({ ok: true, used: record.used, remaining: 0, limit });
+        }
+        case "/status": {
+          return Response.json({
+            ok: true,
+            used: record.used,
+            reserved: record.reserved,
+            remaining: remaining(),
+            limit
+          });
+        }
+        default:
+          return Response.json({ ok: false, error: "not found" }, { status: 404 });
+      }
+    });
+  }
+};
 
-	let enqueuedAny = false;
-
-	return new ReadableStream({
-		async pull(controller) {
-			enqueuedAny = false;
-			const originalEnqueue = controller.enqueue.bind(controller);
-			controller.enqueue = (chunk) => {
-				enqueuedAny = true;
-				originalEnqueue(chunk);
-			};
-
-			while (true) {
-				const { value, done } = await reader.read();
-				if (done) {
-					if (buffer.trim()) {
-						buffer = processLines(buffer, controller);
-					}
-					controller.close();
-					break;
-				}
-
-				buffer += decoder.decode(value, { stream: true });
-				buffer = processLines(buffer, controller);
-
-				if (buffer.indexOf('\n') === -1) {
-					if (enqueuedAny) {
-						break;
-					}
-				}
-			}
-		},
-		cancel() {
-			reader.cancel();
-		},
-	});
-
-	function processLines(data, controller) {
-		const lines = data.split('\n');
-		const remaining = lines.pop();
-
-		for (const line of lines) {
-			const trimmed = line.trim();
-			if (!trimmed) continue;
-
-			if (trimmed.startsWith('data: ')) {
-				const dataStr = trimmed.slice(6);
-				if (dataStr === '[DONE]') {
-					// 发送最终事件
-					sendFinalEvent(controller);
-					continue;
-				}
-
-				try {
-					const chunk = JSON.parse(dataStr);
-					const choice = chunk.choices?.[0];
-					if (!choice) continue;
-
-					const delta = choice.delta || {};
-
-					// 更新 usage
-					if (chunk.usage) {
-						inputTokens = chunk.usage.prompt_tokens || 0;
-						outputTokens = chunk.usage.completion_tokens || 0;
-					}
-
-					// 处理 tool_calls delta
-					if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-						// 首次发送任何数据前先发送 message_start（Bug #1）
-						if (!streamStarted) {
-							sendMessageStart(controller);
-							streamStarted = true;
-						}
-
-						for (const tc of delta.tool_calls) {
-							if (tc.id) {
-								// 新的 tool_call 开始
-								if (currentToolCallId) {
-									// 先结束上一个
-									sendContentBlockStop(controller);
-									blockStopSent = true;
-								}
-								currentToolCallId = tc.id;
-								currentToolName = tc.function?.name || '';
-								currentToolArgs = '';
-								contentBlockIndex++;
-								blockStopSent = false;
-
-								sendContentBlockStart(controller, 'tool_use');
-							}
-
-							if (tc.function?.arguments) {
-								currentToolArgs += tc.function.arguments;
-								// 发送 tool_use 的 input_json_delta
-								sendToolUseDelta(controller, tc.function.arguments);
-							}
-						}
-					} else if (delta.content) {
-						// 文本内容 delta
-						if (!streamStarted) {
-							sendMessageStart(controller);
-							contentBlockIndex++;
-							sendContentBlockStart(controller, 'text');
-							streamStarted = true;
-							blockStopSent = false;
-						}
-
-						// 如果之前有 tool_call 在进行中，先结束
-						if (currentToolCallId) {
-							sendContentBlockStop(controller);
-							blockStopSent = true;
-							currentToolCallId = null;
-							currentToolName = null;
-							currentToolArgs = '';
-
-							// 开始新的 text block
-							contentBlockIndex++;
-							sendContentBlockStart(controller, 'text');
-							blockStopSent = false;
-						}
-
-						sendTextDelta(controller, delta.content);
-					}
-
-					// 检查 finish_reason
-					if (choice.finish_reason) {
-						if (currentToolCallId && currentToolArgs) {
-							// 发送最终的 tool_use input
-							sendToolUseFinalInput(controller);
-						}
-					}
-				} catch (_) {
-					// 忽略解析错误
-				}
-			}
-		}
-		return remaining;
-	}
-
-	function sendMessageStart(controller) {
-		const event = {
-			type: 'message_start',
-			message: {
-				id: messageId,
-				type: 'message',
-				role: 'assistant',
-				content: [],
-				model: modelName,
-				stop_reason: null,
-				stop_sequence: null,
-				usage: { input_tokens: inputTokens, output_tokens: outputTokens }
-			}
-		};
-		controller.enqueue(encoder.encode(`event: message_start\ndata: ${JSON.stringify(event)}\n\n`));
-	}
-
-	function sendContentBlockStart(controller, blockType) {
-		const event = {
-			type: 'content_block_start',
-			index: contentBlockIndex,
-			content_block: blockType === 'tool_use'
-				? { type: 'tool_use', id: currentToolCallId, name: currentToolName, input: {} }
-				: { type: 'text', text: '' }
-		};
-		controller.enqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(event)}\n\n`));
-	}
-
-	function sendTextDelta(controller, text) {
-		const event = {
-			type: 'content_block_delta',
-			index: contentBlockIndex,
-			delta: { type: 'text_delta', text }
-		};
-		controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(event)}\n\n`));
-	}
-
-	function sendToolUseDelta(controller, argsDelta) {
-		const event = {
-			type: 'content_block_delta',
-			index: contentBlockIndex,
-			delta: { type: 'input_json_delta', partial_json: argsDelta }
-		};
-		controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(event)}\n\n`));
-	}
-
-	function sendToolUseFinalInput(controller) {
-		// 发送最终的 content_block_stop
-		controller.enqueue(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({
-			type: 'content_block_stop',
-			index: contentBlockIndex
-		})}\n\n`));
-		blockStopSent = true;
-	}
-
-	function sendContentBlockStop(controller) {
-		controller.enqueue(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({
-			type: 'content_block_stop',
-			index: contentBlockIndex
-		})}\n\n`));
-	}
-
-	function sendFinalEvent(controller) {
-		// 如果 finish_reason 触发时已发送过 content_block_stop，跳过重复发送（Bug #2）
-		if (!blockStopSent) {
-			sendContentBlockStop(controller);
-		}
-
-		let stopReason = 'end_turn';
-		if (currentToolCallId) {
-			stopReason = 'tool_use';
-		}
-
-		const event = {
-			type: 'message_delta',
-			delta: {
-				stop_reason: stopReason,
-				stop_sequence: null
-			},
-			usage: { output_tokens: outputTokens || 0 }
-		};
-		controller.enqueue(encoder.encode(`event: message_delta\ndata: ${JSON.stringify(event)}\n\n`));
-
-		controller.enqueue(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({
-			type: 'message_stop'
-		})}\n\n`));
-	}
+// src/index.js
+var HTML_HEADERS = {
+  "Content-Type": "text/html; charset=utf-8",
+  "Cache-Control": "no-store",
+  "Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; base-uri 'none'; form-action 'self'",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "strict-origin-when-cross-origin"
+};
+function setupResponse(request) {
+  if (new URL(request.url).pathname.startsWith("/v1/")) {
+    return json({
+      error: {
+        message: 'KV binding "KV" is missing. Create a KV namespace and bind it as KV before using the API.',
+        type: "configuration_error",
+        code: "kv_not_configured"
+      }
+    }, { status: 503 });
+  }
+  return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>Setup required</title>
+<style>body{font-family:ui-sans-serif,system-ui,sans-serif;max-width:720px;margin:10vh auto;padding:24px;line-height:1.6;background:#0b0d10;color:#e8eaed}code{background:#1b1f24;padding:2px 6px;border-radius:4px}</style></head>
+<body><h1>KV binding missing</h1><p>Create a KV namespace and bind it as <code>KV</code>, then reload this page.</p>
+<p>Workers: <code>wrangler kv namespace create KV</code> and put the id in <code>wrangler.jsonc</code>.<br>Pages: Settings \u2192 Bindings \u2192 KV namespace \u2192 variable name <code>KV</code>.</p></body></html>`, { status: 503, headers: HTML_HEADERS });
 }
-
-// 向量嵌入（Embeddings）的代理处理函数
-async function handleEmbeddings(request, env) {
-	let body;
-	try {
-		body = await request.json();
-	} catch (e) {
-		return new Response(JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }), { status: 400 });
-	}
-
-	const { model, input } = body;
-	if (!input) {
-		return new Response(JSON.stringify({ error: { message: "input is required", type: "invalid_request_error" } }), { status: 400 });
-	}
-
-	// 解析模型名映射
-	let cfModel = model;
-	if (!cfModel.startsWith('@cf/')) {
-		const customMap = await getCustomModelMap(env);
-		const combinedMap = { ...DEFAULT_MODEL_MAP, ...customMap };
-		cfModel = combinedMap[model];
-		if (!cfModel) {
-			cfModel = '@cf/baai/bge-m3'; // 找不到映射就用这个默认模型兜底
-		}
-	}
-
-	const textArray = Array.isArray(input) ? input : [input];
-	const accounts = await getAccounts(env);
-	const activeAccounts = accounts.filter(a => a.status === 'active');
-	if (activeAccounts.length === 0) {
-		return new Response(JSON.stringify({ error: { message: "No active accounts configured", type: "server_error" } }), { status: 503 });
-	}
-
-	const shuffledAccounts = [...activeAccounts].sort(() => Math.random() - 0.5);
-	let lastError = null;
-
-	for (const account of shuffledAccounts) {
-		try {
-			const cfResponse = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/run/${cfModel}`, {
-				method: 'POST',
-				headers: {
-					'Authorization': `Bearer ${account.apiToken}`,
-					'Content-Type': 'application/json'
-				},
-				body: JSON.stringify({ text: textArray })
-			});
-
-			if (cfResponse.ok) {
-				const cfJson = await cfResponse.json();
-				if (cfJson.success) {
-					const embeddings = cfJson.result.data.map((emb, index) => ({
-						object: "embedding",
-						index: index,
-						embedding: emb
-					}));
-
-					const responseObj = {
-						object: "list",
-						data: embeddings,
-						model: model,
-						usage: {
-							prompt_tokens: textArray.reduce((acc, text) => acc + Math.ceil(text.length / 4), 0),
-							total_tokens: textArray.reduce((acc, text) => acc + Math.ceil(text.length / 4), 0)
-						}
-					};
-					return new Response(JSON.stringify(responseObj), { headers: { 'Content-Type': 'application/json' } });
-				} else {
-					lastError = `CF Run failed: ${JSON.stringify(cfJson.errors)}`;
-				}
-			} else {
-				const errorText = await cfResponse.text();
-				lastError = `CF API status ${cfResponse.status}: ${errorText}`;
-			}
-		} catch (e) {
-			lastError = `Connection error: ${e.message}`;
-		}
-	}
-
-	return new Response(JSON.stringify({
-		error: { message: `All Cloudflare accounts failed. Last error: ${lastError}`, type: "server_error" }
-	}), { status: 502, headers: { 'Content-Type': 'application/json' } });
+function apiUnauthorized(reason, anthropic = false) {
+  const message = reason === "no_keys" ? "No API keys exist and public access is disabled. Create a key in /admin, or set allowPublic=true." : "Incorrect or missing API key. Use Authorization: Bearer sk-wa-\u2026 or x-api-key.";
+  if (anthropic) {
+    return new AnthropicError(message, 401, "authentication_error").toResponse();
+  }
+  return openAIError(message, { status: 401, code: "invalid_api_key", type: "authentication_error" });
 }
-
-// 粗略估算 token 数量（按每 4 个字符约 1 个 token 估算）
-function estimateUsage(messages, answer) {
-	let promptChars = 0;
-	for (const msg of messages) {
-		promptChars += (msg.content || '').length;
-	}
-	const completionChars = (answer || '').length;
-
-	const promptTokens = Math.ceil(promptChars / 4);
-	const completionTokens = Math.ceil(completionChars / 4);
-
-	return {
-		prompt_tokens: promptTokens,
-		completion_tokens: completionTokens,
-		total_tokens: promptTokens + completionTokens
-	};
+async function touchKey(env, ctx, key) {
+  if (!key?.hash) return;
+  const last = key.lastUsedAt ? Date.parse(key.lastUsedAt) : 0;
+  if (Date.now() - last < 10 * 6e4) return;
+  ctx?.waitUntil?.(updateConfig(env, (config) => {
+    const stored = config.apiKeys.find((item) => item.id === key.id);
+    if (stored) stored.lastUsedAt = (/* @__PURE__ */ new Date()).toISOString();
+    return config;
+  }).catch(() => {
+  }));
 }
-
-// 透传 CF /ai/v1/chat/completions 返回的 SSE 流
-// CF 返回的本来就是标准 OpenAI 的 SSE 格式，我们只把模型名改一下，
-// 这样 tool_calls、finish_reason、reasoning_content、usage 等字段都能原样保留。
-function passthroughStream(upstreamBody, modelName) {
-	const reader = upstreamBody.getReader();
-	const decoder = new TextDecoder();
-	const encoder = new TextEncoder();
-	let buffer = '';
-
-	return new ReadableStream({
-		async pull(controller) {
-			while (true) {
-				const { value, done } = await reader.read();
-				if (done) {
-					// 把缓冲区里剩下的内容输出掉
-					if (buffer.trim()) {
-						buffer = processLines(buffer, controller);
-					}
-					controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-					controller.close();
-					break;
-				}
-
-				buffer += decoder.decode(value, { stream: true });
-				buffer = processLines(buffer, controller);
-
-				if (buffer.indexOf('\n') === -1) {
-					break;
-				}
-			}
-		},
-		cancel() {
-			reader.cancel();
-		},
-	});
-
-	function processLines(data, controller) {
-		const lines = data.split('\n');
-		const remaining = lines.pop(); // 把最后可能不完整的一行留在缓冲区里
-
-		for (const line of lines) {
-			const trimmed = line.trim();
-			if (!trimmed) continue;
-
-			if (trimmed.startsWith('data: ')) {
-				const dataStr = trimmed.slice(6);
-				if (dataStr === '[DONE]') continue;
-
-				try {
-					const chunk = JSON.parse(dataStr);
-					// 只改模型名，其他字段全部原样透传
-					// 这样 tool_calls、finish_reason、usage、reasoning_content 都能保留下来
-					if (chunk.model !== undefined) chunk.model = modelName;
-					controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-				} catch (_) {
-					// 解析不了的行，按原样转发
-					controller.enqueue(encoder.encode(`${line}\n`));
-				}
-			} else {
-				// 非 data 开头的 SSE 行（注释、事件等），原样转发
-				controller.enqueue(encoder.encode(`${line}\n`));
-			}
-		}
-		return remaining;
-	}
+async function previewJson(request) {
+  try {
+    return await request.clone().json();
+  } catch {
+    return null;
+  }
 }
-
-// ----------------------------------------------------
-// 后台管理面板的 API 接口处理函数
-// ----------------------------------------------------
-async function handleDashboardApi(request, env, ctx) {
-	const url = new URL(request.url);
-	const method = request.method;
-
-	// 1. 查询初始化状态（密码通过环境变量配置，所以这里永远返回已初始化）
-	if (url.pathname === '/api/auth/status' && method === 'GET') {
-		return new Response(JSON.stringify({
-			isSetup: true
-		}), { headers: { 'Content-Type': 'application/json' } });
-	}
-
-	// 2. 设置首个管理员密码（已停用，改由环境变量 ADMIN_PASSWORD 配置）
-	if (url.pathname === '/api/auth/setup' && method === 'POST') {
-		return new Response(JSON.stringify({ error: 'Setup is handled via environment variable ADMIN_PASSWORD' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-	}
-
-	// 3. 登录（直接比对密码，不读写 KV，既快又省钱）
-	if (url.pathname === '/api/auth/login' && method === 'POST') {
-		const { password } = await request.json();
-		const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
-		if (password === expectedPassword) {
-			const token = await sha256(password);
-			return new Response(JSON.stringify({ success: true }), {
-				headers: {
-					'Content-Type': 'application/json',
-					'Set-Cookie': `admin_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`
-				}
-			});
-		} else {
-			return new Response(JSON.stringify({ error: 'Incorrect password' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
-		}
-	}
-
-	// 4. 退出登录
-	if (url.pathname === '/api/auth/logout' && method === 'POST') {
-		return new Response(JSON.stringify({ success: true }), {
-			headers: {
-				'Content-Type': 'application/json',
-				'Set-Cookie': `admin_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`
-			}
-		});
-	}
-
-	// 5. 公开的用量汇总（首页未登录时也能看到）
-	if (url.pathname === '/api/usage/summary') {
-		if (method === 'GET') {
-			const cached = await getCachedSummary(env);
-			if (cached) {
-				return new Response(JSON.stringify(cached), { headers: { 'Content-Type': 'application/json' } });
-			}
-
-			const accounts = await getAccounts(env);
-			if (accounts.length === 0) {
-				return new Response(JSON.stringify({
-					totalNeuronsToday: 0,
-					totalAccounts: 0,
-					totalLimit: 0,
-					usagePercentage: 0,
-					needUpdate: false
-				}), { headers: { 'Content-Type': 'application/json' } });
-			}
-
-			// 读取缓存的卡片明细来检查更新时间
-			const cachedDetailsRaw = await env.KV.get('cache_usage_details');
-			let cacheMap = {};
-			if (cachedDetailsRaw) {
-				try {
-					cacheMap = JSON.parse(cachedDetailsRaw) || {};
-				} catch (e) { }
-			}
-
-			// 判断是否有任意一个账号的更新时间超过了 20 分钟 (20 * 60 * 1000)
-			const now = Date.now();
-			const hasOutdated = accounts.some(account => {
-				const lastUpdated = cacheMap[account.id]?.timestamp || 0;
-				return (now - lastUpdated) > 20 * 60 * 1000;
-			});
-
-			// 计算当前缓存中的汇总数据和模型占比
-			let totalNeuronsToday = 0;
-			let modelsToday = {};
-			accounts.forEach(account => {
-				const cachedItem = cacheMap[account.id];
-				if (cachedItem) {
-					if (cachedItem.usageToday) {
-						totalNeuronsToday += cachedItem.usageToday;
-					}
-					if (cachedItem.modelsToday) {
-						cachedItem.modelsToday.forEach(m => {
-							modelsToday[m.model] = (modelsToday[m.model] || 0) + m.neurons;
-						});
-					}
-				}
-			});
-
-			const formattedModelsToday = Object.keys(modelsToday).map(model => ({
-				model,
-				neurons: modelsToday[model]
-			}));
-
-			const totalLimit = accounts.length * 10000;
-			const usagePercentage = totalLimit > 0 ? parseFloat(((totalNeuronsToday / totalLimit) * 100).toFixed(2)) : 0;
-
-			const summary = {
-				totalNeuronsToday,
-				totalAccounts: accounts.length,
-				totalLimit,
-				usagePercentage,
-				modelsToday: formattedModelsToday,
-				needUpdate: hasOutdated
-			};
-
-			await setCachedSummary(env, summary);
-			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
-		}
-
-		if (method === 'POST') {
-			const accounts = await getAccounts(env);
-			if (accounts.length === 0) {
-				return new Response(JSON.stringify({
-					totalNeuronsToday: 0,
-					totalAccounts: 0,
-					totalLimit: 0,
-					usagePercentage: 0,
-					modelsToday: [],
-					needUpdate: false
-				}), { headers: { 'Content-Type': 'application/json' } });
-			}
-
-			// 刷新最老数据的 20 个账号
-			const cacheMap = await refreshAccountsUsage(env, accounts, 20);
-
-			// 计算最新总量和模型占比
-			let totalNeuronsToday = 0;
-			let modelsToday = {};
-			accounts.forEach(account => {
-				const cachedItem = cacheMap[account.id];
-				if (cachedItem) {
-					if (cachedItem.usageToday) {
-						totalNeuronsToday += cachedItem.usageToday;
-					}
-					if (cachedItem.modelsToday) {
-						cachedItem.modelsToday.forEach(m => {
-							modelsToday[m.model] = (modelsToday[m.model] || 0) + m.neurons;
-						});
-					}
-				}
-			});
-
-			const formattedModelsToday = Object.keys(modelsToday).map(model => ({
-				model,
-				neurons: modelsToday[model]
-			}));
-
-			const totalLimit = accounts.length * 10000;
-			const usagePercentage = totalLimit > 0 ? parseFloat(((totalNeuronsToday / totalLimit) * 100).toFixed(2)) : 0;
-
-			const summary = {
-				totalNeuronsToday,
-				totalAccounts: accounts.length,
-				totalLimit,
-				usagePercentage,
-				modelsToday: formattedModelsToday,
-				needUpdate: false
-			};
-
-			await setCachedSummary(env, summary);
-			return new Response(JSON.stringify(summary), { headers: { 'Content-Type': 'application/json' } });
-		}
-	}
-
-	// --------------------------------------------------
-	// 下面这些都是需要登录后才能访问的接口
-	// --------------------------------------------------
-	const isAuthorized = await checkAdminAuth(request, env);
-	if (!isAuthorized) {
-		return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
-	}
-
-	if (url.pathname === '/api/accounts') {
-		if (method === 'GET') {
-			const accounts = await getAccounts(env);
-			return new Response(JSON.stringify(accounts), { headers: { 'Content-Type': 'application/json' } });
-		}
-
-		if (method === 'POST') {
-			const { id, name, accountId, apiToken } = await request.json();
-			if (!accountId || !apiToken) {
-				return new Response(JSON.stringify({ error: 'AccountId and ApiToken are required' }), { status: 400 });
-			}
-
-			let accounts = await getAccounts(env);
-			if (id) {
-				// 编辑已有账号
-				accounts = accounts.map(a => {
-					if (a.id === id) {
-						const updatedToken = (apiToken.includes('...') || apiToken === '********') ? a.apiToken : apiToken;
-						return { ...a, name: name || a.name, accountId, apiToken: updatedToken };
-					}
-					return a;
-				});
-			} else {
-				// 新增账号
-				accounts.push({
-					id: crypto.randomUUID(),
-					name: name || 'CF Account',
-					accountId,
-					apiToken,
-					status: 'active'
-				});
-			}
-			await saveAccounts(env, accounts);
-			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-		}
-
-		if (method === 'DELETE') {
-			const { id } = await request.json();
-			let accounts = await getAccounts(env);
-			accounts = accounts.filter(a => a.id !== id);
-			await saveAccounts(env, accounts);
-			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-		}
-	}
-
-	// 7. 测试账号是否能正常连接
-	if (url.pathname === '/api/accounts/test' && method === 'POST') {
-		const { id, accountId, apiToken } = await request.json();
-		let targetAccountId = accountId;
-		let targetApiToken = apiToken;
-
-		if (id) {
-			const accounts = await getAccounts(env);
-			const acc = accounts.find(a => a.id === id);
-			if (acc) {
-				if (!targetAccountId) targetAccountId = acc.accountId;
-				if (!targetApiToken || targetApiToken.includes('...') || targetApiToken === '********') {
-					targetApiToken = acc.apiToken;
-				}
-			}
-		}
-
-		if (!targetAccountId || !targetApiToken) {
-			return new Response(JSON.stringify({ success: false, error: 'Account info not found' }), { status: 400 });
-		}
-
-		const [readResult, editResult, analyticsResult] = await Promise.all([
-			// 1. Workers AI > Read
-			(async () => {
-				try {
-					const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/models/search?limit=1`, {
-						method: 'GET',
-						headers: {
-							'Authorization': `Bearer ${targetApiToken}`,
-							'Content-Type': 'application/json'
-						}
-					});
-					const data = await res.json();
-					if (res.ok && data.success !== false) {
-						return { success: true };
-					}
-					return { success: false, error: data.errors?.[0]?.message || `HTTP ${res.status}` };
-				} catch (e) {
-					return { success: false, error: e.message };
-				}
-			})(),
-			// 2. Workers AI > Edit
-			(async () => {
-				try {
-					const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${targetAccountId}/ai/run/@cf/google/embeddinggemma-300m`, {
-						method: 'POST',
-						headers: {
-							'Authorization': `Bearer ${targetApiToken}`,
-							'Content-Type': 'application/json'
-						},
-						body: JSON.stringify({ text: ['test'] })
-					});
-					const data = await res.json();
-					if (res.ok && data.success !== false) {
-						return { success: true };
-					}
-					return { success: false, error: data.errors?.[0]?.message || `HTTP ${res.status}` };
-				} catch (e) {
-					return { success: false, error: e.message };
-				}
-			})(),
-			// 3. Account Analytics > Read
-			(async () => {
-				try {
-					const query = `
-						query GetAIUsage($accountId: String!, $start: String!) {
-							viewer {
-								accounts(filter: { accountTag: $accountId }) {
-									aiInferenceAdaptiveGroups(
-										filter: { datetime_geq: $start }
-										limit: 1
-									) {
-										count
-									}
-								}
-							}
-						}
-					`;
-					const todayUTC = new Date();
-					todayUTC.setUTCHours(0, 0, 0, 0);
-					const startToday = todayUTC.toISOString().split('.')[0] + 'Z';
-
-					const res = await fetch(`https://api.cloudflare.com/client/v4/graphql`, {
-						method: 'POST',
-						headers: {
-							'Authorization': `Bearer ${targetApiToken}`,
-							'Content-Type': 'application/json'
-						},
-						body: JSON.stringify({
-							query,
-							variables: {
-								accountId: targetAccountId,
-								start: startToday
-							}
-						})
-					});
-					const data = await res.json();
-					if (res.ok && !data.errors && data.data?.viewer?.accounts) {
-						return { success: true };
-					}
-					return { success: false, error: data.errors?.[0]?.message || `HTTP ${res.status}` };
-				} catch (e) {
-					return { success: false, error: e.message };
-				}
-			})()
-		]);
-
-		const allSuccess = readResult.success && editResult.success && analyticsResult.success;
-		let overallError = null;
-		if (!allSuccess) {
-			const failedPerms = [];
-			if (!readResult.success) failedPerms.push(`Workers AI > Read (${readResult.error})`);
-			if (!editResult.success) failedPerms.push(`Workers AI > Edit (${editResult.error})`);
-			if (!analyticsResult.success) failedPerms.push(`Account Analytics > Read (${analyticsResult.error})`);
-			overallError = failedPerms.join('; ');
-		}
-
-		return new Response(JSON.stringify({
-			success: allSuccess,
-			error: overallError,
-			permissions: {
-				workersAiRead: readResult,
-				workersAiEdit: editResult,
-				accountAnalyticsRead: analyticsResult
-			}
-		}), { headers: { 'Content-Type': 'application/json' } });
-	}
-
-	// 8. 登录后看到的详细用量统计
-	if (url.pathname === '/api/accounts/usage' && method === 'GET') {
-		const accounts = await getAccounts(env);
-		if (accounts.length === 0) {
-			return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json' } });
-		}
-
-		// 刷新最老数据的20个账号
-		const cacheMap = await refreshAccountsUsage(env, accounts, 20);
-
-		// 构建完整结果列表，若没有缓存数据则标为 pending
-		const results = accounts.map(account => {
-			const cached = cacheMap[account.id];
-			return {
-				id: account.id,
-				name: account.name,
-				accountId: account.accountId,
-				status: cached ? cached.status : 'pending',
-				error: cached ? cached.error : undefined,
-				usageToday: cached ? cached.usageToday : 0,
-				modelsToday: cached ? cached.modelsToday : [],
-				history: cached ? cached.history : [],
-				lastUpdated: cached ? cached.timestamp : 0
-			};
-		});
-
-		return new Response(JSON.stringify(results), { headers: { 'Content-Type': 'application/json' } });
-	}
-
-	// 9. 代理接口用的自定义 API 密钥管理
-	if (url.pathname === '/api/keys') {
-		if (method === 'GET') {
-			const keys = await getApiKeys(env);
-			return new Response(JSON.stringify(keys), { headers: { 'Content-Type': 'application/json' } });
-		}
-
-		if (method === 'POST') {
-			const { name, key } = await request.json();
-			if (!name) {
-				return new Response(JSON.stringify({ error: 'Name is required' }), { status: 400 });
-			}
-
-			const generatedKey = key || `sk-wa-${crypto.randomUUID().replace(/-/g, '')}`;
-			const keys = await getApiKeys(env);
-			keys.push({
-				id: crypto.randomUUID(),
-				name,
-				key: generatedKey,
-				createdAt: new Date().toISOString()
-			});
-			await saveApiKeys(env, keys);
-			return new Response(JSON.stringify({ success: true, key: generatedKey }), { headers: { 'Content-Type': 'application/json' } });
-		}
-
-		if (method === 'DELETE') {
-			const { id } = await request.json();
-			let keys = await getApiKeys(env);
-			keys = keys.filter(k => k.id !== id);
-			await saveApiKeys(env, keys);
-			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-		}
-	}
-
-	// 10. 模型设置和映射
-	if (url.pathname === '/api/settings') {
-		if (method === 'GET') {
-			const customMap = await getCustomModelMap(env);
-			return new Response(JSON.stringify({ customModelMap: customMap }), { headers: { 'Content-Type': 'application/json' } });
-		}
-
-		if (method === 'POST') {
-			const { customModelMap } = await request.json();
-			if (!customModelMap || typeof customModelMap !== 'object') {
-				return new Response(JSON.stringify({ error: 'Invalid customModelMap payload' }), { status: 400 });
-			}
-			await saveCustomModelMap(env, customModelMap);
-			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-		}
-	}
-
-	return new Response(JSON.stringify({ error: 'Endpoint not found' }), { status: 404 });
+async function previewForm(request) {
+  try {
+    return await request.clone().formData();
+  } catch {
+    return null;
+  }
 }
-
-// ----------------------------------------------------
-// 前端页面处理函数（按页面拆分）
-// ----------------------------------------------------
-
-// 1. 首页 / 登录页
-async function handleLandingPage(request, env, ctx) {
-	const isLoggedIn = await verifyAdminCookie(request, env);
-
-	let actionCardHtml = '';
-	if (isLoggedIn) {
-		actionCardHtml = `
-			<div class="section-card" style="text-align: center;">
-				<div class="section-title" style="justify-content: center; margin-bottom: 10px;">欢迎回来</div>
-				<p style="font-size: 14px; color: var(--text-muted); margin-bottom: 20px;">您当前已登录管理员身份。</p>
-				<a href="/admin" class="btn btn-primary" style="width: 100%; text-decoration: none; display: flex; align-items: center; justify-content: center;">进入后台管理面板</a>
-				<button class="btn btn-secondary" onclick="submitLogout()" style="width: 100%; margin-top: 12px;">安全退出</button>
-			</div>
-		`;
-	} else {
-		actionCardHtml = `
-			<div class="section-card" id="login-form-card">
-				<div class="section-title">后台管理员登录</div>
-				<div class="form-group" style="margin-top: 15px;">
-					<label for="login-password">管理员密码</label>
-					<input type="password" id="login-password" placeholder="请输入管理员密码" onkeydown="if(event.key==='Enter')submitLogin()">
-				</div>
-				<button class="btn btn-primary" onclick="submitLogin()" style="width: 100%; margin-top: 10px;">登录</button>
-			</div>
-		`;
-	}
-
-	const html = `<!DOCTYPE html>
-<head>
-	<meta charset="UTF-8">
-	<meta name="robots" content="noindex, nofollow">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>Workers AI to API - Cloudflare Workers AI Proxy</title>
-	<link rel="preconnect" href="https://fonts.googleapis.com">
-	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
-	<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-	<style>
-		:root {
-			--bg-color: #0b0f19;
-			--card-bg: rgba(30, 41, 59, 0.45);
-			--border-color: rgba(255, 255, 255, 0.08);
-			--text-main: #f8fafc;
-			--text-muted: #94a3b8;
-			--primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
-			--accent-color: #a855f7;
-			--input-bg: rgba(15, 23, 42, 0.6);
-			--input-border: rgba(255, 255, 255, 0.1);
-			--input-text: #f8fafc;
-			--btn-secondary-bg: rgba(255, 255, 255, 0.06);
-			--btn-secondary-hover: rgba(255, 255, 255, 0.12);
-			--btn-secondary-text: #f8fafc;
-			--modal-overlay-bg: rgba(8, 10, 18, 0.6);
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-			--orb-1-color: rgba(99, 102, 241, 0.15);
-			--orb-2-color: rgba(236, 72, 153, 0.12);
-		}
-
-		:root[data-theme="light"] {
-			--bg-color: #f1f5f9;
-			--card-bg: rgba(255, 255, 255, 0.7);
-			--border-color: rgba(0, 0, 0, 0.06);
-			--text-main: #0f172a;
-			--text-muted: #64748b;
-			--primary-gradient: linear-gradient(135deg, #4f46e5 0%, #9333ea 50%, #db2777 100%);
-			--accent-color: #9333ea;
-			--input-bg: rgba(241, 245, 249, 0.8);
-			--input-border: rgba(0, 0, 0, 0.08);
-			--input-text: #0f172a;
-			--btn-secondary-bg: rgba(0, 0, 0, 0.04);
-			--btn-secondary-hover: rgba(0, 0, 0, 0.08);
-			--btn-secondary-text: #0f172a;
-			--modal-overlay-bg: rgba(241, 245, 249, 0.5);
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.07);
-			--orb-1-color: rgba(99, 102, 241, 0.08);
-			--orb-2-color: rgba(236, 72, 153, 0.06);
-		}
-
-		* {
-			box-sizing: border-box;
-			margin: 0;
-			padding: 0;
-		}
-
-		body {
-			font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-			background-color: var(--bg-color);
-			color: var(--text-main);
-			min-height: 100vh;
-			display: flex;
-			flex-direction: column;
-			justify-content: center;
-			align-items: center;
-			padding: 20px;
-			overflow-x: hidden;
-			position: relative;
-		}
-
-		h1, h2, h3 {
-			font-family: 'Outfit', sans-serif;
-		}
-
-		/* Utility Hidden Class */
-		.hidden {
-			display: none !important;
-		}
-
-		/* Dynamic Background Orbs */
-		.bg-orbs-container {
-			position: fixed;
-			top: 0;
-			left: 0;
-			width: 100%;
-			height: 100%;
-			z-index: -1;
-			overflow: hidden;
-			pointer-events: none;
-		}
-
-		.bg-orb {
-			position: absolute;
-			border-radius: 50%;
-			filter: blur(100px);
-			animation: float 25s infinite alternate ease-in-out;
-		}
-
-		.bg-orb-1 {
-			top: -10%;
-			left: -10%;
-			width: 50vw;
-			height: 50vw;
-			background: var(--orb-1-color);
-			animation-duration: 20s;
-		}
-
-		.bg-orb-2 {
-			bottom: -10%;
-			right: -10%;
-			width: 60vw;
-			height: 60vw;
-			background: var(--orb-2-color);
-			animation-duration: 30s;
-			animation-delay: -5s;
-		}
-
-		@keyframes float {
-			0% {
-				transform: translate(0, 0) scale(1);
-			}
-			50% {
-				transform: translate(5%, 10%) scale(1.1);
-			}
-			100% {
-				transform: translate(-5%, -5%) scale(0.9);
-			}
-		}
-
-		.action-btn-group {
-			position: fixed;
-			top: 20px;
-			right: 20px;
-			display: flex;
-			flex-direction: row;
-			gap: 12px;
-			z-index: 1000;
-		}
-
-		.floating-btn {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			color: var(--text-main);
-			width: 44px;
-			height: 44px;
-			border-radius: 12px;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			cursor: pointer;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-			z-index: 1000;
-			outline: none;
-		}
-		
-		.floating-btn:hover {
-			transform: translateY(-2px);
-			border-color: rgba(168, 85, 247, 0.4);
-			box-shadow: 0 8px 20px rgba(168, 85, 247, 0.15);
-		}
-
-		.dashboard-container {
-			max-width: 900px;
-			width: 100%;
-			display: flex;
-			flex-direction: column;
-			gap: 28px;
-			z-index: 10;
-		}
-
-		.dashboard-grid {
-			display: grid;
-			grid-template-columns: 1fr 2fr;
-			gap: 20px;
-			width: 100%;
-		}
-
-		.dashboard-grid.single-col {
-			grid-template-columns: 1fr;
-		}
-
-		.public-chart-wrapper {
-			position: relative;
-			height: 190px;
-			width: 100%;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			gap: 40px;
-			overflow: hidden;
-		}
-
-		.public-chart-wrapper canvas {
-			max-width: 100% !important;
-		}
-
-		@media (max-width: 768px) {
-			.dashboard-grid {
-				grid-template-columns: 1fr !important;
-			}
-			.public-chart-wrapper {
-				flex-direction: column !important;
-				height: auto !important;
-				padding: 10px 0;
-				gap: 20px !important;
-			}
-			.public-chart-wrapper > div:first-child {
-				width: 160px !important;
-				height: 160px !important;
-			}
-			.public-chart-wrapper > div:nth-child(2) {
-				width: 100% !important;
-				height: auto !important;
-				align-items: center !important;
-			}
-			#public-chart-legend {
-				width: 100%;
-				display: grid !important;
-				grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-				gap: 8px !important;
-				max-height: none !important;
-			}
-		}
-
-		@keyframes fadeInUp {
-			from {
-				opacity: 0;
-				transform: translateY(24px);
-			}
-			to {
-				opacity: 1;
-				transform: translateY(0);
-			}
-		}
-
-		.animate-fade-in-up {
-			opacity: 0;
-			animation: fadeInUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-		}
-
-		.delay-1 {
-			animation-delay: 0.15s;
-		}
-
-		.delay-2 {
-			animation-delay: 0.3s;
-		}
-
-		@keyframes spin {
-			to { transform: rotate(360deg); }
-		}
-
-		.spinner {
-			display: inline-block;
-			width: 16px;
-			height: 16px;
-			border: 2px solid rgba(168, 85, 247, 0.2);
-			border-radius: 50%;
-			border-top-color: var(--accent-color);
-			animation: spin 1s linear infinite;
-		}
-
-		#public-chart-legend {
-			scrollbar-width: none;
-			-ms-overflow-style: none;
-		}
-		#public-chart-legend::-webkit-scrollbar {
-			display: none;
-		}
-
-		.login-header {
-			display: flex;
-			flex-direction: row;
-			align-items: center;
-			justify-content: center;
-			gap: 16px;
-			margin-bottom: 8px;
-		}
-
-		.logo-icon {
-			width: 46px;
-			height: 46px;
-			border-radius: 12px;
-			background: var(--primary-gradient);
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			font-weight: bold;
-			color: white;
-			font-size: 22px;
-			font-family: 'Outfit', sans-serif;
-			box-shadow: 0 4px 14px rgba(168, 85, 247, 0.25);
-		}
-
-		.logo-text {
-			font-size: 24px;
-			font-weight: 700;
-			letter-spacing: -0.5px;
-			background: var(--primary-gradient);
-			-webkit-background-clip: text;
-			-webkit-text-fill-color: transparent;
-		}
-
-		.stat-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 18px;
-			padding: 26px;
-			display: flex;
-			flex-direction: column;
-			gap: 14px;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s, border-color 0.3s;
-			min-width: 0;
-			overflow: hidden;
-		}
-
-		.stat-card:hover {
-			transform: translateY(-4px);
-			border-color: rgba(168, 85, 247, 0.3);
-			box-shadow: 0 12px 30px rgba(168, 85, 247, 0.1);
-		}
-
-		.stat-title {
-			font-size: 14px;
-			color: var(--text-muted);
-			font-weight: 500;
-		}
-
-		.stat-value {
-			font-size: 36px;
-			font-weight: 700;
-			font-family: 'Outfit', sans-serif;
-		}
-
-		.progress-container {
-			width: 100%;
-			height: 8px;
-			background-color: rgba(255, 255, 255, 0.06);
-			border-radius: 4px;
-			overflow: hidden;
-			position: relative;
-		}
-
-		:root[data-theme="light"] .progress-container {
-			background-color: rgba(0, 0, 0, 0.05);
-		}
-
-		.progress-bar {
-			height: 100%;
-			background: var(--primary-gradient);
-			border-radius: 4px;
-			width: 0%;
-			transition: width 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
-			position: relative;
-			overflow: hidden;
-		}
-
-		.progress-bar::after {
-			content: '';
-			position: absolute;
-			top: 0;
-			left: 0;
-			right: 0;
-			bottom: 0;
-			background: linear-gradient(
-				90deg,
-				rgba(255, 255, 255, 0) 0%,
-				rgba(255, 255, 255, 0.2) 50%,
-				rgba(255, 255, 255, 0) 100%
-			);
-			animation: progress-shimmer 2s infinite linear;
-			background-size: 200% 100%;
-		}
-
-		@keyframes progress-shimmer {
-			0% { background-position: -200% 0; }
-			100% { background-position: 200% 0; }
-		}
-
-		.section-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 18px;
-			padding: 28px;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			display: flex;
-			flex-direction: column;
-			gap: 20px;
-		}
-
-		.section-title {
-			font-size: 18px;
-			font-weight: 600;
-			display: flex;
-			align-items: center;
-			gap: 8px;
-		}
-
-		.form-group {
-			display: flex;
-			flex-direction: column;
-			gap: 8px;
-		}
-
-		.form-group label {
-			font-size: 13px;
-			font-weight: 500;
-			color: var(--text-muted);
-		}
-
-		input {
-			background-color: var(--input-bg);
-			border: 1px solid var(--input-border);
-			color: var(--input-text);
-			padding: 12px 16px;
-			border-radius: 10px;
-			outline: none;
-			font-size: 14px;
-			transition: all 0.3s ease;
-			backdrop-filter: blur(10px);
-		}
-
-		input:focus {
-			border-color: var(--accent-color);
-			box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.2);
-			background-color: rgba(15, 23, 42, 0.8);
-		}
-
-		:root[data-theme="light"] input:focus {
-			background-color: rgba(255, 255, 255, 0.95);
-		}
-
-		.btn {
-			display: inline-flex;
-			align-items: center;
-			justify-content: center;
-			padding: 12px 20px;
-			border-radius: 10px;
-			font-weight: 600;
-			font-size: 14px;
-			cursor: pointer;
-			border: none;
-			transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-			text-decoration: none;
-		}
-
-		.btn-primary {
-			background: var(--primary-gradient);
-			color: white;
-			box-shadow: 0 4px 14px rgba(168, 85, 247, 0.3);
-		}
-
-		.btn-primary:hover {
-			transform: translateY(-2px);
-			box-shadow: 0 6px 20px rgba(168, 85, 247, 0.5);
-			opacity: 0.95;
-		}
-
-		.btn-primary:active {
-			transform: translateY(0);
-		}
-
-		.btn-secondary {
-			background-color: var(--btn-secondary-bg);
-			color: var(--btn-secondary-text);
-			border: 1px solid var(--border-color);
-		}
-
-		.btn-secondary:hover {
-			background-color: var(--btn-secondary-hover);
-			transform: translateY(-1px);
-		}
-
-		/* Modal Styling */
-		.modal-overlay {
-			position: fixed;
-			top: 0;
-			left: 0;
-			right: 0;
-			bottom: 0;
-			background-color: var(--modal-overlay-bg);
-			backdrop-filter: blur(0px);
-			-webkit-backdrop-filter: blur(0px);
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			z-index: 1000;
-			opacity: 0;
-			pointer-events: none;
-			transition: opacity 0.3s ease, backdrop-filter 0.3s ease, -webkit-backdrop-filter 0.3s ease;
-		}
-
-		.modal-overlay.active {
-			opacity: 1;
-			pointer-events: auto;
-			backdrop-filter: blur(8px);
-			-webkit-backdrop-filter: blur(8px);
-		}
-
-		.modal-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			width: 100%;
-			max-width: 400px;
-			padding: 32px;
-			box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
-			display: flex;
-			flex-direction: column;
-			gap: 20px;
-			transform: scale(0.9) translateY(20px);
-			transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.3s;
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-		}
-
-		.modal-overlay.active .modal-card {
-			transform: scale(1) translateY(0);
-		}
-
-		.modal-header {
-			display: flex;
-			justify-content: space-between;
-			align-items: center;
-			border-bottom: 1px solid var(--border-color);
-			padding-bottom: 16px;
-		}
-
-		.modal-header h3 {
-			font-size: 18px;
-			font-weight: 600;
-		}
-
-		.close-btn {
-			background: none;
-			border: none;
-			color: var(--text-muted);
-			cursor: pointer;
-			padding: 4px;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			outline: none;
-			transition: color 0.2s;
-		}
-
-		.close-btn:hover {
-			color: var(--text-main);
-		}
-
-		/* Toast Notification */
-		.toast-container {
-			position: fixed;
-			top: 24px;
-			right: 24px;
-			display: flex;
-			flex-direction: column;
-			gap: 10px;
-			z-index: 9999;
-			pointer-events: none;
-		}
-
-		.toast {
-			min-width: 260px;
-			padding: 14px 20px;
-			border-radius: 12px;
-			box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
-			font-size: 14px;
-			font-weight: 600;
-			display: flex;
-			align-items: center;
-			gap: 12px;
-			backdrop-filter: blur(15px);
-			-webkit-backdrop-filter: blur(15px);
-			transform: translateY(-20px);
-			opacity: 0;
-			transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-			pointer-events: auto;
-		}
-
-		.toast.show {
-			transform: translateY(0);
-			opacity: 1;
-		}
-
-		.toast-icon {
-			width: 20px;
-			height: 20px;
-			flex-shrink: 0;
-		}
-
-		.toast-success {
-			background-color: #10b981 !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-success .toast-icon, .toast-success span {
-			color: #ffffff !important;
-		}
-
-		.toast-error {
-			background-color: #ef4444 !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-error .toast-icon, .toast-error span {
-			color: #ffffff !important;
-		}
-		
-		.toast-warning {
-			background-color: #f59e0b !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-warning .toast-icon, .toast-warning span {
-			color: #ffffff !important;
-		}
-	</style>
-</head>
-<body>
-
-	<!-- Dynamic Background Orbs -->
-	<div class="bg-orbs-container">
-		<div class="bg-orb bg-orb-1"></div>
-		<div class="bg-orb bg-orb-2"></div>
-	</div>
-
-	<!-- Floating Action Buttons -->
-	<div class="action-btn-group">
-		<button class="floating-btn" onclick="toggleTheme()" title="切换日间/夜间模式">
-			<svg class="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width: 20px; height: 20px;">
-				<circle cx="12" cy="12" r="4" />
-				<path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
-			</svg>
-			<svg class="theme-icon-moon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 20px; height: 20px;">
-				<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
-			</svg>
-		</button>
-		<button class="floating-btn" onclick="openLoginModal()" title="${isLoggedIn ? '管理后台' : '管理员登录'}" style="background: var(--primary-gradient); color: white; border: none;">
-			${isLoggedIn ? `
-				<!-- User Check Icon -->
-				<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 20px; height: 20px;">
-					<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-					<circle cx="9" cy="7" r="4" />
-					<polyline points="16 11 18 13 22 9" />
-				</svg>
-			` : `
-				<!-- User Icon -->
-				<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 20px; height: 20px;">
-					<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
-					<circle cx="12" cy="7" r="4" />
-				</svg>
-			`}
-		</button>
-	</div>
-
-	<div class="dashboard-container">
-		<div class="login-header animate-fade-in-up" style="margin-bottom: 8px;">
-			<div class="logo-icon">AI</div>
-			<span class="logo-text">Workers AI to API</span>
-		</div>
-
-		<div class="dashboard-grid">
-			<!-- Public stats widget -->
-			<div class="stat-card animate-fade-in-up delay-1" style="justify-content: space-between;">
-				<div>
-					<div class="stat-title" style="margin-bottom: 10px;">今日用量汇总</div>
-					<div style="display: flex; align-items: baseline; gap: 4px;">
-						<div class="stat-value" id="public-neurons" style="font-size: 42px; background: var(--primary-gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; display: inline-block;">0</div>
-						<span style="font-size: 14px; color: var(--text-muted); font-weight: 500; font-family: 'Outfit', sans-serif;">Neurons</span>
-					</div>
-				</div>
-				
-				<div style="margin-top: 16px;">
-					<div class="progress-container">
-						<div class="progress-bar" id="public-progress" style="width: 0%;"></div>
-					</div>
-					<div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); margin-top: 8px;">
-						<span id="public-limit-desc">总限额: 0 Neurons</span>
-						<span id="public-percent-desc" style="font-weight: 600; color: var(--accent-color);">0.00%</span>
-					</div>
-				</div>
-			</div>
-			<!-- Public model chart widget -->
-			<div class="stat-card animate-fade-in-up delay-2" id="public-models-card" style="padding: 24px; display: flex; flex-direction: column; justify-content: center;">
-				<!-- Chart and custom legend container -->
-				<div class="public-chart-wrapper" id="public-chart-wrapper" style="display: none; height: 190px; width: 100%; flex-direction: row; align-items: center; justify-content: space-between; gap: 40px;">
-					<!-- Left column: Chart (takes full height of wrapper, i.e., 190px) -->
-					<div style="position: relative; height: 190px; width: 190px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">
-						<canvas id="publicModelsChart"></canvas>
-					</div>
-					<!-- Right column: Legend list -->
-					<div style="flex: 1; display: flex; flex-direction: column; justify-content: center; min-width: 0; align-self: stretch; height: 190px;">
-						<div id="public-chart-legend" style="flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; max-height: 180px; overflow-y: auto; padding-right: 4px;"></div>
-					</div>
-				</div>
-				
-				<!-- Loading / Empty Placeholder -->
-				<div id="public-chart-placeholder" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 190px; width: 100%; color: var(--text-muted); font-size: 13px; gap: 12px;">
-					<span class="spinner" style="width: 24px; height: 24px; border-width: 2.5px;"></span>
-					<span>正在载入数据...</span>
-				</div>
-			</div>
-		</div>
-	</div>
-
-	<!-- 弹窗：管理员登录 / 后台快捷入口 -->
-	<div class="modal-overlay" id="login-modal">
-		<div class="modal-card">
-			<div class="modal-header">
-				<h3 id="modal-title">${isLoggedIn ? '管理面板入口' : '管理员登录'}</h3>
-				<button onclick="closeLoginModal()" class="close-btn">
-					<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
-					</svg>
-				</button>
-			</div>
-			
-			${isLoggedIn ? `
-				<div style="text-align: center; display: flex; flex-direction: column; gap: 16px; margin-top: 10px;">
-					<div style="font-size: 40px; margin-bottom: 8px;">🎉</div>
-					<p style="font-size: 14px; color: var(--text-muted); line-height: 1.5;">您当前已登录管理员身份。</p>
-					<a href="/admin" class="btn btn-primary" style="width: 100%; text-decoration: none; display: flex; align-items: center; justify-content: center; height: 42px;">进入后台管理面板</a>
-					<button class="btn btn-secondary" onclick="submitLogout()" style="width: 100%; height: 42px;">安全退出</button>
-				</div>
-			` : `
-				<div class="form-group" style="margin-top: 10px;">
-					<label for="login-password">管理员密码</label>
-					<input type="password" id="login-password" placeholder="请输入管理员密码" onkeydown="if(event.key==='Enter')submitLogin()">
-				</div>
-				<div class="modal-footer" style="margin-top: 10px; display: flex; gap: 12px; justify-content: flex-end; width: 100%;">
-					<button class="btn btn-secondary" onclick="closeLoginModal()" style="height: 38px;">取消</button>
-					<button class="btn btn-primary" onclick="submitLogin()" style="height: 38px;">登录</button>
-				</div>
-			`}
-		</div>
-	</div>
-
-	<script>
-		// Toast Helper
-		function showToast(message, type = 'success') {
-			let container = document.querySelector('.toast-container');
-			if (!container) {
-				container = document.createElement('div');
-				container.className = 'toast-container';
-				document.body.appendChild(container);
-			}
-
-			const toast = document.createElement('div');
-			toast.className = \`toast toast-\${type}\`;
-			
-			let iconSvg = '';
-			if (type === 'success') {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
-			} else if (type === 'error') {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
-			} else {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>\`;
-			}
-
-			toast.innerHTML = \`\${iconSvg}<span>\${message}</span>\`;
-			container.appendChild(toast);
-
-			toast.offsetHeight; // trigger reflow
-			toast.classList.add('show');
-
-			setTimeout(() => {
-				toast.classList.remove('show');
-				setTimeout(() => toast.remove(), 400);
-			}, 3000);
-		}
-
-		function initTheme() {
-			const savedTheme = localStorage.getItem('theme');
-			if (savedTheme) {
-				document.documentElement.setAttribute('data-theme', savedTheme);
-			} else {
-				const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-				const defaultTheme = systemPrefersDark ? 'dark' : 'light';
-				document.documentElement.setAttribute('data-theme', defaultTheme);
-			}
-			updateThemeIcons();
-		}
-
-		let publicModelsChartInstance = null;
-		let lastPublicSummaryData = null;
-
-		function toggleTheme() {
-			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-			const newTheme = currentTheme === 'light' ? 'dark' : 'light';
-			document.documentElement.setAttribute('data-theme', newTheme);
-			localStorage.setItem('theme', newTheme);
-			updateThemeIcons();
-			if (lastPublicSummaryData) {
-				renderPublicSummary(lastPublicSummaryData);
-			}
-		}
-
-		function updateThemeIcons() {
-			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-			const sunIcons = document.querySelectorAll('.theme-icon-sun');
-			const moonIcons = document.querySelectorAll('.theme-icon-moon');
-			if (currentTheme === 'light') {
-				sunIcons.forEach(el => el.style.display = 'none');
-				moonIcons.forEach(el => el.style.display = 'block');
-			} else {
-				sunIcons.forEach(el => el.style.display = 'block');
-				moonIcons.forEach(el => el.style.display = 'none');
-			}
-		}
-
-		function openLoginModal() {
-			document.getElementById('login-modal').classList.add('active');
-			const pwdInput = document.getElementById('login-password');
-			if (pwdInput) {
-				pwdInput.value = '';
-				setTimeout(() => pwdInput.focus(), 100);
-			}
-		}
-
-		function closeLoginModal() {
-			document.getElementById('login-modal').classList.remove('active');
-		}
-
-		initTheme();
-
-		window.onload = function() {
-			loadPublicSummary();
-		};
-
-		async function loadPublicSummary() {
-			try {
-				const res = await fetch('/api/usage/summary');
-				const data = await res.json();
-				
-				renderPublicSummary(data);
-
-				// 如果后端认为需要更新，则继续发送 POST 请求触发静默更新并获取最新数据
-				if (data.needUpdate) {
-					const updateRes = await fetch('/api/usage/summary', { method: 'POST' });
-					if (updateRes.ok) {
-						const freshData = await updateRes.json();
-						renderPublicSummary(freshData);
-					}
-				}
-			} catch (e) {
-				console.error(e);
-			}
-		}
-
-		function animateNumber(id, end, duration = 1200) {
-			const obj = document.getElementById(id);
-			if (!obj) return;
-			let start = parseInt(obj.innerText.replace(/,/g, ''), 10);
-			if (isNaN(start) || start <= 0) {
-				start = end > 100 ? 100 : 0;
-			}
-			const range = end - start;
-			if (range === 0) {
-				obj.innerText = end.toLocaleString();
-				return;
-			}
-			const startTime = performance.now();
-			function update(currentTime) {
-				const elapsed = currentTime - startTime;
-				const progress = Math.min(elapsed / duration, 1);
-				const easeProgress = 1 - Math.pow(2, -10 * progress);
-				const current = Math.ceil(start + range * easeProgress);
-				obj.innerText = current.toLocaleString();
-				if (progress < 1) {
-					requestAnimationFrame(update);
-				} else {
-					obj.innerText = end.toLocaleString();
-				}
-			}
-			requestAnimationFrame(update);
-		}
-
-		function renderPublicSummary(data) {
-			lastPublicSummaryData = data;
-			const percent = Number(data.usagePercentage).toFixed(2);
-			const roundedNeurons = Math.ceil(data.totalNeuronsToday);
-			
-			// 触发数字滚动的动效
-			animateNumber('public-neurons', roundedNeurons, 1000);
-			
-			document.getElementById('public-progress').style.width = percent + '%';
-			document.getElementById('public-limit-desc').innerText = '总限额: ' + Number(data.totalLimit).toLocaleString() + ' Neurons';
-			document.getElementById('public-percent-desc').innerText = percent + '%';
-
-			const wrapper = document.getElementById('public-chart-wrapper');
-			const placeholder = document.getElementById('public-chart-placeholder');
-			const legendContainer = document.getElementById('public-chart-legend');
-
-			if (data.modelsToday && data.modelsToday.length > 0) {
-				if (wrapper) wrapper.style.display = 'flex';
-				if (placeholder) placeholder.style.display = 'none';
-
-				// 按 Neurons 消耗数从大到小排序
-				const sortedModelsToday = [...data.modelsToday].sort((a, b) => b.neurons - a.neurons);
-
-				const labels = sortedModelsToday.map(m => m.model.split('/').pop());
-				const chartData = sortedModelsToday.map(m => m.neurons);
-				
-				const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-				const textColor = isLight ? '#64748b' : '#94a3b8';
-				const borderColor = isLight ? '#ffffff' : '#1e293b';
-				
-				const ctx = document.getElementById('publicModelsChart').getContext('2d');
-				if (publicModelsChartInstance) {
-					publicModelsChartInstance.destroy();
-				}
-				
-				// 清空旧的 HTML Legend 标签
-				if (legendContainer) legendContainer.innerHTML = '';
-
-				publicModelsChartInstance = new Chart(ctx, {
-					type: 'doughnut',
-					data: {
-						labels: labels,
-						datasets: [{
-							data: chartData,
-							backgroundColor: ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'],
-							borderWidth: 2,
-							borderColor: borderColor
-						}]
-					},
-					options: {
-						responsive: true,
-						maintainAspectRatio: false,
-						cutout: '70%',
-						animation: {
-							animateRotate: true,
-							animateScale: true,
-							duration: 1000,
-							easing: 'easeOutQuart'
-						},
-						plugins: {
-							legend: {
-								display: false // 关闭原生图例，使用 HTML 图例
-							}
-						}
-					}
-				});
-
-				// 动态且逐个淡入渲染模型说明 ID
-				if (legendContainer) {
-					const colors = ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'];
-					const total = chartData.reduce((a, b) => a + b, 0);
-					
-					labels.forEach((label, index) => {
-						const val = chartData[index];
-						const color = colors[index % colors.length];
-						const pct = total > 0 ? ((val / total) * 100).toFixed(1) : '0.0';
-						
-						const item = document.createElement('div');
-						item.style.display = 'flex';
-						item.style.alignItems = 'center';
-						item.style.gap = '8px';
-						item.style.fontSize = '12px';
-						item.style.color = textColor;
-						item.style.opacity = '0';
-						item.style.transform = 'translateX(10px)';
-						item.style.transition = 'all 0.4s cubic-bezier(0.16, 1, 0.3, 1)';
-						
-						item.innerHTML = '<span style="width: 8px; height: 8px; border-radius: 50%; background-color: ' + color + '; flex-shrink: 0; margin-right: 2px;"></span>' +
-							'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + label + '">' + label + '</span>' +
-							'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + pct + '%</span>';
-						
-						legendContainer.appendChild(item);
-						
-						// 与环形图同时开始加载，依次淡入滑出
-						setTimeout(() => {
-							item.style.opacity = '1';
-							item.style.transform = 'translateX(0)';
-						}, index * 80);
-					});
-				}
-			} else {
-				if (wrapper) wrapper.style.display = 'none';
-				if (placeholder) {
-					placeholder.style.display = 'flex';
-					placeholder.innerHTML = '<svg style="width: 32px; height: 32px; opacity: 0.5;" fill="none" stroke="currentColor" viewBox="0 0 24 24">' +
-						'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"></path>' +
-						'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"></path>' +
-						'</svg><span>今日暂无消耗数据</span>';
-				}
-				if (publicModelsChartInstance) {
-					publicModelsChartInstance.destroy();
-					publicModelsChartInstance = null;
-				}
-			}
-		}
-
-		async function submitLogin() {
-			const password = document.getElementById('login-password').value;
-			const res = await fetch('/api/auth/login', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ password })
-			});
-			if (res.ok) {
-				showToast('登录成功！跳转中...');
-				setTimeout(() => {
-					window.location.href = '/admin';
-				}, 600);
-			} else {
-				const data = await res.json();
-				showToast('登录失败: ' + (data.error || '密码不正确！'), 'error');
-			}
-		}
-
-		async function submitLogout() {
-			const res = await fetch('/api/auth/logout', { method: 'POST' });
-			if (res.ok) {
-				showToast('安全退出成功');
-				setTimeout(() => {
-					window.location.reload();
-				}, 600);
-			}
-		}
-	</script>
-	<footer style="text-align: center; padding: 24px 0 20px; font-size: 12px; color: var(--text-muted); opacity: 0.6; z-index: 10;">
-		由 <a href="https://github.com/cmliussss2024/WorkersAI2API" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">WorkersAI2API</a> 强力驱动
-	</footer>
-</body>
-</html>`;
-
-	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
-	});
+function openAIDefault(requested, catalog) {
+  if (requested === "whisper-1") {
+    return catalog.models.find((model) => model.free && model.task === "automatic-speech-recognition" && model.id.endsWith("/whisper"));
+  }
+  if (requested === "tts-1" || requested === "tts-1-hd") {
+    return catalog.models.find((model) => model.free && model.task === "text-to-speech" && model.id.includes("melotts"));
+  }
+  if (requested === "dall-e-3" || requested === "dall-e-2") {
+    return catalog.models.find((model) => model.free && model.task === "text-to-image" && model.id.endsWith("/flux-1-schnell"));
+  }
+  return null;
 }
-
-// 2. 后台管理控制台页面
-function handleAdminPage(request, env, ctx) {
-	const html = `<!DOCTYPE html>
-<head>
-	<meta charset="UTF-8">
-	<meta name="robots" content="noindex, nofollow">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>Workers AI to API Dashboard</title>
-	<link rel="preconnect" href="https://fonts.googleapis.com">
-	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
-	<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-	<style>
-		:root {
-			--bg-color: #0b0f19;
-			--sidebar-bg: rgba(15, 23, 42, 0.6);
-			--card-bg: rgba(30, 41, 59, 0.45);
-			--border-color: rgba(255, 255, 255, 0.08);
-			--text-main: #f8fafc;
-			--text-muted: #94a3b8;
-			--primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 50%, #ec4899 100%);
-			--accent-color: #a855f7;
-			--success-color: #10b981;
-			--warning-color: #f59e0b;
-			--danger-color: #ef4444;
-			--sidebar-width: 260px;
-			--sidebar-menu-hover: rgba(255, 255, 255, 0.04);
-			--input-bg: rgba(15, 23, 42, 0.6);
-			--input-border: rgba(255, 255, 255, 0.1);
-			--input-text: #f8fafc;
-			--table-header-bg: rgba(0, 0, 0, 0.2);
-			--btn-secondary-bg: rgba(255, 255, 255, 0.06);
-			--btn-secondary-hover: rgba(255, 255, 255, 0.12);
-			--btn-secondary-text: #f8fafc;
-			--modal-overlay-bg: rgba(8, 10, 18, 0.6);
-			--section-item-bg: rgba(255, 255, 255, 0.02);
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-			--orb-1-color: rgba(99, 102, 241, 0.12);
-			--orb-2-color: rgba(236, 72, 153, 0.08);
-			
-			/* Theme aware code tag tokens */
-			--code-bg: rgba(0, 0, 0, 0.25);
-			--code-color: #e9d5ff;
-			--code-border: rgba(255, 255, 255, 0.04);
-		}
-
-		:root[data-theme="light"] {
-			--bg-color: #f1f5f9;
-			--sidebar-bg: rgba(255, 255, 255, 0.6);
-			--card-bg: rgba(255, 255, 255, 0.7);
-			--border-color: rgba(0, 0, 0, 0.06);
-			--text-main: #0f172a;
-			--text-muted: #64748b;
-			--primary-gradient: linear-gradient(135deg, #4f46e5 0%, #9333ea 50%, #db2777 100%);
-			--accent-color: #9333ea;
-			--success-color: #10b981;
-			--warning-color: #f59e0b;
-			--danger-color: #ef4444;
-			--sidebar-menu-hover: rgba(0, 0, 0, 0.04);
-			--input-bg: rgba(241, 245, 249, 0.8);
-			--input-border: rgba(0, 0, 0, 0.08);
-			--input-text: #0f172a;
-			--table-header-bg: rgba(0, 0, 0, 0.03);
-			--btn-secondary-bg: rgba(0, 0, 0, 0.04);
-			--btn-secondary-hover: rgba(0, 0, 0, 0.08);
-			--btn-secondary-text: #0f172a;
-			--modal-overlay-bg: rgba(241, 245, 249, 0.5);
-			--section-item-bg: rgba(0, 0, 0, 0.01);
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.07);
-			--orb-1-color: rgba(99, 102, 241, 0.06);
-			--orb-2-color: rgba(236, 72, 153, 0.04);
-			
-			/* Theme aware code tag tokens */
-			--code-bg: rgba(79, 70, 229, 0.07);
-			--code-color: #4f46e5;
-			--code-border: rgba(79, 70, 229, 0.15);
-		}
-
-		* {
-			box-sizing: border-box;
-			margin: 0;
-			padding: 0;
-		}
-
-		body {
-			font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-			background-color: var(--bg-color);
-			color: var(--text-main);
-			min-height: 100vh;
-			display: flex;
-			flex-direction: column;
-			overflow-x: hidden;
-			position: relative;
-		}
-
-		/* Utility Hidden Class */
-		.hidden {
-			display: none !important;
-		}
-
-		/* Tab Content Transition — Cyberpunk Terminal Reveal */
-		.tab-content {
-			display: none;
-			position: relative;
-		}
-		.tab-content.active {
-			display: block;
-			animation: cyberReveal 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
-		}
-		/* Scanline sweep overlay */
-		.tab-content.active::before {
-			content: '';
-			position: absolute;
-			top: 0;
-			left: 0;
-			right: 0;
-			height: 2px;
-			background: linear-gradient(90deg,
-				transparent 0%,
-				rgba(168, 85, 247, 0.1) 15%,
-				rgba(168, 85, 247, 0.65) 40%,
-				rgba(236, 72, 153, 0.85) 50%,
-				rgba(168, 85, 247, 0.65) 60%,
-				rgba(168, 85, 247, 0.1) 85%,
-				transparent 100%
-			);
-			z-index: 100;
-			pointer-events: none;
-			animation: scanlineDrop 0.45s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-			box-shadow:
-				0 0 15px rgba(168, 85, 247, 0.45),
-				0 0 40px rgba(99, 102, 241, 0.2);
-		}
-		@keyframes scanlineDrop {
-			0%   { top: 0; opacity: 0; }
-			8%   { opacity: 1; }
-			92%  { opacity: 1; }
-			100% { top: 100%; opacity: 0; }
-		}
-		@keyframes cyberReveal {
-			0% {
-				opacity: 0;
-				transform: translateY(10px) scale(0.97);
-				filter: brightness(2.5) blur(1px);
-			}
-			18% {
-				opacity: 0.35;
-				filter: brightness(1.5) blur(0.3px);
-			}
-			35% {
-				opacity: 0.7;
-				transform: translateY(3px) scale(0.99);
-				filter: brightness(1.15) blur(0);
-			}
-			60% {
-				opacity: 0.9;
-				transform: translateY(1px) scale(1);
-				filter: brightness(1.03);
-			}
-			100% {
-				opacity: 1;
-				transform: translateY(0) scale(1);
-				filter: brightness(1);
-			}
-		}
-
-		/* Nav item — flowing gradient border + neon glow */
-		.nav-item::after {
-			content: '';
-			position: absolute;
-			left: 0;
-			right: 0;
-			bottom: 0;
-			height: 2px;
-			background: linear-gradient(90deg,
-				#6366f1,
-				#a855f7 20%,
-				#ec4899 50%,
-				#a855f7 80%,
-				#6366f1
-			);
-			background-size: 200% 100%;
-			transform: scaleX(0);
-			transform-origin: center;
-			transition: transform 0.4s cubic-bezier(0.22, 1, 0.36, 1);
-		}
-		.nav-item.active::after {
-			transform: scaleX(1);
-			animation: borderFlow 3s linear infinite;
-		}
-		@keyframes borderFlow {
-			0%   { background-position: 200% 0; }
-			100% { background-position: 0% 0; }
-		}
-		:root[data-theme="light"] .nav-item::after {
-			background: linear-gradient(90deg,
-				#4f46e5,
-				#7c3aed 20%,
-				#db2777 50%,
-				#7c3aed 80%,
-				#4f46e5
-			);
-			background-size: 200% 100%;
-		}
-
-		/* Dynamic Background Orbs */
-		.bg-orbs-container {
-			position: fixed;
-			top: 0;
-			left: 0;
-			width: 100%;
-			height: 100%;
-			z-index: -1;
-			overflow: hidden;
-			pointer-events: none;
-		}
-
-		.bg-orb {
-			position: absolute;
-			border-radius: 50%;
-			filter: blur(100px);
-			animation: float 25s infinite alternate ease-in-out;
-		}
-
-		.bg-orb-1 {
-			top: -10%;
-			left: -10%;
-			width: 50vw;
-			height: 50vw;
-			background: var(--orb-1-color);
-			animation-duration: 20s;
-		}
-
-		.bg-orb-2 {
-			bottom: -10%;
-			right: -10%;
-			width: 60vw;
-			height: 60vw;
-			background: var(--orb-2-color);
-			animation-duration: 30s;
-			animation-delay: -5s;
-		}
-
-		@keyframes float {
-			0% { transform: translate(0, 0) scale(1); }
-			100% { transform: translate(5%, 5%) scale(1.05); }
-		}
-
-		/* Sidebar Layout */
-		.app-container {
-			display: flex;
-			min-height: 100vh;
-			position: relative;
-		}
-
-		aside {
-			width: var(--sidebar-width);
-			background-color: var(--sidebar-bg);
-			border-right: 1px solid var(--border-color);
-			display: flex;
-			flex-direction: column;
-			padding: 30px 20px;
-			position: fixed;
-			top: 0;
-			bottom: 0;
-			left: 0;
-			z-index: 100;
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-		}
-
-		.logo-area {
-			display: flex;
-			align-items: center;
-			gap: 12px;
-			margin-bottom: 40px;
-			padding-left: 8px;
-		}
-
-		.logo-icon {
-			width: 38px;
-			height: 38px;
-			border-radius: 10px;
-			background: var(--primary-gradient);
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			font-weight: bold;
-			color: white;
-			font-size: 18px;
-			font-family: 'Outfit', sans-serif;
-			box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
-		}
-
-		.logo-text {
-			font-size: 18px;
-			font-weight: 700;
-			font-family: 'Outfit', sans-serif;
-			letter-spacing: -0.5px;
-			background: var(--primary-gradient);
-			-webkit-background-clip: text;
-			-webkit-text-fill-color: transparent;
-		}
-
-		.nav-menu {
-			display: flex;
-			flex-direction: column;
-			gap: 8px;
-			flex: 1;
-		}
-
-		.nav-item {
-			display: flex;
-			align-items: center;
-			gap: 12px;
-			padding: 12px 16px;
-			border-radius: 10px;
-			cursor: pointer;
-			font-size: 14px;
-			font-weight: 500;
-			color: var(--text-muted);
-			transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-			position: relative;
-			overflow: hidden;
-		}
-
-		.nav-item:hover {
-			color: var(--text-main);
-			background-color: var(--sidebar-menu-hover);
-			transform: translateX(4px);
-		}
-
-		.nav-item.active {
-			color: white;
-			background: var(--primary-gradient);
-			box-shadow:
-				0 0 18px rgba(168, 85, 247, 0.35),
-				0 0 40px rgba(99, 102, 241, 0.15),
-				inset 0 1px 0 rgba(255, 255, 255, 0.1);
-		}
-
-		.aside-footer {
-			display: flex;
-			flex-direction: column;
-			gap: 12px;
-			border-top: 1px solid var(--border-color);
-			padding-top: 20px;
-		}
-
-		/* Main Content Area */
-		main {
-			flex: 1;
-			margin-left: var(--sidebar-width);
-			padding: 40px;
-			min-width: 0;
-			z-index: 10;
-		}
-
-		header {
-			display: flex;
-			justify-content: space-between;
-			align-items: center;
-			margin-bottom: 30px;
-		}
-
-		/* Card Grid & Stats */
-		.card-grid {
-			display: grid;
-			grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-			gap: 20px;
-		}
-
-		.stat-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 18px;
-			padding: 26px;
-			display: flex;
-			flex-direction: column;
-			gap: 14px;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s, border-color 0.3s;
-		}
-
-		.stat-card:hover {
-			transform: translateY(-4px);
-			border-color: rgba(168, 85, 247, 0.3);
-			box-shadow: 0 12px 30px rgba(168, 85, 247, 0.1);
-		}
-
-		.stat-title {
-			font-size: 14px;
-			color: var(--text-muted);
-			font-weight: 500;
-		}
-
-		.stat-value {
-			font-size: 32px;
-			font-weight: 700;
-			font-family: 'Outfit', sans-serif;
-		}
-
-		.stat-desc {
-			font-size: 12px;
-			color: var(--text-muted);
-		}
-
-		.progress-container {
-			width: 100%;
-			height: 6px;
-			background-color: rgba(255, 255, 255, 0.06);
-			border-radius: 3px;
-			overflow: hidden;
-		}
-
-		:root[data-theme="light"] .progress-container {
-			background-color: rgba(0, 0, 0, 0.05);
-		}
-
-		.progress-bar {
-			height: 100%;
-			background: var(--primary-gradient);
-			width: 0%;
-			transition: width 1.2s cubic-bezier(0.34, 1.56, 0.64, 1);
-		}
-
-		/* Section Cards */
-		.section-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 18px;
-			padding: 30px;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			margin-bottom: 24px;
-		}
-
-		.section-note {
-			margin-top: 6px;
-			font-size: 13px;
-			color: var(--text-muted);
-			line-height: 1.5;
-		}
-
-		.access-endpoint-grid {
-			display: grid;
-			grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-			gap: 14px;
-		}
-
-		.access-endpoint-card {
-			appearance: none;
-			width: 100%;
-			text-align: left;
-			border: 1px solid var(--border-color);
-			border-radius: 16px;
-			padding: 18px 20px;
-			background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.015));
-			box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
-			backdrop-filter: blur(14px);
-			-webkit-backdrop-filter: blur(14px);
-			transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.25s, box-shadow 0.25s, background 0.25s;
-			cursor: default;
-			color: inherit;
-		}
-
-		.access-endpoint-card:hover {
-			transform: translateY(-2px);
-			border-color: rgba(168, 85, 247, 0.28);
-			box-shadow: 0 12px 30px rgba(168, 85, 247, 0.08);
-		}
-
-		.endpoint-badge {
-			display: inline-flex;
-			align-items: center;
-			padding: 4px 10px;
-			border-radius: 999px;
-			background: rgba(168, 85, 247, 0.12);
-			color: var(--accent-color);
-			font-size: 12px;
-			font-weight: 600;
-			letter-spacing: 0.01em;
-		}
-
-		.endpoint-url {
-			display: block;
-			margin-top: 12px;
-			font-size: 14px;
-			line-height: 1.55;
-			word-break: break-all;
-			color: var(--text-main);
-			text-decoration: underline;
-			text-decoration-color: rgba(168, 85, 247, 0.5);
-			text-underline-offset: 3px;
-			cursor: pointer;
-			background: transparent;
-			border: none;
-			padding: 0;
-		}
-
-		.endpoint-url:hover {
-			color: var(--accent-color);
-		}
-
-		.endpoint-hint {
-			margin-top: 10px;
-			font-size: 12px;
-			color: var(--text-muted);
-		}
-
-		.section-header {
-			display: flex;
-			justify-content: space-between;
-			align-items: center;
-			margin-bottom: 20px;
-		}
-
-		.section-title {
-			font-size: 18px;
-			font-weight: 600;
-			font-family: 'Outfit', sans-serif;
-			display: flex;
-			align-items: center;
-			gap: 8px;
-		}
-
-		/* Forms & Inputs */
-		.form-group {
-			display: flex;
-			flex-direction: column;
-			gap: 8px;
-			margin-bottom: 16px;
-		}
-
-		.form-group label {
-			font-size: 13px;
-			font-weight: 500;
-			color: var(--text-muted);
-		}
-
-		input {
-			background-color: var(--input-bg);
-			border: 1px solid var(--input-border);
-			color: var(--input-text);
-			padding: 12px 16px;
-			border-radius: 10px;
-			outline: none;
-			font-size: 14px;
-			transition: all 0.3s ease;
-			backdrop-filter: blur(10px);
-		}
-
-		input:focus {
-			border-color: var(--accent-color);
-			box-shadow: 0 0 0 3px rgba(168, 85, 247, 0.2);
-			background-color: rgba(15, 23, 42, 0.8);
-		}
-
-		:root[data-theme="light"] input:focus {
-			background-color: rgba(255, 255, 255, 0.95);
-		}
-
-		/* Buttons */
-		.btn {
-			display: inline-flex;
-			align-items: center;
-			justify-content: center;
-			padding: 10px 18px;
-			border-radius: 10px;
-			font-weight: 600;
-			font-size: 14px;
-			cursor: pointer;
-			border: none;
-			transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-			gap: 8px;
-		}
-
-		.btn-primary {
-			background: var(--primary-gradient);
-			color: white;
-			box-shadow: 0 4px 14px rgba(168, 85, 247, 0.3);
-		}
-
-		.btn-primary:hover {
-			transform: translateY(-2px);
-			box-shadow: 0 6px 20px rgba(168, 85, 247, 0.5);
-			opacity: 0.95;
-		}
-
-		.btn-secondary {
-			background-color: var(--btn-secondary-bg);
-			color: var(--btn-secondary-text);
-			border: 1px solid var(--border-color);
-		}
-
-		.btn-secondary:hover {
-			background-color: var(--btn-secondary-hover);
-			transform: translateY(-1px);
-		}
-
-		.btn-success {
-			background-color: var(--success-color);
-			color: white;
-			box-shadow: 0 4px 14px rgba(16, 185, 129, 0.3);
-		}
-
-		.btn-success:hover {
-			background-color: #059669;
-			transform: translateY(-2px);
-			box-shadow: 0 6px 20px rgba(16, 185, 129, 0.5);
-			opacity: 0.95;
-		}
-
-		.btn:disabled {
-			opacity: 0.6;
-			cursor: not-allowed;
-			transform: none !important;
-			box-shadow: none !important;
-		}
-
-		@keyframes spinner-border {
-			to { transform: rotate(360deg); }
-		}
-
-		.spinner {
-			display: inline-block;
-			width: 12px;
-			height: 12px;
-			vertical-align: text-bottom;
-			border: 2px solid currentColor;
-			border-right-color: transparent;
-			border-radius: 50%;
-			animation: spinner-border .75s linear infinite;
-		}
-
-		@keyframes flash-green {
-			0% {
-				border-color: rgba(16, 185, 129, 0.8);
-				box-shadow: 0 0 20px rgba(16, 185, 129, 0.35);
-			}
-			100% {
-				border-color: var(--border-color);
-				box-shadow: var(--card-shadow);
-			}
-		}
-
-		.card-update-flash {
-			animation: flash-green 2s cubic-bezier(0.25, 1, 0.5, 1);
-		}
-
-		/* Tables */
-		table {
-			width: 100%;
-			border-collapse: collapse;
-			text-align: left;
-			font-size: 14px;
-		}
-
-		th {
-			background-color: var(--table-header-bg);
-			font-weight: 600;
-			color: var(--text-muted);
-			padding: 16px 20px;
-			border-bottom: 1px solid var(--border-color);
-		}
-
-		td {
-			padding: 16px 20px;
-			border-bottom: 1px solid var(--border-color);
-			color: var(--text-main);
-		}
-
-		tr:hover td {
-			background-color: rgba(255, 255, 255, 0.01);
-		}
-
-		code {
-			font-family: monospace;
-			background-color: var(--code-bg);
-			padding: 4px 8px;
-			border-radius: 6px;
-			font-size: 13px;
-			color: var(--code-color);
-			border: 1px solid var(--code-border);
-			transition: all 0.2s ease;
-		}
-
-		/* Badges */
-		.badge {
-			display: inline-flex;
-			padding: 4px 8px;
-			border-radius: 6px;
-			font-size: 11px;
-			font-weight: 600;
-			white-space: nowrap;
-		}
-
-		.badge-success { background-color: rgba(16, 185, 129, 0.15); color: #10b981; }
-		.badge-warning { background-color: rgba(245, 158, 11, 0.15); color: #f59e0b; }
-		.badge-danger { background-color: rgba(239, 68, 68, 0.15); color: #ef4444; }
-		.badge-info { background-color: rgba(59, 130, 246, 0.15); color: #3b82f6; }
-
-		/* Charts */
-		.charts-grid {
-			display: grid;
-			grid-template-columns: 1.5fr 1fr;
-			gap: 20px;
-		}
-
-		.chart-container {
-			position: relative;
-			height: 300px;
-			width: 100%;
-		}
-
-		@media (max-width: 900px) {
-			.charts-grid {
-				grid-template-columns: 1fr;
-			}
-		}
-
-		/* Modals */
-		.modal-overlay {
-			position: fixed;
-			top: 0;
-			left: 0;
-			right: 0;
-			bottom: 0;
-			background-color: var(--modal-overlay-bg);
-			backdrop-filter: blur(0px);
-			-webkit-backdrop-filter: blur(0px);
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			z-index: 1000;
-			opacity: 0;
-			pointer-events: none;
-			transition: opacity 0.3s ease, backdrop-filter 0.3s ease, -webkit-backdrop-filter 0.3s ease;
-		}
-
-		.modal-overlay.active {
-			opacity: 1;
-			pointer-events: auto;
-			backdrop-filter: blur(8px);
-			-webkit-backdrop-filter: blur(8px);
-		}
-
-		.modal-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			width: 100%;
-			max-width: 500px;
-			padding: 32px;
-			box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
-			display: flex;
-			flex-direction: column;
-			gap: 20px;
-			transform: scale(0.9) translateY(20px);
-			transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.3s;
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-		}
-
-		.modal-overlay.active .modal-card {
-			transform: scale(1) translateY(0);
-		}
-
-		.modal-header {
-			display: flex;
-			justify-content: space-between;
-			align-items: center;
-			border-bottom: 1px solid var(--border-color);
-			padding-bottom: 16px;
-		}
-
-		.modal-header h3 {
-			font-size: 18px;
-			font-weight: 600;
-		}
-
-		.modal-footer {
-			display: flex;
-			justify-content: flex-end;
-			gap: 12px;
-			border-top: 1px solid var(--border-color);
-			padding-top: 20px;
-			margin-top: 10px;
-		}
-
-		/* Toast Notification (Green for success, Red for error, Orange for warning) */
-		.toast-container {
-			position: fixed;
-			top: 24px;
-			right: 24px;
-			display: flex;
-			flex-direction: column;
-			gap: 10px;
-			z-index: 9999;
-			pointer-events: none;
-		}
-
-		.toast {
-			min-width: 260px;
-			padding: 14px 20px;
-			border-radius: 12px;
-			box-shadow: var(--card-shadow);
-			font-size: 14px;
-			font-weight: 600;
-			display: flex;
-			align-items: center;
-			gap: 12px;
-			backdrop-filter: blur(15px);
-			-webkit-backdrop-filter: blur(15px);
-			transform: translateY(-20px);
-			opacity: 0;
-			transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-			pointer-events: auto;
-		}
-
-		.toast.show {
-			transform: translateY(0);
-			opacity: 1;
-		}
-
-		.toast-icon {
-			width: 20px;
-			height: 20px;
-			flex-shrink: 0;
-		}
-
-		.toast-success {
-			background-color: #10b981 !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-success .toast-icon, .toast-success span {
-			color: #ffffff !important;
-		}
-
-		.toast-error {
-			background-color: #ef4444 !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-error .toast-icon, .toast-error span {
-			color: #ffffff !important;
-		}
-		
-		.toast-warning {
-			background-color: #f59e0b !important;
-			color: #ffffff !important;
-			border: none !important;
-		}
-		.toast-warning .toast-icon, .toast-warning span {
-			color: #ffffff !important;
-		}
-
-		/* Mobile Responsiveness */
-		.mobile-header {
-			display: none !important;
-		}
-
-		@media (max-width: 768px) {
-			aside {
-				transform: translateX(-100%);
-			}
-			aside.active {
-				transform: translateX(0);
-			}
-			main {
-				margin-left: 0;
-				padding: 20px;
-			}
-			.mobile-header {
-				display: flex !important;
-			}
-			.mobile-nav-toggle {
-				background: none;
-				border: none;
-				color: var(--text-main);
-				display: flex;
-				align-items: center;
-				gap: 6px;
-				cursor: pointer;
-				font-size: 14px;
-				font-weight: 500;
-			}
-		}
-
-		.public-chart-wrapper {
-			position: relative;
-			height: 190px;
-			width: 100%;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			gap: 40px;
-			overflow: hidden;
-		}
-
-		.public-chart-wrapper canvas {
-			max-width: 100% !important;
-		}
-
-		#admin-chart-legend {
-			scrollbar-width: none;
-			-ms-overflow-style: none;
-		}
-		#admin-chart-legend::-webkit-scrollbar {
-			display: none;
-		}
-
-		@media (max-width: 768px) {
-			.public-chart-wrapper {
-				flex-direction: column !important;
-				height: auto !important;
-				padding: 10px 0;
-				gap: 20px !important;
-			}
-			.public-chart-wrapper > div:first-child {
-				width: 160px !important;
-				height: 160px !important;
-			}
-			.public-chart-wrapper > div:nth-child(2) {
-				width: 100% !important;
-				height: auto !important;
-				align-items: center !important;
-			}
-			#admin-chart-legend {
-				width: 100%;
-				display: grid !important;
-				grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-				gap: 8px !important;
-				max-height: none !important;
-			}
-		}
-	</style>
-</head>
-<body>
-	<!-- Dynamic Background Orbs -->
-	<div class="bg-orbs-container">
-		<div class="bg-orb bg-orb-1"></div>
-		<div class="bg-orb bg-orb-2"></div>
-	</div>
-
-	<!-- App Header for Mobile Toggle -->
-	<div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; background-color: var(--sidebar-bg); border-bottom: 1px solid var(--border-color); z-index: 90;" class="mobile-header">
-		<div class="logo-area" style="margin-bottom: 0;">
-			<div class="logo-icon">AI</div>
-			<span class="logo-text">Workers AI to API</span>
-		</div>
-		<div style="display: flex; align-items: center; gap: 12px;">
-			<button class="mobile-nav-toggle" onclick="toggleSidebar()">
-				<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
-				<span>菜单</span>
-			</button>
-		</div>
-	</div>
-
-	<div class="app-container">
-		<!-- Sidebar -->
-		<aside id="sidebar">
-			<div class="logo-area">
-				<div class="logo-icon">AI</div>
-				<span class="logo-text">Workers AI to API</span>
-			</div>
-			
-			<div class="nav-menu">
-				<div class="nav-item active" id="menu-overview" onclick="switchTab('overview')">
-					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
-					数据看板
-				</div>
-				<div class="nav-item" id="menu-accounts" onclick="switchTab('accounts')">
-					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-					账号管理
-				</div>
-				<div class="nav-item" id="menu-keys" onclick="switchTab('keys')">
-					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path></svg>
-					API 密钥
-				</div>
-				<div class="nav-item" id="menu-settings" onclick="switchTab('settings')">
-					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-					模型映射
-				</div>
-			</div>
-
-			<div class="aside-footer">
-				<button class="btn btn-secondary" onclick="toggleTheme()" title="切换日间/夜间模式" style="width: 100%; display: flex; justify-content: center; gap: 8px; align-items: center;">
-					<svg class="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width: 18px; height: 18px;">
-						<circle cx="12" cy="12" r="4" />
-						<path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
-					</svg>
-					<svg class="theme-icon-moon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 18px; height: 18px;">
-						<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
-					</svg>
-					<span>切换主题</span>
-				</button>
-				<button class="btn btn-secondary" onclick="logout()">退出登录</button>
-				<div style="text-align: center; font-size: 11px; color: var(--text-muted); opacity: 0.55; padding-top: 4px;">
-					由 <a href="https://github.com/cmliussss2024/WorkersAI2API" target="_blank" rel="noopener" style="color: inherit; text-decoration: underline; text-underline-offset: 2px;">WorkersAI2API</a> 强力驱动
-				</div>
-			</div>
-		</aside>
-
-		<!-- Main Workspace -->
-		<main>
-			<div id="auth-views" style="display: flex; flex-direction: column; gap: 30px; width: 100%;">
-				
-				<!-- Header -->
-				<header>
-					<div>
-						<h1 style="font-size: 26px; font-weight: 700;" id="view-title">数据看板</h1>
-						<p style="color: var(--text-muted); font-size: 14px; margin-top: 4px;">实时监控 Cloudflare AI 账号及接口 status</p>
-					</div>
-					<div class="user-profile">
-						<span class="badge badge-success">系统正常运行</span>
-					</div>
-				</header>
-
-				<!-- TAB: Overview -->
-				<div id="tab-overview" class="tab-content active">
-					<div class="card-grid">
-						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
-								<div class="stat-title">今日总消耗量</div>
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-									<path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
-								</svg>
-							</div>
-							<div class="stat-value" id="stat-total-neurons">0</div>
-							<div class="progress-container">
-								<div class="progress-bar" id="stat-neurons-progress" style="width: 0%;"></div>
-							</div>
-							<div class="stat-desc" id="stat-neurons-desc">0 / 0 Neurons (0.00%)</div>
-						</div>
-						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
-								<div class="stat-title">已绑定账号</div>
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-									<path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-								</svg>
-							</div>
-							<div class="stat-value" id="stat-accounts-count">0</div>
-							<div class="stat-desc">活跃中的 Cloudflare 账号数</div>
-						</div>
-						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
-								<div class="stat-title">代理 API 密钥</div>
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-									<path stroke-linecap="round" stroke-linejoin="round" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
-								</svg>
-							</div>
-							<div class="stat-value" id="stat-keys-count">0</div>
-							<div class="stat-desc">已配额调用 Key数</div>
-						</div>
-						<div class="stat-card">
-							<div style="display: flex; justify-content: space-between; align-items: flex-start;">
-								<div class="stat-title">节省成本 (估算)</div>
-								<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="width: 22px; height: 22px; color: var(--accent-color); opacity: 0.85;">
-									<path stroke-linecap="round" stroke-linejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-								</svg>
-							</div>
-							<div class="stat-value" id="stat-cost-saving">$0.00</div>
-							<div class="stat-desc">对比 OpenAI completions 同等额度价格</div>
-						</div>
-					</div>
-
-					<!-- Charts -->
-					<div class="charts-grid" style="margin-top: 24px;">
-						<div class="section-card">
-							<div class="section-title">过去 7 日消耗走势 (Neurons)</div>
-							<div class="chart-container">
-								<canvas id="historyChart"></canvas>
-							</div>
-						</div>
-						<div class="section-card">
-							<div class="section-title">今日模型消耗占比</div>
-							<div class="chart-container public-chart-wrapper" id="admin-chart-wrapper" style="display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 30px; height: 300px; padding: 10px 0;">
-								<!-- Left: Chart -->
-								<div id="admin-canvas-wrapper" style="position: relative; height: 220px; width: 220px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">
-									<canvas id="modelsChart"></canvas>
-								</div>
-								<!-- Right: Legend -->
-								<div id="admin-legend-wrapper" style="flex: 1; display: flex; flex-direction: column; justify-content: center; min-width: 0; align-self: stretch; height: 100%;">
-									<div id="admin-chart-legend" style="flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; max-height: 260px; overflow-y: auto; padding-right: 4px;"></div>
-								</div>
-								<!-- Empty Placeholder -->
-								<div id="admin-chart-placeholder" style="display: none; flex-direction: column; align-items: center; justify-content: center; height: 100%; width: 100%; color: var(--text-muted); font-size: 13px; gap: 12px; margin: auto;">
-									<svg style="width: 32px; height: 32px; opacity: 0.5;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"></path>
-										<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"></path>
-									</svg>
-									<span>今日暂无消耗数据</span>
-								</div>
-							</div>
-						</div>
-					</div>
-
-					<!-- Detailed Accounts Usage Grid -->
-					<div class="section-card" style="margin-top: 24px;">
-						<div class="section-header">
-							<div class="section-title">账号用量明细</div>
-							<div style="display: flex; align-items: center; gap: 12px;">
-								<span id="txt-last-updated" style="font-size: 12px; color: var(--text-muted); font-family: monospace;"></span>
-								<button class="btn btn-secondary" id="btn-refresh-usage" onclick="loadUsageDetails(true)">刷新用量</button>
-							</div>
-						</div>
-						<div id="accounts-usage-list" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px;">
-							<!-- Individual account progress item -->
-						</div>
-					</div>
-				</div>
-
-				<!-- TAB: Accounts -->
-				<div id="tab-accounts" class="tab-content">
-					<div class="section-card">
-						<div class="section-header">
-							<div class="section-title">账号配置</div>
-							<button class="btn btn-primary" onclick="openAddAccountModal()">
-								<svg style="width: 16px; height: 16px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
-								添加账号
-							</button>
-						</div>
-
-						<table>
-							<thead>
-								<tr>
-									<th>别名</th>
-									<th>Account ID</th>
-									<th>API Token</th>
-									<th>操作</th>
-								</tr>
-							</thead>
-							<tbody id="accounts-table-body">
-								<!-- Accounts rows -->
-							</tbody>
-						</table>
-					</div>
-				</div>
-
-				<!-- TAB: API Keys -->
-				<div id="tab-keys" class="tab-content">
-					<!-- Proxy URL Info -->
-					<div class="section-card" style="margin-bottom: 24px;">
-						<div class="section-title">接入信息</div>
-						<div class="section-note">OpenAI SDK 和 Anthropic Messages 都可直接接入，点击 URL 即可复制。</div>
-						<div class="access-endpoint-grid" style="margin-top: 18px;">
-							<div class="access-endpoint-card">
-								<div class="endpoint-badge">OpenAI 兼容格式</div>
-								<button type="button" class="endpoint-url" id="openai-endpoint-url" data-endpoint-url="" onclick="copyEndpointUrl(this.dataset.endpointUrl)">https://domain/v1/chat/completions</button>
-							</div>
-							<div class="access-endpoint-card">
-								<div class="endpoint-badge">Anthropic 兼容格式</div>
-								<button type="button" class="endpoint-url" id="anthropic-endpoint-url" data-endpoint-url="" onclick="copyEndpointUrl(this.dataset.endpointUrl)">https://domain/v1/messages</button>
-							</div>
-						</div>
-					</div>
-
-					<div class="section-card">
-						<div class="section-header">
-							<div class="section-title">API 密钥管理</div>
-							<button class="btn btn-primary" onclick="openAddKeyModal()">
-								<svg style="width: 16px; height: 16px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
-								生成新密钥
-							</button>
-						</div>
-						
-						<div style="background-color: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.2); padding: 16px; border-radius: 12px; font-size: 13px; color: var(--warning-color); line-height: 1.5; margin-bottom: 10px;" id="no-key-warning" class="hidden">
-							<strong>提示：</strong> 目前未配置任何 API 密钥。反代 API (/v1/...) 处于公开可被任何人调用的状态。建议点击“生成新密钥”为您的接口加上调用凭证鉴权。
-						</div>
-
-						<table>
-							<thead>
-								<tr>
-									<th>密钥描述</th>
-									<th>API Key</th>
-									<th>创建时间</th>
-									<th>操作</th>
-								</tr>
-							</thead>
-							<tbody id="keys-table-body">
-								<!-- Keys rows -->
-							</tbody>
-						</table>
-					</div>
-				</div>
-
-				<!-- TAB: Settings (Model Mapping) -->
-				<div id="tab-settings" class="tab-content">
-					<div class="section-card">
-						<div class="section-title">模型映射 (Model Mappings)</div>
-						<p style="font-size: 13px; color: var(--text-muted); margin-top: 8px; margin-bottom: 20px; line-height: 1.6;">您可以设置请求中的模型名字（例如 gpt-3.5-turbo）应该被反向代理路由去哪一个具体的 Cloudflare AI 对应模型。若请求的模型以 @cf/ 开头，则默认透传不会经过映射。</p>
-						
-						<div style="display: grid; grid-template-columns: 1fr 1.5fr auto; gap: 15px; background-color: var(--section-item-bg); padding: 20px; border-radius: 12px; border: 1px solid var(--border-color); margin-top: 10px;">
-							<div class="form-group" style="margin-bottom: 0;">
-								<label>请求模型名称 (OpenAI ID/别名)</label>
-								<input type="text" id="map-source" placeholder="如: gpt-3.5-turbo">
-							</div>
-							<div class="form-group" style="margin-bottom: 0;">
-								<label>CF 目标模型路径 (Cloudflare Model Path)</label>
-								<input type="text" id="map-target" placeholder="如: @cf/meta/llama-3.1-8b-instruct">
-							</div>
-							<div style="display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;">
-								<button class="btn btn-primary" onclick="addMapping()" style="height: 45px;">添加/修改</button>
-								<button class="btn btn-secondary" onclick="restorePresetMappings()" style="height: 45px;">预设映射</button>
-							</div>
-						</div>
-
-						<table style="margin-top: 20px;">
-							<thead>
-								<tr>
-									<th>客户端请求模型</th>
-									<th>映射后 Cloudflare 目标模型</th>
-									<th>类型</th>
-									<th style="width: 100px;">操作</th>
-								</tr>
-							</thead>
-							<tbody id="mappings-table-body">
-								<!-- Mapping rows -->
-							</tbody>
-						</table>
-					</div>
-				</div>
-
-			</div>
-		</main>
-	</div>
-
-	<!-- Modal: Add Cloudflare Account -->
-	<div class="modal-overlay" id="account-modal">
-		<div class="modal-card">
-			<div class="modal-header">
-				<h3 id="account-modal-title">添加 Cloudflare 账号</h3>
-				<button onclick="closeAccountModal()" style="background: none; border: none; color: var(--text-muted); cursor: pointer;">
-					<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-				</button>
-			</div>
-			<input type="hidden" id="account-id-edit">
-			<div class="form-group">
-				<label for="account-name">账号别名 (如: 主账号 A)</label>
-				<input type="text" id="account-name" placeholder="请输入备注名">
-			</div>
-			<div class="form-group">
-				<label for="account-id">Account ID</label>
-				<input type="text" id="account-id" placeholder="获取于 CF 控制台 Workers AI 页面" oninput="onAccountInfoChange()">
-			</div>
-			<div class="form-group">
-				<label for="account-token">API Token (需要创建并赋予以下 3 个权限):</label>
-				<div style="font-size: 12px; color: var(--text-muted); background: rgba(0,0,0,0.15); padding: 8px 12px; border-radius: 6px; margin-top: 4px; margin-bottom: 4px; line-height: 1.5; font-family: monospace;">
-					• Workers AI &gt; Read <span id="perm-wa-read" style="margin-left: 8px;"></span><br>
-					• Workers AI &gt; Edit <span id="perm-wa-edit" style="margin-left: 8px;"></span><br>
-					• Account Analytics &gt; Read <span id="perm-aa-read" style="margin-left: 8px;"></span>
-				</div>
-				<input type="text" id="account-token" placeholder="CF 账号 API Token (会安全遮蔽保存)" oninput="onAccountInfoChange()">
-			</div>
-			
-			<div id="test-result-alert" style="display: none; padding: 12px 16px; border-radius: 8px; font-size: 13px; font-weight: 500; word-break: break-word; overflow-wrap: break-word; max-height: 200px; overflow-y: auto; line-height: 1.6; border: 1px solid transparent;"></div>
-
-			<div class="modal-footer">
-				<button class="btn btn-success" onclick="testConnection()" id="btn-test-conn">测试连接</button>
-				<button class="btn btn-primary" onclick="saveAccount()" id="btn-save-account" disabled>保存账号</button>
-			</div>
-		</div>
-	</div>
-
-	<!-- Modal: Add API Key -->
-	<div class="modal-overlay" id="key-modal">
-		<div class="modal-card">
-			<div class="modal-header">
-				<h3 id="key-modal-title">生成新 API 密钥</h3>
-				<button onclick="closeKeyModal()" style="background: none; border: none; color: var(--text-muted); cursor: pointer;">
-					<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-				</button>
-			</div>
-			<div id="key-modal-form">
-				<div class="form-group" style="margin-bottom: 16px;">
-					<label for="key-name">密钥描述/使用客户端 (如: Cursor / NextChat)</label>
-					<input type="text" id="key-name" placeholder="请输入描述名" style="width: 100%;">
-				</div>
-				<div class="form-group" style="margin-bottom: 16px;">
-					<label for="key-val">API 密钥值 (可选，为空则随机生成 sk-wa-...)</label>
-					<input type="text" id="key-val" placeholder="留空则随机生成密钥" style="width: 100%;">
-				</div>
-				<div class="modal-footer" style="margin-top: 10px; display: flex; gap: 12px; justify-content: flex-end; width: 100%;">
-					<button class="btn btn-secondary" onclick="closeKeyModal()">取消</button>
-					<button class="btn btn-primary" onclick="saveKey()">生成密钥</button>
-				</div>
-			</div>
-			<div id="key-modal-success" class="hidden" style="display: flex; flex-direction: column; gap: 16px;">
-				<div style="text-align: center; color: var(--success-color); font-size: 40px; margin-bottom: 8px;">🎉</div>
-				<p style="font-size: 14px; text-align: center; line-height: 1.6; color: var(--text-main);">
-					密钥生成成功！请务必复制保存此密钥，关闭后将无法再次完整查看。
-				</p>
-				<div class="form-group">
-					<label>API Key</label>
-					<div style="display: flex; gap: 10px;">
-						<input type="text" id="generated-key-val" readonly style="flex: 1; font-family: monospace;">
-						<button class="btn btn-primary" onclick="copyGeneratedKey()">复制</button>
-					</div>
-				</div>
-				<div class="modal-footer" style="margin-top: 10px; width: 100%;">
-					<button class="btn btn-secondary" onclick="closeKeyModal()" style="width: 100%;">我已保存，关闭</button>
-				</div>
-			</div>
-		</div>
-	</div>
-
-	<script>
-		let currentTab = 'overview';
-		let historyChart = null;
-		let modelsChart = null;
-		const defaultMappings = ${JSON.stringify(DEFAULT_MODEL_MAP)};
-		let customMappings = {};
-
-		// Toast Helper
-		function showToast(message, type = 'success') {
-			let container = document.querySelector('.toast-container');
-			if (!container) {
-				container = document.createElement('div');
-				container.className = 'toast-container';
-				document.body.appendChild(container);
-			}
-
-			const toast = document.createElement('div');
-			toast.className = \`toast toast-\${type}\`;
-			
-			let iconSvg = '';
-			if (type === 'success') {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
-			} else if (type === 'error') {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>\`;
-			} else {
-				iconSvg = \`<svg class="toast-icon" style="color: #ffffff;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>\`;
-			}
-
-			toast.innerHTML = \`\${iconSvg}<span>\${message}</span>\`;
-			container.appendChild(toast);
-
-			toast.offsetHeight; // trigger reflow
-			toast.classList.add('show');
-
-			setTimeout(() => {
-				toast.classList.remove('show');
-				setTimeout(() => toast.remove(), 400);
-			}, 3000);
-		}
-
-		function renderUsageDetails(data) {
-			let totalUsageToday = 0;
-			let totalLimit = data.length * 10000;
-			let historyData = {};
-			let modelsToday = {};
-
-			const usageList = document.getElementById('accounts-usage-list');
-
-			// 记录刷新前已有卡片的最后更新时间戳
-			const previousTimestamps = new Map();
-			usageList.querySelectorAll('.section-card').forEach(card => {
-				const id = card.dataset.id;
-				const ts = parseInt(card.dataset.lastUpdated || '0', 10);
-				if (id) previousTimestamps.set(id, ts);
-			});
-
-			usageList.innerHTML = '';
-
-			if (data.length === 0) {
-				usageList.innerHTML = '<div style="color: var(--text-muted); font-size:14px; text-align:center; padding: 20px; width: 100%;">没有绑定的账号，请前往“账号管理”添加账号。</div>';
-				return;
-			}
-
-			data.forEach(account => {
-				totalUsageToday += account.usageToday;
-
-				// Percentage formatted to 2 decimal places
-				const percentage = Math.min(100, Number(((account.usageToday / 10000) * 100).toFixed(2)));
-				const warningClass = account.status === 'error' ? 'badge-danger' : (account.status === 'pending' ? 'badge-info' : (percentage >= 90 ? 'badge-warning' : 'badge-success'));
-				const statusText = account.status === 'error' ? '连接异常' : (account.status === 'pending' ? '待刷新' : (percentage >= 100 ? '用尽 (10k)' : '正常运行'));
-				
-				// Usage rounded up (Math.ceil)
-				const roundedUsage = Math.ceil(account.usageToday);
-				
-				const item = document.createElement('div');
-				const isRefreshed = previousTimestamps.has(account.id) && previousTimestamps.get(account.id) !== account.lastUpdated;
-				item.className = 'section-card' + (isRefreshed ? ' card-update-flash' : '');
-				item.dataset.id = account.id;
-				item.dataset.lastUpdated = account.lastUpdated || 0;
-				item.style.padding = '20px';
-				item.style.backgroundColor = 'rgba(255,255,255,0.01)';
-				item.innerHTML = \`
-					<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px; gap: 12px;">
-						<div style="min-width: 0; flex: 1; display: flex; align-items: center; gap: 8px;">
-							<strong style="font-size:15px; font-weight:600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto;" title="\${account.name}">\${account.name}</strong>
-							<span style="font-size:12px; color: var(--text-muted); font-family: monospace; white-space: nowrap; flex-shrink: 0;">(\${account.accountId.substring(0,6)}...\${account.accountId.substring(account.accountId.length-4)})</span>
-						</div>
-						<span class="badge \${warningClass}" style="flex-shrink: 0;">\${statusText}</span>
-					</div>
-					<div class="progress-container">
-						<div class="progress-bar" style="width: \${percentage}%;"></div>
-					</div>
-					<div style="display:flex; justify-content:space-between; font-size:12px; color: var(--text-muted); margin-top: 6px;">
-						<span>今日已用: \${roundedUsage.toLocaleString()} / 10,000 Neurons</span>
-						<span>\${percentage.toFixed(2)}%</span>
-					</div>
-					\${account.error ? \`<div style="color: var(--danger-color); font-size:11px; margin-top: 8px; background: rgba(239,68,68,0.08); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(239,68,68,0.12);">错误信息: \${account.error}</div>\` : ''}
-				\`;
-				usageList.appendChild(item);
-
-				if (account.history) {
-					account.history.forEach(h => {
-						historyData[h.date] = (historyData[h.date] || 0) + h.neurons;
-					});
-				}
-
-				if (account.modelsToday) {
-					account.modelsToday.forEach(m => {
-						modelsToday[m.model] = (modelsToday[m.model] || 0) + m.neurons;
-					});
-				}
-			});
-
-			// Top stats formatting (Usage rounded up, Percentage 2 decimals)
-			const roundedTotalUsageToday = Math.ceil(totalUsageToday);
-			document.getElementById('stat-total-neurons').innerText = roundedTotalUsageToday.toLocaleString();
-			document.getElementById('stat-accounts-count').innerText = data.length;
-			
-			const overallPercentage = totalLimit > 0 ? Math.min(100, Number(((totalUsageToday / totalLimit) * 100).toFixed(2))) : 0;
-			document.getElementById('stat-neurons-progress').style.width = overallPercentage + '%';
-			document.getElementById('stat-neurons-desc').innerText = \`\${roundedTotalUsageToday.toLocaleString()} / \${totalLimit.toLocaleString()} Neurons (\${overallPercentage.toFixed(2)}%)\`;
-			
-			const costSaved = (totalUsageToday / 1000) * 0.011;
-			document.getElementById('stat-cost-saving').innerText = '$' + costSaved.toFixed(2);
-
-			const dates = Object.keys(historyData).sort();
-			const neuronsData = dates.map(d => historyData[d]);
-			renderHistoryChart(dates, neuronsData);
-
-			const models = Object.keys(modelsToday);
-			const modelsNeurons = models.map(m => modelsToday[m]);
-			renderModelsChart(models, modelsNeurons);
-		}
-
-		let isRefreshingUsage = false;
-
-		async function loadUsageDetails(isManual = false) {
-			// 如果已经在刷新中，则直接返回，避免并发请求
-			if (isRefreshingUsage) return;
-
-			const now = Date.now();
-			const lastFetchedRaw = localStorage.getItem('cache_usage_details_last_fetched');
-			let lastFetched = lastFetchedRaw ? parseInt(lastFetchedRaw, 10) : 0;
-
-			// 优先从浏览器 localStorage 读取并渲染上次缓存的数据
-			const cachedDataRaw = localStorage.getItem('cache_accounts_usage');
-			if (cachedDataRaw) {
-				try {
-					const cachedData = JSON.parse(cachedDataRaw);
-					renderUsageDetails(cachedData);
-				} catch (e) {
-					console.error('Error parsing cached usage details:', e);
-				}
-			}
-			const cachedKeysCount = localStorage.getItem('cache_keys_count');
-			if (cachedKeysCount) {
-				document.getElementById('stat-keys-count').innerText = cachedKeysCount;
-			}
-
-			// 更新文字显示
-			updateLastUpdatedText(lastFetched);
-
-			// 如果不是手动刷新，且最后更新时间在 15 分钟以内，则直接使用缓存，不发起 API 请求
-			if (!isManual && lastFetched && (now - lastFetched) < 15 * 60 * 1000) {
-				console.log('Skipping auto refresh, last fetch was ' + Math.round((now - lastFetched) / 1000) + 's ago');
-				return;
-			}
-
-			const btn = document.getElementById('btn-refresh-usage');
-			let originalBtnText = '';
-			if (btn) {
-				originalBtnText = btn.innerHTML;
-				btn.disabled = true;
-				btn.innerHTML = '<span class="spinner"></span> 刷新中...';
-			}
-
-			isRefreshingUsage = true;
-
-			try {
-				const res = await apiFetch('/api/accounts/usage');
-				const data = await res.json();
-				
-				// 渲染最新的实时数据
-				renderUsageDetails(data);
-				
-				// 保存/更新本地缓存
-				localStorage.setItem('cache_accounts_usage', JSON.stringify(data));
-
-				// 记录更新时间戳，并更新文字
-				localStorage.setItem('cache_usage_details_last_fetched', now);
-				updateLastUpdatedText(now);
-
-				// 刷新并缓存 API 密钥数
-				const keysRes = await apiFetch('/api/keys');
-				const keys = await keysRes.json();
-				document.getElementById('stat-keys-count').innerText = keys.length;
-				localStorage.setItem('cache_keys_count', keys.length);
-
-			} catch (e) {
-				console.error(e);
-			} finally {
-				isRefreshingUsage = false;
-				if (btn) {
-					btn.disabled = false;
-					btn.innerHTML = originalBtnText;
-				}
-			}
-		}
-
-		function updateLastUpdatedText(timestamp) {
-			const label = document.getElementById('txt-last-updated');
-			if (!label) return;
-			if (!timestamp) {
-				label.innerText = '从未更新';
-				return;
-			}
-			const date = new Date(timestamp);
-			const yyyy = date.getFullYear();
-			const MM = String(date.getMonth() + 1).padStart(2, '0');
-			const dd = String(date.getDate()).padStart(2, '0');
-			const hh = String(date.getHours()).padStart(2, '0');
-			const mm = String(date.getMinutes()).padStart(2, '0');
-			const ss = String(date.getSeconds()).padStart(2, '0');
-			label.innerText = '最后更新: ' + yyyy + '-' + MM + '-' + dd + ' ' + hh + ':' + mm + ':' + ss;
-		}
-
-		function initTheme() {
-			const savedTheme = localStorage.getItem('theme');
-			if (savedTheme) {
-				document.documentElement.setAttribute('data-theme', savedTheme);
-			} else {
-				const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-				const defaultTheme = systemPrefersDark ? 'dark' : 'light';
-				document.documentElement.setAttribute('data-theme', defaultTheme);
-			}
-			updateThemeIcons();
-		}
-
-		function toggleTheme() {
-			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-			const newTheme = currentTheme === 'light' ? 'dark' : 'light';
-			document.documentElement.setAttribute('data-theme', newTheme);
-			localStorage.setItem('theme', newTheme);
-			updateThemeIcons();
-			if (currentTab === 'overview') {
-				loadUsageDetails();
-			}
-		}
-
-		function updateThemeIcons() {
-			const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-			const sunIcons = document.querySelectorAll('.theme-icon-sun');
-			const moonIcons = document.querySelectorAll('.theme-icon-moon');
-			if (currentTheme === 'light') {
-				sunIcons.forEach(el => el.style.display = 'none');
-				moonIcons.forEach(el => el.style.display = 'block');
-			} else {
-				sunIcons.forEach(el => el.style.display = 'block');
-				moonIcons.forEach(el => el.style.display = 'none');
-			}
-		}
-
-		initTheme();
-
-		window.onload = function() {
-			const openaiUrl = window.location.origin + '/v1/chat/completions';
-			const anthropicUrl = window.location.origin + '/v1/messages';
-			const openaiUrlEl = document.getElementById('openai-endpoint-url');
-			const anthropicUrlEl = document.getElementById('anthropic-endpoint-url');
-			if (openaiUrlEl) {
-				openaiUrlEl.dataset.endpointUrl = openaiUrl;
-				openaiUrlEl.textContent = openaiUrl;
-			}
-			if (anthropicUrlEl) {
-				anthropicUrlEl.dataset.endpointUrl = anthropicUrl;
-				anthropicUrlEl.textContent = anthropicUrl;
-			}
-			loadUsageDetails();
-		};
-
-		function toggleSidebar() {
-			document.getElementById('sidebar').classList.toggle('active');
-		}
-
-		async function logout() {
-			const res = await fetch('/api/auth/logout', { method: 'POST' });
-			if (res.ok) {
-				showToast('已安全退出登录');
-				setTimeout(() => {
-					window.location.href = '/';
-				}, 800);
-			}
-		}
-
-		function switchTab(tabName) {
-			if (tabName === currentTab) return;
-			currentTab = tabName;
-			document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-			document.getElementById('menu-' + tabName).classList.add('active');
-
-			document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-			document.getElementById('tab-' + tabName).classList.add('active');
-
-			const titles = {
-				overview: '数据看板',
-				accounts: '账号管理',
-				keys: 'API 密钥',
-				settings: '模型映射'
-			};
-			document.getElementById('view-title').innerText = titles[tabName];
-			document.getElementById('sidebar').classList.remove('active');
-
-			if (tabName === 'overview') {
-				loadUsageDetails();
-			} else if (tabName === 'accounts') {
-				loadAccounts();
-			} else if (tabName === 'keys') {
-				loadKeys();
-			} else if (tabName === 'settings') {
-				loadSettings();
-			}
-		}
-
-		async function apiFetch(path, options = {}) {
-			const res = await fetch(path, options);
-			if (res.status === 401) {
-				window.location.href = '/';
-				throw new Error('Unauthorized');
-			}
-			return res;
-		}
-
-
-		function renderHistoryChart(labels, data) {
-			if (historyChart) historyChart.destroy();
-			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-			const gridColor = isLight ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.05)';
-			const textColor = isLight ? '#64748b' : '#94a3b8';
-			const ctx = document.getElementById('historyChart').getContext('2d');
-			const gradient = ctx.createLinearGradient(0, 0, 0, 300);
-			gradient.addColorStop(0, 'rgba(168, 85, 247, 0.35)');
-			gradient.addColorStop(1, 'rgba(168, 85, 247, 0.00)');
-			historyChart = new Chart(ctx, {
-				type: 'line',
-				data: {
-					labels: labels,
-					datasets: [{
-						label: 'Neuron 消耗数',
-						data: data,
-						borderColor: '#a855f7',
-						backgroundColor: gradient,
-						borderWidth: 3,
-						tension: 0.3,
-						fill: true,
-						pointBackgroundColor: '#a855f7',
-						pointBorderColor: 'rgba(255, 255, 255, 0.8)',
-						pointBorderWidth: 1.5,
-						pointRadius: 4,
-						pointHoverRadius: 6,
-						pointHoverBorderWidth: 3
-					}]
-				},
-				options: {
-					responsive: true,
-					maintainAspectRatio: false,
-					plugins: { legend: { display: false } },
-					scales: {
-						y: { grid: { color: gridColor }, ticks: { color: textColor } },
-						x: { grid: { display: false }, ticks: { color: textColor } }
-					}
-				}
-			});
-		}
-
-		function renderModelsChart(labels, data) {
-			if (modelsChart) modelsChart.destroy();
-			
-			const legendContainer = document.getElementById('admin-chart-legend');
-			const canvasWrapper = document.getElementById('admin-canvas-wrapper');
-			const legendWrapper = document.getElementById('admin-legend-wrapper');
-			const placeholder = document.getElementById('admin-chart-placeholder');
-
-			if (legendContainer) legendContainer.innerHTML = '';
-
-			if (labels.length === 0) {
-				if (canvasWrapper) canvasWrapper.style.display = 'none';
-				if (legendWrapper) legendWrapper.style.display = 'none';
-				if (placeholder) placeholder.style.display = 'flex';
-				return;
-			} else {
-				if (canvasWrapper) canvasWrapper.style.display = 'flex';
-				if (legendWrapper) legendWrapper.style.display = 'flex';
-				if (placeholder) placeholder.style.display = 'none';
-			}
-
-			// Sort the model data descending by neurons
-			const combined = labels.map((label, idx) => ({
-				fullLabel: label,
-				cleanLabel: label.split('/').pop(),
-				value: data[idx]
-			})).sort((a, b) => b.value - a.value);
-
-			const sortedLabels = combined.map(x => x.cleanLabel);
-			const sortedData = combined.map(x => x.value);
-
-			const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-			const textColor = isLight ? '#64748b' : '#94a3b8';
-			const borderColor = isLight ? '#ffffff' : '#1e293b';
-			const ctx = document.getElementById('modelsChart').getContext('2d');
-			
-			modelsChart = new Chart(ctx, {
-				type: 'doughnut',
-				data: {
-					labels: sortedLabels,
-					datasets: [{
-						data: sortedData,
-						backgroundColor: ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'],
-						borderWidth: 2,
-						borderColor: borderColor
-					}]
-				},
-				options: {
-					responsive: true,
-					maintainAspectRatio: false,
-					cutout: '70%',
-					animation: {
-						animateRotate: true,
-						animateScale: true,
-						duration: 1000,
-						easing: 'easeOutQuart'
-					},
-					plugins: {
-						legend: {
-							display: false // 关闭原生图例，使用 HTML 自定义图例
-						}
-					}
-				}
-			});
-
-			// Render Custom HTML Legend for Admin Page
-			if (legendContainer) {
-				const colors = ['#6366f1', '#a855f7', '#ec4899', '#10b981', '#f59e0b', '#3b82f6'];
-				const total = sortedData.reduce((a, b) => a + b, 0);
-				
-				combined.forEach((itemData, index) => {
-					const label = itemData.cleanLabel;
-					const fullLabel = itemData.fullLabel;
-					const val = itemData.value;
-					const color = colors[index % colors.length];
-					const pct = total > 0 ? ((val / total) * 100).toFixed(1) : '0.0';
-					
-					const item = document.createElement('div');
-					item.style.display = 'flex';
-					item.style.alignItems = 'center';
-					item.style.gap = '8px';
-					item.style.fontSize = '12px';
-					item.style.color = textColor;
-					item.style.opacity = '0';
-					item.style.transform = 'translateX(10px)';
-					item.style.transition = 'all 0.4s cubic-bezier(0.16, 1, 0.3, 1)';
-					
-					item.innerHTML = '<span style="width: 8px; height: 8px; border-radius: 50%; background-color: ' + color + '; flex-shrink: 0; margin-right: 2px;"></span>' +
-						'<span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; font-weight: 500;" title="' + fullLabel + '">' + label + '</span>' +
-						'<span style="color: var(--text-muted); font-family: monospace; font-size: 11px; flex-shrink: 0; margin-left: 4px;">' + pct + '%</span>';
-					
-					legendContainer.appendChild(item);
-					
-					// 与环形图同时开始加载，依次淡入滑出
-					setTimeout(() => {
-						item.style.opacity = '1';
-						item.style.transform = 'translateX(0)';
-					}, index * 80);
-				});
-			}
-		}
-
-		async function copyEndpointUrl(url) {
-			if (!url) return;
-			try {
-				if (navigator.clipboard && window.isSecureContext) {
-					await navigator.clipboard.writeText(url);
-				} else {
-					const input = document.createElement('input');
-					input.value = url;
-					input.style.position = 'fixed';
-					input.style.opacity = '0';
-					input.style.left = '-9999px';
-					document.body.appendChild(input);
-					input.select();
-					document.execCommand('copy');
-					document.body.removeChild(input);
-				}
-				showToast('已复制接入地址！');
-			} catch (e) {
-				console.error(e);
-				showToast('复制失败，请手动复制 URL', 'error');
-			}
-		}
-
-		async function loadAccounts() {
-			try {
-				const res = await apiFetch('/api/accounts');
-				const accounts = await res.json();
-				const tbody = document.getElementById('accounts-table-body');
-				tbody.innerHTML = '';
-				if (accounts.length === 0) {
-					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">暂无配置的 Cloudflare 账号</td></tr>';
-					return;
-				}
-				accounts.forEach(acc => {
-					const maskedToken = acc.apiToken.length > 8 ? acc.apiToken.substring(0, 4) + '...' + acc.apiToken.substring(acc.apiToken.length - 4) : '********';
-					const tr = document.createElement('tr');
-					tr.innerHTML = \`
-						<td><strong style="font-weight:600;">\${acc.name}</strong></td>
-						<td><code>\${acc.accountId}</code></td>
-						<td><code>\${maskedToken}</code></td>
-						<td>
-							<div style="display:flex; gap:8px;">
-								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" onclick="editAccount('\${acc.id}', '\${acc.name}', '\${acc.accountId}', '\${acc.apiToken}')">编辑</button>
-								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteAccount('\${acc.id}')">删除</button>
-							</div>
-						</td>
-					\`;
-					tbody.appendChild(tr);
-				});
-			} catch (e) {
-				console.error(e);
-			}
-		}
-
-		function openAddAccountModal() {
-			document.getElementById('account-modal-title').innerText = '添加 Cloudflare 账号';
-			document.getElementById('account-id-edit').value = '';
-			document.getElementById('account-name').value = '';
-			document.getElementById('account-id').value = '';
-			document.getElementById('account-token').value = '';
-			document.getElementById('test-result-alert').style.display = 'none';
-			document.getElementById('perm-wa-read').innerHTML = '';
-			document.getElementById('perm-wa-edit').innerHTML = '';
-			document.getElementById('perm-aa-read').innerHTML = '';
-			document.getElementById('btn-save-account').disabled = true;
-			document.getElementById('account-modal').classList.add('active');
-		}
-
-		function closeAccountModal() {
-			document.getElementById('account-modal').classList.remove('active');
-		}
-
-		function editAccount(id, name, accountId, apiToken) {
-			document.getElementById('account-modal-title').innerText = '编辑 Cloudflare 账号';
-			document.getElementById('account-id-edit').value = id;
-			document.getElementById('account-name').value = name;
-			document.getElementById('account-id').value = accountId;
-			document.getElementById('account-token').value = apiToken;
-			document.getElementById('test-result-alert').style.display = 'none';
-			document.getElementById('perm-wa-read').innerHTML = '';
-			document.getElementById('perm-wa-edit').innerHTML = '';
-			document.getElementById('perm-aa-read').innerHTML = '';
-			document.getElementById('btn-save-account').disabled = true;
-			document.getElementById('account-modal').classList.add('active');
-		}
-
-		function onAccountInfoChange() {
-			document.getElementById('btn-save-account').disabled = true;
-			document.getElementById('test-result-alert').style.display = 'none';
-			document.getElementById('perm-wa-read').innerHTML = '';
-			document.getElementById('perm-wa-edit').innerHTML = '';
-			document.getElementById('perm-aa-read').innerHTML = '';
-		}
-
-		function updatePermissionStatus(elementId, statusObj) {
-			const el = document.getElementById(elementId);
-			if (!el) return;
-			if (statusObj && statusObj.success) {
-				el.innerHTML = '<span style="color: #10b981; font-weight: bold; margin-left: 6px;">✅ 有效</span>';
-			} else {
-				const err = (statusObj && statusObj.error) ? statusObj.error : '测试失败';
-				el.innerHTML = '<span style="color: #ef4444; font-weight: bold; margin-left: 6px;" title="' + err.replace(/"/g, '&quot;') + '">🔴 无效</span>';
-			}
-		}
-
-		function escapeHtml(str) {
-			if (!str) return '';
-			return String(str)
-				.replace(/&/g, '&amp;')
-				.replace(/</g, '&lt;')
-				.replace(/>/g, '&gt;')
-				.replace(/"/g, '&quot;')
-				.replace(/'/g, '&#39;');
-		}
-
-		function setAlertStyle(el, type) {
-			const styles = {
-				warning: { bg: 'rgba(245, 158, 11, 0.12)', color: '#f59e0b', border: 'rgba(245, 158, 11, 0.3)' },
-				success: { bg: 'rgba(16, 185, 129, 0.12)', color: '#10b981', border: 'rgba(16, 185, 129, 0.3)' },
-				danger:  { bg: 'rgba(239, 68, 68, 0.12)', color: '#ef4444', border: 'rgba(239, 68, 68, 0.3)' }
-			};
-			const s = styles[type] || styles.danger;
-			el.style.backgroundColor = s.bg;
-			el.style.color = s.color;
-			el.style.borderColor = s.border;
-		}
-
-		const ALERT_ICONS = {
-			spinner: '<svg style="width:16px;height:16px;animation:spin 1s linear infinite;flex-shrink:0;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>',
-			check:    '<svg style="width:18px;height:18px;flex-shrink:0;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>',
-			warning: '<svg style="width:18px;height:18px;flex-shrink:0;margin-top:1px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>'
-		};
-
-		async function testConnection() {
-			const accountId = document.getElementById('account-id').value;
-			const apiToken = document.getElementById('account-token').value;
-			const id = document.getElementById('account-id-edit').value;
-			const alertEl = document.getElementById('test-result-alert');
-			alertEl.style.display = 'block';
-			setAlertStyle(alertEl, 'warning');
-			alertEl.innerHTML = '<div style="display:flex;align-items:center;gap:8px;">' + ALERT_ICONS.spinner + '<span>测试中...</span></div>';
-
-			document.getElementById('perm-wa-read').innerHTML = '';
-			document.getElementById('perm-wa-edit').innerHTML = '';
-			document.getElementById('perm-aa-read').innerHTML = '';
-			document.getElementById('btn-save-account').disabled = true;
-
-			try {
-				const res = await apiFetch('/api/accounts/test', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ id, accountId, apiToken })
-				});
-				const data = await res.json();
-				if (data.permissions) {
-					updatePermissionStatus('perm-wa-read', data.permissions.workersAiRead);
-					updatePermissionStatus('perm-wa-edit', data.permissions.workersAiEdit);
-					updatePermissionStatus('perm-aa-read', data.permissions.accountAnalyticsRead);
-				}
-				if (data.success) {
-					setAlertStyle(alertEl, 'success');
-					alertEl.innerHTML = '<div style="display:flex;align-items:center;gap:8px;">' + ALERT_ICONS.check + '<span>连接成功！API 权限全部有效</span></div>';
-					showToast('连接测试成功！');
-					document.getElementById('btn-save-account').disabled = false;
-				} else {
-					setAlertStyle(alertEl, 'danger');
-
-					// Build structured error details from permissions data
-					let errorDetailHtml = '';
-					if (data.permissions) {
-						const permList = [
-							{ key: 'workersAiRead',       label: 'Workers AI > Read' },
-							{ key: 'workersAiEdit',       label: 'Workers AI > Edit' },
-							{ key: 'accountAnalyticsRead', label: 'Account Analytics > Read' }
-						];
-						const failedItems = permList.filter(p => {
-							const perm = data.permissions[p.key];
-							return perm && !perm.success;
-						});
-						if (failedItems.length > 0) {
-							errorDetailHtml = failedItems.map(p => {
-								const perm = data.permissions[p.key];
-								const errMsg = escapeHtml(perm.error || '未知错误');
-								return '<div style="padding:3px 0;word-break:break-all;overflow-wrap:break-word;"><span style="opacity:0.6;">●</span> <strong>' + p.label + '</strong>: ' + errMsg + '</div>';
-							}).join('');
-						}
-					}
-					if (!errorDetailHtml) {
-						errorDetailHtml = '<div style="padding:3px 0;word-break:break-all;overflow-wrap:break-word;">' + escapeHtml(data.error || '部分权限验证未通过') + '</div>';
-					}
-
-					alertEl.innerHTML = '<div style="display:flex;align-items:flex-start;gap:8px;">' +
-						ALERT_ICONS.warning +
-						'<div style="flex:1;min-width:0;">' +
-						'<div style="font-weight:700;margin-bottom:4px;">连接失败 — 以下权限验证未通过：</div>' +
-						'<div style="font-size:12px;opacity:0.85;line-height:1.7;">' + errorDetailHtml + '</div>' +
-						'</div>' +
-						'</div>';
-
-					showToast('测试连接失败，请检查 Token 权限', 'error');
-					document.getElementById('btn-save-account').disabled = true;
-				}
-			} catch (e) {
-				setAlertStyle(alertEl, 'danger');
-				alertEl.innerHTML = '<div style="display:flex;align-items:center;gap:8px;">' + ALERT_ICONS.warning + '<span>连接超时或异常，请重试</span></div>';
-				showToast('连接异常，请重试', 'error');
-				document.getElementById('btn-save-account').disabled = true;
-			}
-		}
-
-		async function saveAccount() {
-			const id = document.getElementById('account-id-edit').value;
-			const name = document.getElementById('account-name').value;
-			const accountId = document.getElementById('account-id').value;
-			const apiToken = document.getElementById('account-token').value;
-			if (!accountId || !apiToken) {
-				showToast('Account ID 和 API Token 均为必填项！', 'warning');
-				return;
-			}
-			const res = await apiFetch('/api/accounts', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ id, name, accountId, apiToken })
-			});
-			if (res.ok) {
-				closeAccountModal();
-				loadAccounts();
-				showToast('账号保存成功！');
-			} else {
-				showToast('保存失败！', 'error');
-			}
-		}
-
-		async function deleteAccount(id) {
-			if (!confirm('确定要删除这个 Cloudflare 账号吗？')) return;
-			const res = await apiFetch('/api/accounts', {
-				method: 'DELETE',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ id })
-			});
-			if (res.ok) {
-				loadAccounts();
-				showToast('账号已成功删除');
-			} else {
-				showToast('删除失败', 'error');
-			}
-		}
-
-		async function loadKeys() {
-			try {
-				const res = await apiFetch('/api/keys');
-				const keys = await res.json();
-				const tbody = document.getElementById('keys-table-body');
-				tbody.innerHTML = '';
-				if (keys.length === 0) {
-					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">暂无配置的 API 密钥</td></tr>';
-					document.getElementById('no-key-warning').classList.remove('hidden');
-					return;
-				} else {
-					document.getElementById('no-key-warning').classList.add('hidden');
-				}
-				keys.forEach(k => {
-					const tr = document.createElement('tr');
-					const dateStr = new Date(k.createdAt).toLocaleString();
-					tr.innerHTML = \`
-						<td><strong style="font-weight:600;">\${sen(k.name)}</strong></td>
-						<td>
-							<div style="display:flex; align-items:center; gap:8px;">
-								<code id="key-val-\${k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
-								<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText('\${k.key}')">复制</button>
-							</div>
-						</td>
-						<td>\${dateStr}</td>
-						<td>
-							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteKey('\${k.id}')">删除</button>
-						</td>
-					\`;
-					tbody.appendChild(tr);
-				});
-			} catch (e) {
-				console.error(e);
-			}
-		}
-
-		function sen(str) {
-			return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-		}
-
-		function copyKeyText(val) {
-			const input = document.createElement('input');
-			input.value = val;
-			document.body.appendChild(input);
-			input.select();
-			document.execCommand('copy');
-			document.body.removeChild(input);
-			showToast('API Key 复制成功！');
-		}
-
-		function openAddKeyModal() {
-			document.getElementById('key-name').value = '';
-			document.getElementById('key-val').value = '';
-			document.getElementById('key-modal-title').innerText = '生成新 API 密钥';
-			document.getElementById('key-modal-form').classList.remove('hidden');
-			document.getElementById('key-modal-success').classList.add('hidden');
-			document.getElementById('key-modal').classList.add('active');
-		}
-
-		function closeKeyModal() {
-			document.getElementById('key-modal').classList.remove('active');
-		}
-
-		async function saveKey() {
-			const name = document.getElementById('key-name').value;
-			const key = document.getElementById('key-val').value;
-			if (!name) {
-				showToast('请输入描述名称！', 'warning');
-				return;
-			}
-			const res = await apiFetch('/api/keys', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ name, key })
-			});
-			if (res.ok) {
-				const data = await res.json();
-				loadKeys();
-				document.getElementById('key-modal-title').innerText = '密钥已生成';
-				document.getElementById('key-modal-form').classList.add('hidden');
-				document.getElementById('key-modal-success').classList.remove('hidden');
-				document.getElementById('generated-key-val').value = data.key;
-			} else {
-				showToast('保存密钥失败！', 'error');
-			}
-		}
-
-		function copyGeneratedKey() {
-			const el = document.getElementById('generated-key-val');
-			el.select();
-			document.execCommand('copy');
-			showToast('API Key 复制成功！');
-		}
-
-		async function deleteKey(id) {
-			if (!confirm('确定要删除这个 API 密钥吗？')) return;
-			const res = await apiFetch('/api/keys', {
-				method: 'DELETE',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ id })
-			});
-			if (res.ok) {
-				loadKeys();
-				showToast('密钥已成功删除');
-			} else {
-				showToast('删除密钥失败', 'error');
-			}
-		}
-
-		function copyModelId(val) {
-			const input = document.createElement('input');
-			input.value = val;
-			document.body.appendChild(input);
-			input.select();
-			document.execCommand('copy');
-			document.body.removeChild(input);
-			showToast(\`已复制模型: \${val}\`);
-		}
-
-		async function loadSettings() {
-			try {
-				const res = await apiFetch('/api/settings');
-				const data = await res.json();
-				customMappings = data.customModelMap || {};
-				const tbody = document.getElementById('mappings-table-body');
-				tbody.innerHTML = '';
-				Object.keys(customMappings).forEach(source => {
-					const target = customMappings[source];
-					const isPreset = Object.prototype.hasOwnProperty.call(defaultMappings, source) && defaultMappings[source] === target;
-					const typeText = isPreset ? '<span class="badge badge-success">预设映射</span>' : '<span class="badge badge-warning">自定义</span>';
-					const tr = document.createElement('tr');
-					tr.innerHTML = \`
-						<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId('\${source}')">\${source}</code></td>
-						<td><code style="cursor: pointer;" title="点击复制" onclick="copyModelId('\${target}')">\${target}</code></td>
-						<td>\${typeText}</td>
-						<td>
-							<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px; color: var(--danger-color);" onclick="deleteMapping('\${source}')">删除</button>
-						</td>
-					\`;
-					tbody.appendChild(tr);
-				});
-			} catch(e) {
-				console.error(e);
-			}
-		}
-
-		async function addMapping() {
-			const source = document.getElementById('map-source').value.trim();
-			const target = document.getElementById('map-target').value.trim();
-			if (!source || !target) {
-				showToast('请求模型名称和目标模型路径不能为空！', 'warning');
-				return;
-			}
-			customMappings[source] = target;
-			const res = await apiFetch('/api/settings', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ customModelMap: customMappings })
-			});
-			if (res.ok) {
-				document.getElementById('map-source').value = '';
-				document.getElementById('map-target').value = '';
-				loadSettings();
-				showToast('映射配置成功！');
-			} else {
-				showToast('添加映射失败！', 'error');
-			}
-		}
-
-		async function restorePresetMappings() {
-			const mergedMappings = { ...customMappings, ...defaultMappings };
-			const hasChanges = Object.keys(defaultMappings).some(source => customMappings[source] !== defaultMappings[source]);
-
-			if (!hasChanges && Object.keys(defaultMappings).every(source => customMappings[source] === defaultMappings[source])) {
-				showToast('预设映射已存在，无需重复添加');
-				return;
-			}
-
-			const res = await apiFetch('/api/settings', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ customModelMap: mergedMappings })
-			});
-			if (res.ok) {
-				customMappings = mergedMappings;
-				loadSettings();
-				showToast('已恢复预设映射');
-			} else {
-				showToast('恢复预设映射失败！', 'error');
-			}
-		}
-
-		async function deleteMapping(source) {
-			if (!confirm('确定要删除此映射吗？')) return;
-			delete customMappings[source];
-			const res = await apiFetch('/api/settings', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ customModelMap: customMappings })
-			});
-			if (res.ok) {
-				loadSettings();
-				showToast('已删除映射');
-			} else {
-				showToast('删除映射失败！', 'error');
-			}
-		}
-	</script>
-</body>
-</html>`;
-
-	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
-	});
+async function handleV1(request, env, ctx) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const anthropicEndpoint = path === "/v1/messages" || path === "/v1/messages/count_tokens";
+  const auth = await verifyApiKey(request, env);
+  if (!auth.ok) return apiUnauthorized(auth.reason, anthropicEndpoint);
+  await touchKey(env, ctx, auth.key);
+  if (path === "/v1/models" && request.method === "GET") {
+    const includePaid = url.searchParams.get("include_paid") === "1" && await isAdmin(request, env);
+    const data = await catalogResponse(env, ctx, {
+      includePaid,
+      task: url.searchParams.get("task"),
+      search: url.searchParams.get("search"),
+      sort: url.searchParams.get("sort") || "performance",
+      limit: url.searchParams.get("limit") ? Number(url.searchParams.get("limit")) : null
+    });
+    return json(data, {
+      headers: {
+        "x-workers-ai-catalog-source": data.meta?.source || "unknown",
+        "Cache-Control": "public, max-age=60"
+      }
+    });
+  }
+  if (path.startsWith("/v1/models/") && request.method === "GET") {
+    const requested = decodeURIComponent(path.slice("/v1/models/".length));
+    const catalog2 = await getCatalog(env, ctx);
+    const model = findModel(catalog2, requested);
+    if (!model) throw new RequestError(`Model "${requested}" not found.`, { status: 404, code: "model_not_found" });
+    if (model.requires_paid && !await isAdmin(request, env)) {
+      throw new RequestError(`Model "${model.id}" requires a Workers Paid plan.`, { status: 403, code: "model_requires_paid_plan" });
+    }
+    return json(publicModel(model));
+  }
+  const catalog = await getCatalog(env, ctx);
+  const settings = await getSettings(env);
+  const resolve = (name, options) => resolveModel(catalog, name, settings, options);
+  if ((path === "/v1/chat/completions" || path === "/v1/completions") && request.method === "POST") {
+    const body = await previewJson(request);
+    if (!body?.model) throw new RequestError("model is required", { status: 400, code: "missing_model" });
+    const model = resolve(body.model, { task: "text-generation" });
+    return handleChat(request, env, ctx, model, { legacyCompletions: path === "/v1/completions" });
+  }
+  if (path === "/v1/responses" && request.method === "POST") {
+    const body = await previewJson(request);
+    if (!body?.model) throw new RequestError("model is required", { status: 400, code: "missing_model" });
+    const model = resolve(body.model, { task: "text-generation" });
+    return handleResponses(request, env, ctx, model);
+  }
+  if (path === "/v1/embeddings" && request.method === "POST") {
+    const body = await previewJson(request);
+    if (!body?.model) throw new RequestError("model is required", { status: 400, code: "missing_model" });
+    const model = resolve(body.model, { task: "text-embeddings" });
+    return handleEmbeddings(request, env, ctx, model);
+  }
+  if (path === "/v1/images/generations" && request.method === "POST") {
+    const body = await previewJson(request);
+    if (!body?.model) throw new RequestError("model is required", { status: 400, code: "missing_model" });
+    const model = openAIDefault(body.model, catalog) || resolve(body.model, { task: "text-to-image" });
+    return handleImages(request, env, ctx, model);
+  }
+  if (path === "/v1/audio/transcriptions" && request.method === "POST") {
+    const form = await previewForm(request);
+    const requested = String(form?.get("model") || "whisper-1");
+    const model = openAIDefault(requested, catalog) || resolve(requested, { task: "automatic-speech-recognition" });
+    return handleTranscription(request, env, ctx, model);
+  }
+  if (path === "/v1/audio/speech" && request.method === "POST") {
+    const body = await previewJson(request);
+    if (!body?.model) throw new RequestError("model is required", { status: 400, code: "missing_model" });
+    const model = openAIDefault(body.model, catalog) || resolve(body.model, { task: "text-to-speech" });
+    return handleSpeech(request, env, ctx, model);
+  }
+  if (path === "/v1/rerank" && request.method === "POST") {
+    const body = await previewJson(request);
+    if (!body?.model) throw new RequestError("model is required", { status: 400, code: "missing_model" });
+    const model = resolve(body.model, { task: "text-classification" });
+    return handleRerank(request, env, ctx, model);
+  }
+  if (path === "/v1/run" && request.method === "POST") {
+    const body = await previewJson(request);
+    if (!body?.model) throw new RequestError("model is required", { status: 400, code: "missing_model" });
+    const model = resolve(body.model);
+    return handleRun(request, env, ctx, model);
+  }
+  if (path === "/v1/messages" && request.method === "POST") {
+    const body = await previewJson(request);
+    if (!body?.model) throw new AnthropicError("model is required.", 400, "invalid_request_error");
+    const model = resolve(body.model, { task: "text-generation" });
+    return handleAnthropicMessages(request, env, ctx, model);
+  }
+  if (path === "/v1/messages/count_tokens" && request.method === "POST") {
+    const body = await previewJson(request);
+    if (!body?.model) throw new AnthropicError("model is required.", 400, "invalid_request_error");
+    const model = resolve(body.model, { task: "text-generation" });
+    return handleAnthropicCountTokens(request, env, ctx, model);
+  }
+  throw new RequestError(`Unknown endpoint: ${request.method} ${path}`, { status: 404, code: "not_found" });
 }
-
-// 3. KV 未绑定时的报错页面
-function handleKVError(request) {
-	const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>KV 绑定异常 - Workers AI to API</title>
-	<link rel="preconnect" href="https://fonts.googleapis.com">
-	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
-	<style>
-		:root {
-			--bg-color: #0b0f19;
-			--card-bg: rgba(30, 41, 59, 0.45);
-			--border-color: rgba(239, 68, 68, 0.2);
-			--text-main: #f8fafc;
-			--text-muted: #94a3b8;
-			--primary-gradient: linear-gradient(135deg, #ef4444 0%, #ec4899 100%);
-			--accent-color: #ec4899;
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-			--orb-1-color: rgba(239, 68, 68, 0.08);
-			--orb-2-color: rgba(236, 72, 153, 0.06);
-		}
-
-		* {
-			box-sizing: border-box;
-			margin: 0;
-			padding: 0;
-		}
-
-		body {
-			font-family: 'Inter', sans-serif;
-			background-color: var(--bg-color);
-			color: var(--text-main);
-			min-height: 100vh;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			padding: 20px;
-			position: relative;
-			overflow: hidden;
-		}
-
-		/* Dynamic Background Orbs */
-		.bg-orbs-container {
-			position: fixed;
-			top: 0;
-			left: 0;
-			width: 100%;
-			height: 100%;
-			z-index: -1;
-			overflow: hidden;
-			pointer-events: none;
-		}
-
-		.bg-orb {
-			position: absolute;
-			border-radius: 50%;
-			filter: blur(100px);
-			animation: float 25s infinite alternate ease-in-out;
-		}
-
-		.bg-orb-1 {
-			top: -10%;
-			left: -10%;
-			width: 50vw;
-			height: 50vw;
-			background: var(--orb-1-color);
-		}
-
-		.bg-orb-2 {
-			bottom: -10%;
-			right: -10%;
-			width: 60vw;
-			height: 60vw;
-			background: var(--orb-2-color);
-		}
-
-		@keyframes float {
-			0% { transform: translate(0, 0) scale(1); }
-			100% { transform: translate(5%, 5%) scale(1.05); }
-		}
-
-		.error-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			padding: 40px;
-			max-width: 500px;
-			width: 100%;
-			text-align: center;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			z-index: 10;
-		}
-
-		h1 {
-			font-family: 'Outfit', sans-serif;
-			font-size: 24px;
-			color: #ef4444;
-			margin-bottom: 16px;
-			font-weight: 600;
-		}
-
-		p {
-			color: var(--text-muted);
-			font-size: 15px;
-			line-height: 1.6;
-			margin-bottom: 24px;
-		}
-
-		.code-block {
-			background-color: rgba(0, 0, 0, 0.25);
-			padding: 20px;
-			border-radius: 12px;
-			font-family: monospace;
-			font-size: 13px;
-			color: #e9d5ff;
-			text-align: left;
-			margin-bottom: 26px;
-			border: 1px solid rgba(255, 255, 255, 0.05);
-			line-height: 1.8;
-		}
-
-		.btn {
-			display: inline-block;
-			background: var(--primary-gradient);
-			color: white;
-			text-decoration: none;
-			padding: 12px 28px;
-			border-radius: 10px;
-			font-weight: 600;
-			font-size: 14px;
-			transition: all 0.3s;
-			box-shadow: 0 4px 14px rgba(239, 68, 68, 0.2);
-		}
-
-		.btn:hover {
-			transform: translateY(-2px);
-			box-shadow: 0 6px 20px rgba(239, 68, 68, 0.35);
-			opacity: 0.95;
-		}
-	</style>
-</head>
-<body>
-	<div class="bg-orbs-container">
-		<div class="bg-orb bg-orb-1"></div>
-		<div class="bg-orb bg-orb-2"></div>
-	</div>
-	<div class="error-card">
-		<div style="font-size: 48px; margin-bottom: 16px;">⚠️</div>
-		<h1>KV 命名空间未绑定</h1>
-		<p>系统检测到您未在 Cloudflare 平台中为该项目绑定 KV 命名空间，或者绑定的变量名称不为 <strong>KV</strong>。这会导致数据无法保存，系统无法正常运行。</p>
-		
-		<div class="code-block">
-			<strong>解决方案：</strong><br>
-			1. 进入您的 Cloudflare Workers/Pages 仪表盘。<br>
-			2. 导航至 Settings -> Functions (或 Settings -> Variables) -> KV namespace bindings。<br>
-			3. 添加绑定，将【变量名称 (Variable name)】设置为: <strong>KV</strong><br>
-			4. 保存并重新部署项目即可。
-		</div>
-		
-		<a href="https://developers.cloudflare.com/kv/learning/kv-bindings/" target="_blank" class="btn">查看官方绑定教程</a>
-	</div>
-</body>
-</html>`;
-
-	const url = new URL(request.url);
-	if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/api/')) {
-		return new Response(JSON.stringify({
-			error: {
-				message: "Cloudflare KV namespace binding 'KV' is missing. Please bind a KV namespace to 'KV' in your Worker/Pages settings.",
-				type: "server_error"
-			}
-		}), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
-	}
-
-	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
-	});
+function errorResponse(error, request) {
+  const path = new URL(request.url).pathname;
+  if (path === "/v1/messages" || path === "/v1/messages/count_tokens") {
+    if (error instanceof InferenceError) {
+      return new AnthropicError(error.message, error.status, error.status === 401 ? "authentication_error" : "api_error").toResponse();
+    }
+    if (error instanceof RequestError) {
+      return new AnthropicError(error.message, error.status, error.status === 404 ? "not_found_error" : "invalid_request_error").toResponse();
+    }
+  }
+  if (typeof error?.toResponse === "function") return error.toResponse();
+  console.error("Unhandled error", error);
+  return openAIError("Internal server error", { status: 500, code: "internal_error", type: "server_error" });
 }
-
-// 4. Password Error UI Page
-function handlePasswordError(request) {
-	const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>管理员密码未配置 - Workers AI to API</title>
-	<link rel="preconnect" href="https://fonts.googleapis.com">
-	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
-	<style>
-		:root {
-			--bg-color: #0b0f19;
-			--card-bg: rgba(30, 41, 59, 0.45);
-			--border-color: rgba(239, 68, 68, 0.2);
-			--text-main: #f8fafc;
-			--text-muted: #94a3b8;
-			--primary-gradient: linear-gradient(135deg, #ef4444 0%, #ec4899 100%);
-			--accent-color: #ec4899;
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-			--orb-1-color: rgba(239, 68, 68, 0.08);
-			--orb-2-color: rgba(236, 72, 153, 0.06);
-		}
-
-		* {
-			box-sizing: border-box;
-			margin: 0;
-			padding: 0;
-		}
-
-		body {
-			font-family: 'Inter', sans-serif;
-			background-color: var(--bg-color);
-			color: var(--text-main);
-			min-height: 100vh;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			padding: 20px;
-			position: relative;
-			overflow: hidden;
-		}
-
-		/* Dynamic Background Orbs */
-		.bg-orbs-container {
-			position: fixed;
-			top: 0;
-			left: 0;
-			width: 100%;
-			height: 100%;
-			z-index: -1;
-			overflow: hidden;
-			pointer-events: none;
-		}
-
-		.bg-orb {
-			position: absolute;
-			border-radius: 50%;
-			filter: blur(100px);
-			animation: float 25s infinite alternate ease-in-out;
-		}
-
-		.bg-orb-1 {
-			top: -10%;
-			left: -10%;
-			width: 50vw;
-			height: 50vw;
-			background: var(--orb-1-color);
-		}
-
-		.bg-orb-2 {
-			bottom: -10%;
-			right: -10%;
-			width: 60vw;
-			height: 60vw;
-			background: var(--orb-2-color);
-		}
-
-		@keyframes float {
-			0% { transform: translate(0, 0) scale(1); }
-			100% { transform: translate(5%, 5%) scale(1.05); }
-		}
-
-		.error-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			padding: 40px;
-			max-width: 500px;
-			width: 100%;
-			text-align: center;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			z-index: 10;
-		}
-
-		h1 {
-			font-family: 'Outfit', sans-serif;
-			font-size: 24px;
-			color: #ef4444;
-			margin-bottom: 16px;
-			font-weight: 600;
-		}
-
-		p {
-			color: var(--text-muted);
-			font-size: 15px;
-			line-height: 1.6;
-			margin-bottom: 24px;
-		}
-
-		.code-block {
-			background-color: rgba(0, 0, 0, 0.25);
-			padding: 20px;
-			border-radius: 12px;
-			font-family: monospace;
-			font-size: 13px;
-			color: #e9d5ff;
-			text-align: left;
-			margin-bottom: 26px;
-			border: 1px solid rgba(255, 255, 255, 0.05);
-			line-height: 1.8;
-		}
-	</style>
-</head>
-<body>
-	<div class="bg-orbs-container">
-		<div class="bg-orb bg-orb-1"></div>
-		<div class="bg-orb bg-orb-2"></div>
-	</div>
-	<div class="error-card">
-		<div style="font-size: 48px; margin-bottom: 16px;">🔑</div>
-		<h1>管理员密码未配置</h1>
-		<p>系统检测到您未在 Cloudflare 平台中为该项目配置 <strong>ADMIN_PASSWORD</strong> 环境变量。为了您的接口 and 管理后台安全，系统已拦截所有访问，直到密码配置完成。</p>
-		
-		<div class="code-block">
-			<strong>解决方案：</strong><br>
-			1. 进入您的 Cloudflare Workers/Pages 仪表盘。<br>
-			2. 导航至 Settings -> Variables (或 Settings -> Environment Variables)。<br>
-			3. 点击【Add variable】，将【Variable name】设置为: <strong>ADMIN_PASSWORD</strong><br>
-			4. 输入您的管理员登录密码作为其值，保存并部署即可。
-		</div>
-	</div>
-</body>
-</html>`;
-
-	const url = new URL(request.url);
-	if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/api/')) {
-		return new Response(JSON.stringify({
-			error: {
-				message: "ADMIN_PASSWORD environment variable is missing. Please add the ADMIN_PASSWORD variable to your Worker/Pages settings.",
-				type: "server_error"
-			}
-		}), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key' } });
-	}
-
-	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
-	});
-}
+var index_default = {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (request.method === "OPTIONS") return preflight(request);
+    try {
+      if (url.pathname === "/robots.txt") {
+        return new Response("User-agent: *\nDisallow: /\n", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+      }
+      if (url.pathname === "/favicon.ico" || url.pathname === "/favicon.svg") {
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#f6821f"/><path d="M16 40h32M16 24h32M24 16l-8 8 8 8M40 32l8 8-8 8" stroke="#0b0d10" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>';
+        return new Response(svg, { headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" } });
+      }
+      if (!env.KV) return setupResponse(request);
+      if (url.pathname.startsWith("/api/")) {
+        return cors(await handleAdminApi(request, env, ctx), request);
+      }
+      if (url.pathname.startsWith("/v1/")) {
+        return cors(await handleV1(request, env, ctx), request);
+      }
+      if (url.pathname === "/") {
+        return new Response(await handleLandingPage(request, env, ctx), { headers: HTML_HEADERS });
+      }
+      if (url.pathname === "/admin" || url.pathname === "/admin/") {
+        return new Response(await handleAdminPage(request, env, ctx), { headers: HTML_HEADERS });
+      }
+      if (url.pathname.startsWith("/docs/")) {
+        const page = handleDocsPage(url.pathname.slice("/docs/".length).replace(/\/$/, ""));
+        if (page) return new Response(page, { headers: HTML_HEADERS });
+      }
+      return new Response("404 Not Found", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    } catch (error) {
+      return cors(errorResponse(error, request), request);
+    }
+  }
+};
+export {
+  QuotaGuard,
+  index_default as default
+};

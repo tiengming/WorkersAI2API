@@ -1,0 +1,35 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "workers-ai2api",
+	"main": "src/index.js",
+	"compatibility_date": "2026-10-20",
+	"workers_dev": true,
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1
+	},
+	"vars": {
+		"FREE_DAILY_NEURONS": "10000",
+		"MAX_DAILY_NEURONS": "10000"
+	},
+	"kv_namespaces": [
+		{
+			"binding": "KV",
+			"id": "00000000000000000000000000000000"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "QUOTA",
+				"class_name": "QuotaGuard"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["QuotaGuard"]
+		}
+	]
+}
