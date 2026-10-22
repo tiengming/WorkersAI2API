@@ -11,6 +11,7 @@ import {
 	seedConfig,
 } from './fixtures.js';
 import { resetConfigCache } from '../src/config.js';
+import { getCatalog } from '../src/catalog/index.js';
 import { quotaStatus } from '../src/quota.js';
 import { utcDay } from '../src/utils.js';
 
@@ -127,6 +128,31 @@ describe('public endpoints', () => {
 		expect(await response.text()).toContain('Workers AI2API');
 	});
 
+	it('serves Chinese by default and English via ?lang=en', async () => {
+		const zh = await SELF.fetch(url('/'));
+		const zhHtml = await zh.text();
+		expect(zhHtml).toContain('lang="zh-CN"');
+		expect(zhHtml).toContain('免费模型目录');
+		expect(zhHtml).toContain('每账号每日免费 Neurons');
+
+		const en = await SELF.fetch(url('/?lang=en'));
+		const enHtml = await en.text();
+		expect(enHtml).toContain('lang="en"');
+		expect(enHtml).toContain('Free model catalog');
+		expect(en.headers.get('set-cookie')).toContain('lang=en');
+
+		const docs = await SELF.fetch(url('/docs/api'));
+		expect(await docs.text()).toContain('接口参考');
+	});
+
+	it('serves the Chinese admin sign-in page', async () => {
+		const response = await SELF.fetch(url('/admin'));
+		expect(response.status).toBe(200);
+		const html = await response.text();
+		expect(html).toContain('管理员登录');
+		expect(html).toContain('返回公开首页');
+	});
+
 	it('rejects unauthenticated API requests when keys exist', async () => {
 		const response = await SELF.fetch(url('/v1/models'));
 		expect(response.status).toBe(401);
@@ -227,6 +253,78 @@ describe('GET /v1/models', () => {
 		const response = await SELF.fetch(url('/v1/models/@cf/test/missing'), { headers: authHeaders() });
 		expect(response.status).toBe(404);
 		expect((await response.json()).error.code).toBe('model_not_found');
+	});
+});
+
+describe('dynamic catalog formats', () => {
+	it('merges native task metadata with OpenRouter pricing and context', async () => {
+		mockFetch(async (input) => {
+			const target = String(input);
+			if (target.includes('/ai/models/search')) {
+				if (target.includes('format=openrouter')) {
+					return upstreamJson({
+						success: true,
+						result: [{
+							id: '@cf/test/dual',
+							name: 'Dual Model',
+							description: 'OpenRouter-shaped row',
+							context_length: 64_000,
+							architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+							pricing: { prompt: '0.0000001', completion: '0.0000002' },
+						}],
+					});
+				}
+				return upstreamJson({
+					success: true,
+					result: [{
+						id: '@cf/test/dual',
+						name: 'Dual Model',
+						task: { name: 'Text Generation' },
+						properties: { function_calling: true, streaming: true },
+					}],
+				});
+			}
+			return new Response('# Pricing\n\n10,000 Neurons per day\n', { status: 200 });
+		});
+
+		const catalog = await getCatalog(env, null, { force: true });
+		const model = catalog.models.find((item) => item.id === '@cf/test/dual');
+
+		expect(catalog.meta.source).toBe('cloudflare-models-api');
+		expect(catalog.meta.formats).toEqual({ native: 1, openrouter: 1, merged: 1 });
+		expect(model.task).toBe('text-generation');
+		expect(model.context_window).toBe(64_000);
+		expect(model.pricing.tokens.input_usd_per_million).toBeCloseTo(0.1, 6);
+		expect(model.pricing.tokens.output_usd_per_million).toBeCloseTo(0.2, 6);
+		expect(model.free).toBe(true);
+	});
+
+	it('infers a task when only the OpenRouter format is available', async () => {
+		mockFetch(async (input) => {
+			const target = String(input);
+			if (target.includes('/ai/models/search')) {
+				if (target.includes('format=openrouter')) {
+					return upstreamJson({
+						success: true,
+						result: [{
+							id: '@cf/test/openrouter-chat',
+							name: 'OpenRouter Chat',
+							architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+							context_length: 16_000,
+						}],
+					});
+				}
+				return upstreamJson({ success: true, result: [] });
+			}
+			return new Response('# Pricing\n\n10,000 Neurons per day\n', { status: 200 });
+		});
+
+		const catalog = await getCatalog(env, null, { force: true });
+		const model = catalog.models.find((item) => item.id === '@cf/test/openrouter-chat');
+
+		expect(catalog.meta.formats).toEqual({ native: 0, openrouter: 1, merged: 1 });
+		expect(model.task).toBe('text-generation');
+		expect(model.task).not.toBe('unknown');
 	});
 });
 

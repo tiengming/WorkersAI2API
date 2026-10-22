@@ -532,24 +532,97 @@ var TASK_ALIASES = {
   "text-generation": "text-generation",
   "text embeddings": "text-embeddings",
   "text-embeddings": "text-embeddings",
+  embeddings: "text-embeddings",
+  embedding: "text-embeddings",
   "text-to-image": "text-to-image",
   "text to image": "text-to-image",
+  "image generation": "text-to-image",
   "automatic speech recognition": "automatic-speech-recognition",
   "speech recognition": "automatic-speech-recognition",
+  "speech to text": "automatic-speech-recognition",
   "text-to-speech": "text-to-speech",
   "text to speech": "text-to-speech",
   translation: "translation",
-  "summarization": "summarization",
+  summarization: "summarization",
   "text classification": "text-classification",
   "image classification": "image-classification",
   "image-to-text": "image-to-text",
+  "image to text": "image-to-text",
   "object detection": "object-detection",
   "dumb pipe": "dumb-pipe"
 };
 function normalizeTask(value) {
   if (!value) return "unknown";
   const raw = typeof value === "string" ? value : value.name || value.id || value.task || "";
-  return TASK_ALIASES[String(raw).toLowerCase()] || String(raw).toLowerCase().replace(/\s+/g, "-");
+  const key = String(raw).trim().toLowerCase();
+  if (!key) return "unknown";
+  return TASK_ALIASES[key] || key.replace(/\s+/g, "-");
+}
+var KNOWN_TASKS = new Set(Object.values(TASK_ALIASES));
+function resolveDeclaredTask(raw, props) {
+  for (const value of [raw?.task, raw?.task_name, props?.task]) {
+    const task = normalizeTask(value);
+    if (task !== "unknown") return task;
+  }
+  const type = normalizeTask(raw?.type);
+  return KNOWN_TASKS.has(type) ? type : "unknown";
+}
+function modalityList(value) {
+  if (!value) return null;
+  const list = Array.isArray(value) ? value : String(value).split(/[,+/|]/);
+  const normalized = [...new Set(
+    list.map((item) => String(item).trim().toLowerCase()).filter(Boolean)
+  )];
+  return normalized.length ? normalized : null;
+}
+function explicitModalities(raw) {
+  const architecture = raw?.architecture || {};
+  let input = modalityList(
+    architecture.input_modalities || raw?.input_modalities || raw?.modalities?.input
+  );
+  let output = modalityList(
+    architecture.output_modalities || raw?.output_modalities || raw?.modalities?.output
+  );
+  const modality = String(architecture.modality || raw?.modality || "").toLowerCase();
+  if ((!input || !output) && /->|→/.test(modality)) {
+    const [left, right] = modality.split(/->|→/);
+    input ||= modalityList(left);
+    output ||= modalityList(right);
+  }
+  return { input, output };
+}
+function inferTask(raw, props = {}, modalities = null) {
+  const id = String(raw?.id || "").toLowerCase();
+  const name = String(raw?.name || "").toLowerCase();
+  const text = `${id} ${name}`;
+  const mods = modalities || explicitModalities(raw);
+  const input = mods.input || [];
+  const output = mods.output || [];
+  const propTask = normalizeTask(props.task);
+  if (propTask !== "unknown") return propTask;
+  if (/rerank/.test(text)) return "text-classification";
+  if (/embedding|embed-|bge-|plamo-embedding|embeddinggemma/.test(text) || output.includes("embedding") || output.includes("embeddings")) {
+    return "text-embeddings";
+  }
+  if (/melotts|aura-|text[- ]to[- ]speech|\btts\b/.test(text) || output.includes("audio")) {
+    return "text-to-speech";
+  }
+  if (/smart-turn|dumb[- ]pipe/.test(text)) return "dumb-pipe";
+  if (/llava|moondream/.test(text)) return "image-to-text";
+  if (/whisper|nova-3|transcrib|speech[- ]to[- ]text|\basr\b|deepgram\/flux/.test(text) || input.includes("audio") && output.includes("text")) {
+    return "automatic-speech-recognition";
+  }
+  if (/resnet|image[- ]classification/.test(text)) return "image-classification";
+  const looksLikeChat = /vision|instruct|chat|multimodal/.test(text);
+  const looksLikeImageToText = /image[- ]to[- ]text|llava|moondream/.test(text);
+  if (output.includes("image") || !looksLikeChat && !looksLikeImageToText && /stable-diffusion|sdxl|flux|dreamshaper|lucid-origin|phoenix|diffusion|text[- ]to[- ]image|image[- ]generat/.test(text)) {
+    return "text-to-image";
+  }
+  if (input.includes("image") && output.includes("text") && !looksLikeChat) return "image-to-text";
+  if (/m2m100|indictrans|translat/.test(text)) return "translation";
+  if (/bart.*cnn|summar/.test(text)) return "summarization";
+  if (/classif|sentiment|distilbert|sst-2|toxic/.test(text)) return "text-classification";
+  return "text-generation";
 }
 function endpointForTask(task) {
   switch (task) {
@@ -592,10 +665,12 @@ function firstNumber(...values) {
   return null;
 }
 function parseModalities(raw, task) {
-  const architecture = raw.architecture || {};
-  const input = architecture.input_modalities || raw.input_modalities || raw.modalities?.input || taskModalities(task).input;
-  const output = architecture.output_modalities || raw.output_modalities || raw.modalities?.output || taskModalities(task).output;
-  return { input: [...new Set(input)], output: [...new Set(output)] };
+  const explicit = explicitModalities(raw);
+  const fallback = taskModalities(task);
+  return {
+    input: explicit.input || fallback.input,
+    output: explicit.output || fallback.output
+  };
 }
 function taskModalities(task) {
   switch (task) {
@@ -681,7 +756,8 @@ function normalizeModel(raw, { paidOnly = /* @__PURE__ */ new Set(), pricing = n
   if (!raw?.id || !String(raw.id).startsWith("@cf/")) return null;
   const id = String(raw.id);
   const props = propsOf(raw);
-  const task = normalizeTask(raw.task || raw.task_name || raw.type);
+  const declaredTask = resolveDeclaredTask(raw, props);
+  const task = declaredTask === "unknown" ? inferTask(raw, props) : declaredTask;
   const description = String(raw.description || "");
   const modalities = parseModalities(raw, task);
   const capabilities = inferCapabilities(raw, props, modalities, task, description);
@@ -719,7 +795,10 @@ function normalizeModel(raw, { paidOnly = /* @__PURE__ */ new Set(), pricing = n
     pricing: price || { items: [], tokens: {}, display: "\u2014", source: null },
     requires_paid: Boolean(requiresPaid),
     deprecated: Boolean(deprecated),
-    free: !requiresPaid && !deprecated,
+    // Deprecated models remain callable during Cloudflare's 3-month grace
+    // period, so they stay in the catalog (clearly flagged) instead of
+    // silently disappearing from a free user's options.
+    free: !requiresPaid,
     free_daily_output_tokens: dailyTokens,
     created_at: created ? new Date(created * 1e3).toISOString() : raw.created_at || null,
     created_unix: created,
@@ -729,16 +808,10 @@ function normalizeModel(raw, { paidOnly = /* @__PURE__ */ new Set(), pricing = n
     aliases: [id, short]
   };
 }
-function normalizeApiModel(raw, options) {
-  return normalizeModel(raw, options);
-}
-function normalizeOpenRouterModel(raw, options) {
-  return normalizeModel(raw, options);
-}
 
 // src/data/catalog-snapshot.js
 var catalog_snapshot_default = {
-  "generated_at": "2026-10-22T03:08:01.063Z",
+  "generated_at": "2026-10-22T04:40:40.185Z",
   "free_daily_neurons": 1e4,
   "pricing": {
     "models": {
@@ -2485,101 +2558,6 @@ var catalog_snapshot_default = {
       }
     },
     {
-      "id": "@cf/moonshotai/kimi-k2.7-code",
-      "name": "kimi-k2.7-code",
-      "author": "Moonshot AI",
-      "task": "text-generation",
-      "description": "Kimi K2.7 is a frontier-scale open-source 1T parameter model with a 262.1k context window, multi-turn tool calling, vision inputs, and structured outputs for agentic workloads.",
-      "context_window": 262144,
-      "max_output_tokens": null,
-      "modalities": {
-        "input": [
-          "text"
-        ],
-        "output": [
-          "text"
-        ]
-      },
-      "capabilities": {
-        "function_calling": true,
-        "reasoning": false,
-        "structured_output": true,
-        "vision": false,
-        "audio_input": false,
-        "audio_output": false,
-        "streaming": true,
-        "multilingual": false
-      },
-      "pricing": {
-        "items": [
-          {
-            "kind": "input_token",
-            "usd": 0.95,
-            "neurons": 86364,
-            "unit": "per M input tokens"
-          },
-          {
-            "kind": "cached_input_token",
-            "usd": 0.19,
-            "neurons": 17273,
-            "unit": "per M cached input tokens"
-          },
-          {
-            "kind": "output_token",
-            "usd": 4,
-            "neurons": 363636,
-            "unit": "per M output tokens"
-          }
-        ],
-        "tokens": {
-          "input_usd_per_million": 0.95,
-          "input_neurons_per_million": 86364,
-          "output_usd_per_million": 4,
-          "output_neurons_per_million": 363636,
-          "cached_input_usd_per_million": 0.19,
-          "cached_input_neurons_per_million": 17273
-        },
-        "display": "$0.95 / input \xB7 $0.19 / cached input \xB7 $4 / output",
-        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
-      },
-      "requires_paid": true,
-      "deprecated": false,
-      "free": false,
-      "free_daily_output_tokens": 27500,
-      "created_at": null,
-      "created_unix": null,
-      "docs_url": "https://developers.cloudflare.com/workers-ai/models/kimi-k2.7-code/",
-      "openai_compatible": true,
-      "endpoints": [
-        "/v1/chat/completions",
-        "/v1/run"
-      ],
-      "aliases": [
-        "@cf/moonshotai/kimi-k2.7-code",
-        "kimi-k2.7-code"
-      ],
-      "source": "docs-snapshot",
-      "performance": {
-        "score": 53.8,
-        "tier": "B",
-        "basis": [
-          "size unknown",
-          "262k context",
-          "tools",
-          "heuristic score"
-        ],
-        "components": {
-          "size": 40,
-          "capability": 56,
-          "context": 76,
-          "recency": 45,
-          "price": 77,
-          "override": null
-        },
-        "rank": 3
-      }
-    },
-    {
       "id": "@cf/moonshotai/kimi-k2.6",
       "name": "kimi-k2.6",
       "author": "Moonshot AI",
@@ -2652,6 +2630,101 @@ var catalog_snapshot_default = {
       "aliases": [
         "@cf/moonshotai/kimi-k2.6",
         "kimi-k2.6"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 53.8,
+        "tier": "B",
+        "basis": [
+          "size unknown",
+          "262k context",
+          "tools",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 56,
+          "context": 76,
+          "recency": 45,
+          "price": 77,
+          "override": null
+        },
+        "rank": 3
+      }
+    },
+    {
+      "id": "@cf/moonshotai/kimi-k2.7-code",
+      "name": "kimi-k2.7-code",
+      "author": "Moonshot AI",
+      "task": "text-generation",
+      "description": "Kimi K2.7 is a frontier-scale open-source 1T parameter model with a 262.1k context window, multi-turn tool calling, vision inputs, and structured outputs for agentic workloads.",
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": true,
+        "reasoning": false,
+        "structured_output": true,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 0.95,
+            "neurons": 86364,
+            "unit": "per M input tokens"
+          },
+          {
+            "kind": "cached_input_token",
+            "usd": 0.19,
+            "neurons": 17273,
+            "unit": "per M cached input tokens"
+          },
+          {
+            "kind": "output_token",
+            "usd": 4,
+            "neurons": 363636,
+            "unit": "per M output tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 0.95,
+          "input_neurons_per_million": 86364,
+          "output_usd_per_million": 4,
+          "output_neurons_per_million": 363636,
+          "cached_input_usd_per_million": 0.19,
+          "cached_input_neurons_per_million": 17273
+        },
+        "display": "$0.95 / input \xB7 $0.19 / cached input \xB7 $4 / output",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": true,
+      "deprecated": false,
+      "free": false,
+      "free_daily_output_tokens": 27500,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/kimi-k2.7-code/",
+      "openai_compatible": true,
+      "endpoints": [
+        "/v1/chat/completions",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/moonshotai/kimi-k2.7-code",
+        "kimi-k2.7-code"
       ],
       "source": "docs-snapshot",
       "performance": {
@@ -3532,11 +3605,11 @@ var catalog_snapshot_default = {
       }
     },
     {
-      "id": "@cf/deepgram/aura-2-en",
-      "name": "aura-2-en",
+      "id": "@cf/deepgram/aura-1",
+      "name": "aura-1",
       "author": "Deepgram",
       "task": "text-to-speech",
-      "description": "Aura-2 is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
+      "description": "Aura is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
       "context_window": null,
       "max_output_tokens": null,
       "modalities": {
@@ -3561,13 +3634,13 @@ var catalog_snapshot_default = {
         "items": [
           {
             "kind": "character",
-            "usd": 0.03,
-            "neurons": 2727.27,
+            "usd": 0.015,
+            "neurons": 1,
             "unit": "per 1k characters input"
           }
         ],
         "tokens": {},
-        "display": "$0.03 / 1k chars",
+        "display": "$0.015 / 1k chars",
         "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
       },
       "requires_paid": false,
@@ -3576,15 +3649,15 @@ var catalog_snapshot_default = {
       "free_daily_output_tokens": null,
       "created_at": null,
       "created_unix": null,
-      "docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-2-en/",
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-1/",
       "openai_compatible": false,
       "endpoints": [
         "/v1/audio/speech",
         "/v1/run"
       ],
       "aliases": [
-        "@cf/deepgram/aura-2-en",
-        "aura-2-en"
+        "@cf/deepgram/aura-1",
+        "aura-1"
       ],
       "source": "docs-snapshot",
       "performance": {
@@ -3682,11 +3755,11 @@ var catalog_snapshot_default = {
       }
     },
     {
-      "id": "@cf/deepgram/aura-1",
-      "name": "aura-1",
+      "id": "@cf/deepgram/aura-2-en",
+      "name": "aura-2-en",
       "author": "Deepgram",
       "task": "text-to-speech",
-      "description": "Aura is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
+      "description": "Aura-2 is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
       "context_window": null,
       "max_output_tokens": null,
       "modalities": {
@@ -3711,13 +3784,13 @@ var catalog_snapshot_default = {
         "items": [
           {
             "kind": "character",
-            "usd": 0.015,
-            "neurons": 1,
+            "usd": 0.03,
+            "neurons": 2727.27,
             "unit": "per 1k characters input"
           }
         ],
         "tokens": {},
-        "display": "$0.015 / 1k chars",
+        "display": "$0.03 / 1k chars",
         "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
       },
       "requires_paid": false,
@@ -3726,15 +3799,15 @@ var catalog_snapshot_default = {
       "free_daily_output_tokens": null,
       "created_at": null,
       "created_unix": null,
-      "docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-1/",
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-2-en/",
       "openai_compatible": false,
       "endpoints": [
         "/v1/audio/speech",
         "/v1/run"
       ],
       "aliases": [
-        "@cf/deepgram/aura-1",
-        "aura-1"
+        "@cf/deepgram/aura-2-en",
+        "aura-2-en"
       ],
       "source": "docs-snapshot",
       "performance": {
@@ -4571,6 +4644,83 @@ var catalog_snapshot_default = {
       }
     },
     {
+      "id": "@cf/baai/bge-reranker-base",
+      "name": "bge-reranker-base",
+      "author": "BAAI",
+      "task": "text-classification",
+      "description": '"Different from embedding model, reranker uses question and document as input and directly output similarity instead of embedding. You can get a relevance score by inputting query and passage to the reranker. And the score can be mapped to a float value in [0,1] by sigmoid function.\\n\\n"',
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "input_token",
+            "usd": 3e-3,
+            "neurons": 283,
+            "unit": "per M input tokens"
+          }
+        ],
+        "tokens": {
+          "input_usd_per_million": 3e-3,
+          "input_neurons_per_million": 283
+        },
+        "display": "$0.003 / input",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": 35335689,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/bge-reranker-base/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/baai/bge-reranker-base",
+        "bge-reranker-base"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 28
+      }
+    },
+    {
       "id": "@cf/baai/bge-large-en-v1.5",
       "name": "bge-large-en-v1.5",
       "author": "BAAI",
@@ -4627,83 +4777,6 @@ var catalog_snapshot_default = {
       "aliases": [
         "@cf/baai/bge-large-en-v1.5",
         "bge-large-en-v1.5"
-      ],
-      "source": "docs-snapshot",
-      "performance": {
-        "score": 37.3,
-        "tier": "C",
-        "basis": [
-          "size unknown",
-          "context unknown",
-          "heuristic score"
-        ],
-        "components": {
-          "size": 40,
-          "capability": 30,
-          "context": 30,
-          "recency": 45,
-          "price": 45,
-          "override": null
-        },
-        "rank": 28
-      }
-    },
-    {
-      "id": "@cf/baai/bge-reranker-base",
-      "name": "bge-reranker-base",
-      "author": "BAAI",
-      "task": "text-classification",
-      "description": '"Different from embedding model, reranker uses question and document as input and directly output similarity instead of embedding. You can get a relevance score by inputting query and passage to the reranker. And the score can be mapped to a float value in [0,1] by sigmoid function.\\n\\n"',
-      "context_window": null,
-      "max_output_tokens": null,
-      "modalities": {
-        "input": [
-          "text"
-        ],
-        "output": [
-          "text"
-        ]
-      },
-      "capabilities": {
-        "function_calling": false,
-        "reasoning": false,
-        "structured_output": false,
-        "vision": false,
-        "audio_input": false,
-        "audio_output": false,
-        "streaming": true,
-        "multilingual": false
-      },
-      "pricing": {
-        "items": [
-          {
-            "kind": "input_token",
-            "usd": 3e-3,
-            "neurons": 283,
-            "unit": "per M input tokens"
-          }
-        ],
-        "tokens": {
-          "input_usd_per_million": 3e-3,
-          "input_neurons_per_million": 283
-        },
-        "display": "$0.003 / input",
-        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
-      },
-      "requires_paid": false,
-      "deprecated": false,
-      "free": true,
-      "free_daily_output_tokens": 35335689,
-      "created_at": null,
-      "created_unix": null,
-      "docs_url": "https://developers.cloudflare.com/workers-ai/models/bge-reranker-base/",
-      "openai_compatible": false,
-      "endpoints": [
-        "/v1/run"
-      ],
-      "aliases": [
-        "@cf/baai/bge-reranker-base",
-        "bge-reranker-base"
       ],
       "source": "docs-snapshot",
       "performance": {
@@ -4804,74 +4877,6 @@ var catalog_snapshot_default = {
       }
     },
     {
-      "id": "@cf/google/embeddinggemma-300m",
-      "name": "embeddinggemma-300m",
-      "author": "Google",
-      "task": "text-embeddings",
-      "description": "EmbeddingGemma is a 300M parameter, state-of-the-art for its size, open embedding model from Google, built from Gemma 3 (with T5Gemma initialization) and the same research and technology used to create Gemini models. EmbeddingGemma produces vector representations of text, making it well-suited for search and retrieval tasks, including classification, clustering, and semantic similarity search. This model was trained with data in 100+ spoken languages.",
-      "context_window": null,
-      "max_output_tokens": null,
-      "modalities": {
-        "input": [
-          "text"
-        ],
-        "output": [
-          "text"
-        ]
-      },
-      "capabilities": {
-        "function_calling": false,
-        "reasoning": false,
-        "structured_output": false,
-        "vision": false,
-        "audio_input": false,
-        "audio_output": false,
-        "streaming": true,
-        "multilingual": false
-      },
-      "pricing": {
-        "items": [],
-        "tokens": {},
-        "display": "\u2014",
-        "source": null
-      },
-      "requires_paid": false,
-      "deprecated": false,
-      "free": true,
-      "free_daily_output_tokens": null,
-      "created_at": null,
-      "created_unix": null,
-      "docs_url": "https://developers.cloudflare.com/workers-ai/models/embeddinggemma-300m/",
-      "openai_compatible": true,
-      "endpoints": [
-        "/v1/embeddings",
-        "/v1/run"
-      ],
-      "aliases": [
-        "@cf/google/embeddinggemma-300m",
-        "embeddinggemma-300m"
-      ],
-      "source": "docs-snapshot",
-      "performance": {
-        "score": 37.3,
-        "tier": "C",
-        "basis": [
-          "size unknown",
-          "context unknown",
-          "heuristic score"
-        ],
-        "components": {
-          "size": 40,
-          "capability": 30,
-          "context": 30,
-          "recency": 45,
-          "price": 45,
-          "override": null
-        },
-        "rank": 31
-      }
-    },
-    {
       "id": "@cf/huggingface/distilbert-sst-2-int8",
       "name": "distilbert-sst-2-int8",
       "author": "HuggingFace",
@@ -4945,7 +4950,7 @@ var catalog_snapshot_default = {
           "price": 45,
           "override": null
         },
-        "rank": 32
+        "rank": 31
       }
     },
     {
@@ -5013,15 +5018,15 @@ var catalog_snapshot_default = {
           "price": 45,
           "override": null
         },
-        "rank": 33
+        "rank": 32
       }
     },
     {
-      "id": "@cf/black-forest-labs/flux-1-schnell",
-      "name": "flux-1-schnell",
-      "author": "Black Forest Labs",
-      "task": "text-to-image",
-      "description": '"FLUX.1 [schnell] is a 12 billion parameter rectified flow transformer capable of generating images from text descriptions. "',
+      "id": "@cf/google/embeddinggemma-300m",
+      "name": "embeddinggemma-300m",
+      "author": "Google",
+      "task": "text-embeddings",
+      "description": "EmbeddingGemma is a 300M parameter, state-of-the-art for its size, open embedding model from Google, built from Gemma 3 (with T5Gemma initialization) and the same research and technology used to create Gemini models. EmbeddingGemma produces vector representations of text, making it well-suited for search and retrieval tasks, including classification, clustering, and semantic similarity search. This model was trained with data in 100+ spoken languages.",
       "context_window": null,
       "max_output_tokens": null,
       "modalities": {
@@ -5029,7 +5034,7 @@ var catalog_snapshot_default = {
           "text"
         ],
         "output": [
-          "image"
+          "text"
         ]
       },
       "capabilities": {
@@ -5043,23 +5048,10 @@ var catalog_snapshot_default = {
         "multilingual": false
       },
       "pricing": {
-        "items": [
-          {
-            "kind": "image_tile",
-            "usd": 528e-7,
-            "neurons": 4.8,
-            "unit": "per 512x512 tile"
-          },
-          {
-            "kind": "step",
-            "usd": 1056e-7,
-            "neurons": 9.6,
-            "unit": "per step"
-          }
-        ],
+        "items": [],
         "tokens": {},
-        "display": "$0.0000528 / tile \xB7 $0.0001056 / step",
-        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+        "display": "\u2014",
+        "source": null
       },
       "requires_paid": false,
       "deprecated": false,
@@ -5067,15 +5059,15 @@ var catalog_snapshot_default = {
       "free_daily_output_tokens": null,
       "created_at": null,
       "created_unix": null,
-      "docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-1-schnell/",
-      "openai_compatible": false,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/embeddinggemma-300m/",
+      "openai_compatible": true,
       "endpoints": [
-        "/v1/images/generations",
+        "/v1/embeddings",
         "/v1/run"
       ],
       "aliases": [
-        "@cf/black-forest-labs/flux-1-schnell",
-        "flux-1-schnell"
+        "@cf/google/embeddinggemma-300m",
+        "embeddinggemma-300m"
       ],
       "source": "docs-snapshot",
       "performance": {
@@ -5094,7 +5086,7 @@ var catalog_snapshot_default = {
           "price": 45,
           "override": null
         },
-        "rank": 34
+        "rank": 33
       }
     },
     {
@@ -5157,6 +5149,87 @@ var catalog_snapshot_default = {
       "aliases": [
         "@cf/black-forest-labs/flux-2-dev",
         "flux-2-dev"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 34
+      }
+    },
+    {
+      "id": "@cf/black-forest-labs/flux-1-schnell",
+      "name": "flux-1-schnell",
+      "author": "Black Forest Labs",
+      "task": "text-to-image",
+      "description": '"FLUX.1 [schnell] is a 12 billion parameter rectified flow transformer capable of generating images from text descriptions. "',
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "image_tile",
+            "usd": 528e-7,
+            "neurons": 4.8,
+            "unit": "per 512x512 tile"
+          },
+          {
+            "kind": "step",
+            "usd": 1056e-7,
+            "neurons": 9.6,
+            "unit": "per step"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.0000528 / tile \xB7 $0.0001056 / step",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-1-schnell/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/black-forest-labs/flux-1-schnell",
+        "flux-1-schnell"
       ],
       "source": "docs-snapshot",
       "performance": {
@@ -5415,74 +5488,6 @@ var catalog_snapshot_default = {
       }
     },
     {
-      "id": "@cf/runwayml/stable-diffusion-v1-5-inpainting",
-      "name": "stable-diffusion-v1-5-inpainting",
-      "author": "RunwayML",
-      "task": "text-to-image",
-      "description": "Stable Diffusion Inpainting is a latent text-to-image diffusion model capable of generating photo-realistic images given any text input, with the extra capability of inpainting the pictures by using a mask.",
-      "context_window": null,
-      "max_output_tokens": null,
-      "modalities": {
-        "input": [
-          "text"
-        ],
-        "output": [
-          "image"
-        ]
-      },
-      "capabilities": {
-        "function_calling": false,
-        "reasoning": false,
-        "structured_output": false,
-        "vision": false,
-        "audio_input": false,
-        "audio_output": false,
-        "streaming": true,
-        "multilingual": false
-      },
-      "pricing": {
-        "items": [],
-        "tokens": {},
-        "display": "\u2014",
-        "source": null
-      },
-      "requires_paid": false,
-      "deprecated": false,
-      "free": true,
-      "free_daily_output_tokens": null,
-      "created_at": null,
-      "created_unix": null,
-      "docs_url": "https://developers.cloudflare.com/workers-ai/models/stable-diffusion-v1-5-inpainting/",
-      "openai_compatible": false,
-      "endpoints": [
-        "/v1/images/generations",
-        "/v1/run"
-      ],
-      "aliases": [
-        "@cf/runwayml/stable-diffusion-v1-5-inpainting",
-        "stable-diffusion-v1-5-inpainting"
-      ],
-      "source": "docs-snapshot",
-      "performance": {
-        "score": 37.3,
-        "tier": "C",
-        "basis": [
-          "size unknown",
-          "context unknown",
-          "heuristic score"
-        ],
-        "components": {
-          "size": 40,
-          "capability": 30,
-          "context": 30,
-          "recency": 45,
-          "price": 45,
-          "override": null
-        },
-        "rank": 39
-      }
-    },
-    {
       "id": "@cf/microsoft/resnet-50",
       "name": "resnet-50",
       "author": "Microsoft",
@@ -5553,7 +5558,7 @@ var catalog_snapshot_default = {
           "price": 45,
           "override": null
         },
-        "rank": 40
+        "rank": 39
       }
     },
     {
@@ -5621,7 +5626,7 @@ var catalog_snapshot_default = {
           "price": 45,
           "override": null
         },
-        "rank": 41
+        "rank": 40
       }
     },
     {
@@ -5671,6 +5676,74 @@ var catalog_snapshot_default = {
       "aliases": [
         "@cf/bytedance/stable-diffusion-xl-lightning",
         "stable-diffusion-xl-lightning"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 37.3,
+        "tier": "C",
+        "basis": [
+          "size unknown",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 40,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 41
+      }
+    },
+    {
+      "id": "@cf/runwayml/stable-diffusion-v1-5-inpainting",
+      "name": "stable-diffusion-v1-5-inpainting",
+      "author": "RunwayML",
+      "task": "text-to-image",
+      "description": "Stable Diffusion Inpainting is a latent text-to-image diffusion model capable of generating photo-realistic images given any text input, with the extra capability of inpainting the pictures by using a mask.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [],
+        "tokens": {},
+        "display": "\u2014",
+        "source": null
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/stable-diffusion-v1-5-inpainting/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/runwayml/stable-diffusion-v1-5-inpainting",
+        "stable-diffusion-v1-5-inpainting"
       ],
       "source": "docs-snapshot",
       "performance": {
@@ -7348,6 +7421,87 @@ var catalog_snapshot_default = {
       }
     },
     {
+      "id": "@cf/black-forest-labs/flux-2-klein-4b",
+      "name": "flux-2-klein-4b",
+      "author": "Black Forest Labs",
+      "task": "text-to-image",
+      "description": "FLUX.2 [klein] is an ultra-fast, distilled image model. It unifies image generation and editing in a single model, delivering state-of-the-art quality enabling interactive workflows, real-time previews, and latency-critical applications.",
+      "context_window": null,
+      "max_output_tokens": null,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "image"
+        ]
+      },
+      "capabilities": {
+        "function_calling": false,
+        "reasoning": false,
+        "structured_output": false,
+        "vision": false,
+        "audio_input": false,
+        "audio_output": false,
+        "streaming": true,
+        "multilingual": false
+      },
+      "pricing": {
+        "items": [
+          {
+            "kind": "image_tile",
+            "usd": 59e-6,
+            "neurons": 5.37,
+            "unit": "per input 512x512 tile"
+          },
+          {
+            "kind": "image_tile",
+            "usd": 287e-6,
+            "neurons": 26.05,
+            "unit": "per output 512x512 tile"
+          }
+        ],
+        "tokens": {},
+        "display": "$0.000059 / tile \xB7 $0.000287 / tile",
+        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+      },
+      "requires_paid": false,
+      "deprecated": false,
+      "free": true,
+      "free_daily_output_tokens": null,
+      "created_at": null,
+      "created_unix": null,
+      "docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/",
+      "openai_compatible": false,
+      "endpoints": [
+        "/v1/images/generations",
+        "/v1/run"
+      ],
+      "aliases": [
+        "@cf/black-forest-labs/flux-2-klein-4b",
+        "flux-2-klein-4b"
+      ],
+      "source": "docs-snapshot",
+      "performance": {
+        "score": 23.3,
+        "tier": "D",
+        "basis": [
+          "4B parameters",
+          "context unknown",
+          "heuristic score"
+        ],
+        "components": {
+          "size": 0,
+          "capability": 30,
+          "context": 30,
+          "recency": 45,
+          "price": 45,
+          "override": null
+        },
+        "rank": 63
+      }
+    },
+    {
       "id": "@cf/black-forest-labs/flux-2-klein-9b",
       "name": "flux-2-klein-9b",
       "author": "Black Forest Labs",
@@ -7420,87 +7574,6 @@ var catalog_snapshot_default = {
         "tier": "D",
         "basis": [
           "9B parameters",
-          "context unknown",
-          "heuristic score"
-        ],
-        "components": {
-          "size": 0,
-          "capability": 30,
-          "context": 30,
-          "recency": 45,
-          "price": 45,
-          "override": null
-        },
-        "rank": 63
-      }
-    },
-    {
-      "id": "@cf/black-forest-labs/flux-2-klein-4b",
-      "name": "flux-2-klein-4b",
-      "author": "Black Forest Labs",
-      "task": "text-to-image",
-      "description": "FLUX.2 [klein] is an ultra-fast, distilled image model. It unifies image generation and editing in a single model, delivering state-of-the-art quality enabling interactive workflows, real-time previews, and latency-critical applications.",
-      "context_window": null,
-      "max_output_tokens": null,
-      "modalities": {
-        "input": [
-          "text"
-        ],
-        "output": [
-          "image"
-        ]
-      },
-      "capabilities": {
-        "function_calling": false,
-        "reasoning": false,
-        "structured_output": false,
-        "vision": false,
-        "audio_input": false,
-        "audio_output": false,
-        "streaming": true,
-        "multilingual": false
-      },
-      "pricing": {
-        "items": [
-          {
-            "kind": "image_tile",
-            "usd": 59e-6,
-            "neurons": 5.37,
-            "unit": "per input 512x512 tile"
-          },
-          {
-            "kind": "image_tile",
-            "usd": 287e-6,
-            "neurons": 26.05,
-            "unit": "per output 512x512 tile"
-          }
-        ],
-        "tokens": {},
-        "display": "$0.000059 / tile \xB7 $0.000287 / tile",
-        "source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
-      },
-      "requires_paid": false,
-      "deprecated": false,
-      "free": true,
-      "free_daily_output_tokens": null,
-      "created_at": null,
-      "created_unix": null,
-      "docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/",
-      "openai_compatible": false,
-      "endpoints": [
-        "/v1/images/generations",
-        "/v1/run"
-      ],
-      "aliases": [
-        "@cf/black-forest-labs/flux-2-klein-4b",
-        "flux-2-klein-4b"
-      ],
-      "source": "docs-snapshot",
-      "performance": {
-        "score": 23.3,
-        "tier": "D",
-        "basis": [
-          "4B parameters",
           "context unknown",
           "heuristic score"
         ],
@@ -8203,7 +8276,7 @@ var catalog_snapshot_default = {
 };
 
 // src/catalog/index.js
-var CATALOG_KEY = "catalog:cache:v2";
+var CATALOG_KEY = "catalog:cache:v3";
 var PRICING_KEY = "pricing:cache:v2";
 var CATALOG_TTL_MS = 15 * 60 * 1e3;
 var PRICING_TTL_MS = 6 * 60 * 60 * 1e3;
@@ -8236,7 +8309,7 @@ async function fetchModelsPage(account, page, format) {
     per_page: "100",
     page: String(page),
     hide_experimental: "false",
-    include_deprecated: "false"
+    include_deprecated: "true"
   });
   if (format) params.set("format", format);
   const url = `https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/models/search?${params}`;
@@ -8246,37 +8319,54 @@ async function fetchModelsPage(account, page, format) {
       Accept: "application/json"
     }
   });
-  return {
-    models: Array.isArray(data.result) ? data.result : Array.isArray(data.data) ? data.data : [],
-    openrouter: format === "openrouter" || Array.isArray(data.data)
-  };
+  return Array.isArray(data.result) ? data.result : Array.isArray(data.data) ? data.data : [];
+}
+async function fetchFormat(account, format) {
+  const models = [];
+  for (let page = 1; page <= 10; page += 1) {
+    const pageModels = await fetchModelsPage(account, page, format);
+    models.push(...pageModels);
+    if (pageModels.length < 100) break;
+  }
+  return models;
+}
+function mergeFormats(native, openrouter) {
+  const byId = /* @__PURE__ */ new Map();
+  for (const raw of openrouter) {
+    if (raw?.id) byId.set(String(raw.id), { ...raw });
+  }
+  for (const raw of native) {
+    if (!raw?.id) continue;
+    const key = String(raw.id);
+    const existing = byId.get(key);
+    byId.set(key, existing ? { ...existing, ...raw } : { ...raw });
+  }
+  return [...byId.values()];
 }
 async function fetchAllModels(env) {
   const accounts = shuffle(await getActiveAccounts(env)).slice(0, 3);
   if (accounts.length === 0) throw new Error("No active Cloudflare account configured");
   let lastError = null;
   for (const account of accounts) {
-    for (const format of ["openrouter", null]) {
-      try {
-        const models = [];
-        let openrouter = false;
-        for (let page = 1; page <= 10; page += 1) {
-          const result = await fetchModelsPage(account, page, format);
-          openrouter = result.openrouter;
-          models.push(...result.models);
-          if (result.models.length < 100) break;
-        }
-        if (models.length > 0) {
-          return {
-            models,
-            openrouter,
-            account: { id: account.id, name: account.name, accountId: account.accountId }
-          };
-        }
-      } catch (error) {
-        lastError = error;
-      }
+    const [nativeResult, openrouterResult] = await Promise.allSettled([
+      fetchFormat(account, null),
+      fetchFormat(account, "openrouter")
+    ]);
+    const native = nativeResult.status === "fulfilled" ? nativeResult.value : [];
+    const openrouter = openrouterResult.status === "fulfilled" ? openrouterResult.value : [];
+    const models = mergeFormats(native, openrouter);
+    if (models.length > 0) {
+      return {
+        models,
+        formats: {
+          native: native.length,
+          openrouter: openrouter.length,
+          merged: models.length
+        },
+        account: { id: account.id, name: account.name, accountId: account.accountId }
+      };
     }
+    lastError = nativeResult.status === "rejected" ? nativeResult.reason : openrouterResult.status === "rejected" ? openrouterResult.reason : lastError;
   }
   throw lastError || new Error("Unable to fetch models");
 }
@@ -8311,6 +8401,14 @@ function snapshotById() {
   for (const model of catalog_snapshot_default.models || []) map.set(model.id, model);
   return map;
 }
+function tally(models, key) {
+  const out = {};
+  for (const model of models) {
+    const value = model[key] || "unknown";
+    out[value] = (out[value] || 0) + 1;
+  }
+  return out;
+}
 function mergeWithSnapshot(model, snapshotMap) {
   const base = snapshotMap.get(model.id);
   if (!base) return model;
@@ -8325,6 +8423,7 @@ function mergeWithSnapshot(model, snapshotMap) {
     capabilities: { ...base.capabilities || {}, ...model.capabilities || {} },
     pricing: model.pricing?.items?.length ? model.pricing : base.pricing,
     requires_paid: model.requires_paid || base.requires_paid,
+    deprecated: Boolean(model.deprecated || base.deprecated),
     free: model.free && base.free !== false,
     free_daily_output_tokens: model.free_daily_output_tokens || base.free_daily_output_tokens,
     aliases: [.../* @__PURE__ */ new Set([...base.aliases || [], ...model.aliases || []])]
@@ -8350,8 +8449,7 @@ async function buildCatalog(env) {
   let models = [];
   let source = "bundled-snapshot";
   if (live?.models?.length) {
-    const normalize2 = live.openrouter ? normalizeOpenRouterModel : normalizeApiModel;
-    models = live.models.map((raw) => normalize2(raw, {
+    models = live.models.map((raw) => normalizeModel(raw, {
       paidOnly,
       pricing: pricingMap[String(raw.id)],
       freeQuota
@@ -8363,29 +8461,31 @@ async function buildCatalog(env) {
       ...model,
       pricing: pricingMap[model.id] || model.pricing,
       requires_paid: model.requires_paid || paidOnly.has(model.id),
-      free: !(model.requires_paid || paidOnly.has(model.id)) && !model.deprecated
+      free: !(model.requires_paid || paidOnly.has(model.id))
     }));
   }
   const byId = /* @__PURE__ */ new Map();
   for (const model of models) {
     const merged = mergeWithSnapshot(model, snapshotMap);
     merged.requires_paid = Boolean(merged.requires_paid || paidOnly.has(merged.id));
-    merged.free = !merged.requires_paid && !merged.deprecated;
+    merged.free = !merged.requires_paid;
     byId.set(merged.id, merged);
   }
   for (const base of catalog_snapshot_default.models || []) {
-    if (!byId.has(base.id)) {
-      const requiresPaid = base.requires_paid || paidOnly.has(base.id);
-      byId.set(base.id, {
-        ...base,
-        pricing: pricingMap[base.id] || base.pricing,
-        requires_paid: requiresPaid,
-        free: !requiresPaid && !base.deprecated
-      });
-    }
+    if (byId.has(base.id)) continue;
+    const requiresPaid = base.requires_paid || paidOnly.has(base.id);
+    if (!requiresPaid) continue;
+    byId.set(base.id, {
+      ...base,
+      pricing: pricingMap[base.id] || base.pricing,
+      requires_paid: true,
+      free: false
+    });
   }
   const ranked = rankModels([...byId.values()], settings.benchmarks || {});
   const now = Date.now();
+  const authors = tally(ranked, "author");
+  const tasks = tally(ranked, "task");
   return {
     models: ranked,
     meta: {
@@ -8399,8 +8499,13 @@ async function buildCatalog(env) {
       total_models: ranked.length,
       free_models: ranked.filter((model) => model.free).length,
       paid_models: ranked.filter((model) => model.requires_paid).length,
+      deprecated_models: ranked.filter((model) => model.deprecated).length,
+      partner_models: ranked.filter((model) => model.author && model.author !== "Cloudflare").length,
+      authors,
+      tasks,
+      formats: live?.formats || null,
       account: live?.account || null,
-      stale: false,
+      stale: source !== "cloudflare-models-api",
       version: catalog_snapshot_default.generated_at || null
     }
   };
@@ -8437,15 +8542,20 @@ async function getCatalog(env, ctx, { force = false } = {}) {
     return await refresh(env);
   } catch (error) {
     if (cached) return { ...cached, meta: { ...cached.meta, stale: true, error: error.message } };
+    const models = (catalog_snapshot_default.models || []).map((model) => ({ ...model }));
     return {
-      models: (catalog_snapshot_default.models || []).map((model) => ({ ...model })),
+      models,
       meta: {
         source: "bundled-snapshot",
         fetched_at: Date.now(),
         free_daily_neurons: 1e4,
-        total_models: (catalog_snapshot_default.models || []).length,
-        free_models: (catalog_snapshot_default.models || []).filter((model) => model.free).length,
-        paid_models: (catalog_snapshot_default.models || []).filter((model) => model.requires_paid).length,
+        total_models: models.length,
+        free_models: models.filter((model) => model.free).length,
+        paid_models: models.filter((model) => model.requires_paid).length,
+        deprecated_models: models.filter((model) => model.deprecated).length,
+        partner_models: models.filter((model) => model.author && model.author !== "Cloudflare").length,
+        authors: tally(models, "author"),
+        tasks: tally(models, "task"),
         stale: true,
         error: error.message
       }
@@ -8474,6 +8584,8 @@ function publicModel(model) {
     created: model.created_unix || 0,
     owned_by: model.author || "cloudflare",
     name: model.name,
+    description: model.description,
+    created_at: model.created_at,
     task: model.task,
     context_window: model.context_window,
     max_output_tokens: model.max_output_tokens,
@@ -8482,6 +8594,7 @@ function publicModel(model) {
     pricing: model.pricing,
     free: model.free,
     requires_paid: model.requires_paid,
+    deprecated: model.deprecated,
     free_daily_output_tokens: model.free_daily_output_tokens,
     performance: model.performance,
     endpoints: model.endpoints,
@@ -8546,6 +8659,12 @@ async function catalogResponse(env, ctx, {
   };
   models = [...models].sort(sorters[sort] || sorters.performance);
   if (limit) models = models.slice(0, limit);
+  if (sort === "performance") {
+    models = models.map((model, index) => ({
+      ...model,
+      performance: { ...model.performance || {}, rank: index + 1 }
+    }));
+  }
   return {
     object: "list",
     data: models.map(publicModel),
@@ -10189,93 +10308,407 @@ data: ${JSON.stringify(data)}
   return result.response.body.pipeThrough(transform);
 }
 
+// src/ui/i18n.js
+var LANGS = ["zh", "en"];
+var DEFAULT_LANG = "zh";
+var DICT = {
+  "brand.name": { zh: "Workers AI2API", en: "Workers AI2API" },
+  "nav.admin": { zh: "\u7BA1\u7406", en: "Admin" },
+  "nav.status.checking": { zh: "\u68C0\u6D4B\u4E2D", en: "checking" },
+  "nav.status.live": { zh: "\u76EE\u5F55\u5B9E\u65F6", en: "catalog live" },
+  "nav.status.cached": { zh: "\u76EE\u5F55\u7F13\u5B58", en: "catalog cached" },
+  "nav.status.offline": { zh: "\u79BB\u7EBF", en: "offline" },
+  "nav.lang.zh": { zh: "\u4E2D\u6587", en: "\u4E2D\u6587" },
+  "nav.lang.en": { zh: "EN", en: "EN" },
+  "common.copy": { zh: "\u590D\u5236", en: "Copy" },
+  "common.copied": { zh: "\u5DF2\u590D\u5236", en: "Copied" },
+  "common.loading": { zh: "\u52A0\u8F7D\u4E2D\u2026", en: "Loading\u2026" },
+  "common.refresh": { zh: "\u5237\u65B0", en: "Refresh" },
+  "common.refreshing": { zh: "\u5237\u65B0\u4E2D\u2026", en: "Refreshing\u2026" },
+  "common.save": { zh: "\u4FDD\u5B58\u8BBE\u7F6E", en: "Save settings" },
+  "common.allTasks": { zh: "\u5168\u90E8\u4EFB\u52A1", en: "All tasks" },
+  "common.search": { zh: "\u641C\u7D22\u6A21\u578B\u2026", en: "Search models\u2026" },
+  "common.noData": { zh: "\u6682\u65E0\u6570\u636E", en: "No data yet" },
+  "common.close": { zh: "\u5173\u95ED", en: "Close" },
+  "common.enable": { zh: "\u542F\u7528", en: "Enable" },
+  "common.disable": { zh: "\u7981\u7528", en: "Disable" },
+  "common.delete": { zh: "\u5220\u9664", en: "Delete" },
+  "common.active": { zh: "\u542F\u7528", en: "active" },
+  "common.disabled": { zh: "\u5DF2\u7981\u7528", en: "disabled" },
+  "common.never": { zh: "\u4ECE\u672A", en: "never" },
+  "common.set": { zh: "\u5DF2\u8BBE\u7F6E", en: "set" },
+  "common.missing": { zh: "\u672A\u8BBE\u7F6E", en: "missing" },
+  "common.bound": { zh: "\u5DF2\u7ED1\u5B9A", en: "bound" },
+  "common.deprecated": { zh: "\u5DF2\u5F03\u7528", en: "deprecated" },
+  "common.paidOnly": { zh: "\u9700\u4ED8\u8D39\u8BA1\u5212", en: "paid plan" },
+  "common.free": { zh: "\u514D\u8D39", en: "free" },
+  "landing.title": { zh: "Workers AI2API \u2014 OpenAI \u517C\u5BB9\u7684 Workers AI \u7F51\u5173", en: "Workers AI2API \u2014 OpenAI-compatible Workers AI gateway" },
+  "landing.metaDesc": { zh: "\u628A\u5168\u90E8\u514D\u8D39 Cloudflare Workers AI \u6A21\u578B\u5C01\u88C5\u4E3A\u4E00\u4E2A OpenAI \u517C\u5BB9\u63A5\u53E3\u3002", en: "OpenAI-compatible gateway for every free Cloudflare Workers AI model." },
+  "landing.eyebrow": { zh: "\u72EC\u7ACB\u9879\u76EE \xB7 Cloudflare Workers AI", en: "Independent \xB7 Cloudflare Workers AI" },
+  "landing.h1": { zh: "\u6240\u6709\u514D\u8D39\u7684 Workers AI \u6A21\u578B\u3002<br>\u4E00\u4E2A OpenAI \u517C\u5BB9\u7AEF\u70B9\u3002", en: "Every free Workers AI model.<br>One OpenAI-compatible endpoint." },
+  "landing.lead": { zh: "\u52A8\u6001\u6A21\u578B\u76EE\u5F55\u3001\u6309\u8D26\u53F7\u6838\u7B97\u7684\u514D\u8D39 Neurons\u3001\u6D41\u5F0F\u5BF9\u8BDD\u3001\u5411\u91CF\u3001\u56FE\u50CF\u3001\u8BED\u97F3\u4E0E Anthropic Messages\uFF0C\u5168\u90E8\u8DD1\u5728\u8FB9\u7F18\u7F51\u7EDC\u3002", en: "A dynamic model catalog, per-account free-neuron accounting, and streaming chat, embeddings, images, audio and Anthropic Messages \u2014 deployed at the edge." },
+  "landing.stat.freeModels": { zh: "\u514D\u8D39\u6A21\u578B \xB7 \u76EE\u5F55", en: "free models, catalog" },
+  "landing.stat.neurons": { zh: "\u6BCF\u8D26\u53F7\u6BCF\u65E5\u514D\u8D39 Neurons", en: "free neurons / account / day" },
+  "landing.stat.accounts": { zh: "\u5DF2\u63A5\u5165\u8D26\u53F7", en: "accounts connected" },
+  "landing.stat.usage": { zh: "\u4ECA\u65E5\u989D\u5EA6\u5DF2\u7528", en: "of daily quota used" },
+  "landing.ledger.title": { zh: "\u514D\u8D39\u989D\u5EA6\u8D26\u672C", en: "Free tier ledger" },
+  "landing.ledger.caption": { zh: "\u6BCF\u8D26\u53F7 \xB7 \u6BCF\u65E5 \xB7 UTC 00:00 \u91CD\u7F6E", en: "per account \xB7 per day \xB7 resets 00:00 UTC" },
+  "landing.ledger.backend": { zh: "\u8BB0\u8D26\u540E\u7AEF", en: "quota backend" },
+  "landing.ledger.remaining": { zh: "\u5269\u4F59 Neurons", en: "neurons remaining" },
+  "landing.ledger.note": { zh: "\u786C\u4E0A\u9650\uFF1A\u9884\u7559 + \u7ED3\u7B97\uFF0C\u6C38\u8FDC\u4E0D\u8D8A\u8FC7 10,000 Neurons\u3002", en: "Hard ceiling: reserve, then settle. Never past 10,000 neurons." },
+  "landing.catalog.title": { zh: "\u514D\u8D39\u6A21\u578B\u76EE\u5F55", en: "Free model catalog" },
+  "landing.catalog.sub": { zh: "\u542B Cloudflare \u6258\u7BA1\u4E0E\u7B2C\u4E09\u65B9\u5408\u4F5C\u6A21\u578B", en: "Cloudflare-hosted and partner models" },
+  "landing.sort.performance": { zh: "\u6027\u80FD", en: "Performance" },
+  "landing.sort.price": { zh: "\u4EF7\u683C", en: "Price" },
+  "landing.sort.context": { zh: "\u4E0A\u4E0B\u6587", en: "Context" },
+  "landing.sort.name": { zh: "\u540D\u79F0", en: "Name" },
+  "landing.sort.updated": { zh: "\u66F4\u65B0\u65F6\u95F4", en: "Updated" },
+  "landing.table.model": { zh: "\u6A21\u578B", en: "Model" },
+  "landing.table.task": { zh: "\u4EFB\u52A1", en: "Task" },
+  "landing.table.context": { zh: "\u4E0A\u4E0B\u6587", en: "Context" },
+  "landing.table.caps": { zh: "\u80FD\u529B", en: "Capabilities" },
+  "landing.table.price": { zh: "\u4EF7\u683C\uFF08USD\uFF09", en: "Price (USD)" },
+  "landing.table.daily": { zh: "\u514D\u8D39\u65E5\u8F93\u51FA", en: "Free daily output" },
+  "landing.table.tier": { zh: "\u7B49\u7EA7", en: "Tier" },
+  "landing.table.neurons": { zh: "\u8F93\u51FA Neurons / M", en: "Neurons/M output" },
+  "landing.noMatch": { zh: "\u6CA1\u6709\u7B26\u5408\u7B5B\u9009\u6761\u4EF6\u7684\u6A21\u578B\u3002", en: "No models match this filter." },
+  "landing.count": { zh: "\u663E\u793A {shown} / {total} \u4E2A\u514D\u8D39\u6A21\u578B", en: "{shown} of {total} free models" },
+  "landing.footnote": { zh: "\u6027\u80FD\u7B49\u7EA7\u4E3A\u900F\u660E\u542F\u53D1\u5F0F\u4F30\u7B97\uFF08\u53C2\u6570\u91CF\u3001\u80FD\u529B\u3001\u4E0A\u4E0B\u6587\u3001\u53D1\u5E03\u65F6\u95F4\u3001\u4EF7\u683C\uFF09\uFF0C\u53EF\u5728\u7BA1\u7406\u540E\u53F0\u7528\u81EA\u6D4B\u57FA\u51C6\u8986\u76D6\u3002\u4EF7\u683C\u6765\u81EA Cloudflare \u5B9E\u65F6\u5B9A\u4EF7\u9875\uFF1B\u514D\u8D39\u989D\u5EA6\u4E3A\u6BCF\u8D26\u53F7\u6BCF\u5929 10,000 Neurons\u3002", en: "Ranking is a transparent estimate from parameters, capabilities, context, recency and price; override it with your own benchmarks in admin. Prices come from Cloudflare's live pricing page; the free allowance is 10,000 neurons per account per UTC day." },
+  "landing.coverage": { zh: "{free} \u4E2A\u514D\u8D39 \xB7 {partners} \u4E2A\u5408\u4F5C\u65B9\u6A21\u578B \xB7 {authors} \u5BB6\u63D0\u4F9B\u65B9", en: "{free} free \xB7 {partners} partner models \xB7 {authors} providers" },
+  "landing.paidNote": { zh: "\u9700 Workers Paid \u6216 AI Gateway \u9884\u4ED8\u989D\u5EA6\u7684\u6A21\u578B\u4E0D\u4F1A\u51FA\u73B0\u5728\u514D\u8D39\u76EE\u5F55\u4E2D\uFF0C\u4EE3\u7406\u4F1A\u8FD4\u56DE 403\u3002\u901A\u8FC7 AI Gateway \u8BBF\u95EE\u7684 OpenAI / Anthropic \u7B49\u5916\u90E8 API \u4E0D\u5C5E\u4E8E Workers AI \u514D\u8D39\u989D\u5EA6\u3002", en: "Models requiring Workers Paid or AI Gateway prepaid credits stay out of the free catalog; the proxy returns 403. External APIs reached through AI Gateway (OpenAI, Anthropic, etc.) are not part of the free Workers AI allowance." },
+  "landing.cards.vs.title": { zh: "Workers AI \u4E0E AI Gateway \u7684\u533A\u522B", en: "Workers AI vs AI Gateway" },
+  "landing.cards.vs.body": { zh: "\u4E00\u4E2A\u8FD0\u884C\u6A21\u578B\u5E76\u6309 Neurons \u8BA1\u8D39\uFF1B\u53E6\u4E00\u4E2A\u662F\u7F13\u5B58\u3001\u65E5\u5FD7\u3001\u91CD\u8BD5\u4E0E\u7EDF\u4E00\u8BA1\u8D39\u7684\u63A7\u5236\u5C42\u3002", en: "One runs models and bills neurons. The other is a control layer for caching, logs, retries and unified billing." },
+  "landing.cards.vs.link": { zh: "\u9605\u8BFB\u5206\u6790 \u2192", en: "Read the analysis \u2192" },
+  "landing.cards.api.title": { zh: "OpenAI \u517C\u5BB9\u63A5\u53E3", en: "OpenAI-compatible API" },
+  "landing.cards.api.body": { zh: "/v1/chat/completions\u3001embeddings\u3001images\u3001audio\u3001rerank\u3001Anthropic Messages \u4EE5\u53CA\u901A\u7528\u7684 /v1/run\u3002", en: "/v1/chat/completions, embeddings, images, audio, rerank, Anthropic Messages and a generic /v1/run." },
+  "landing.cards.api.link": { zh: "\u63A5\u53E3\u6587\u6863 \u2192", en: "Endpoint reference \u2192" },
+  "landing.cards.quota.title": { zh: "\u514D\u8D39\u989D\u5EA6\u786C\u4FDD\u62A4", en: "Hard free-tier guard" },
+  "landing.cards.quota.body": { zh: "\u539F\u5B50\u9884\u7559\u8BA9\u5E76\u53D1\u8BF7\u6C42\u4E5F\u65E0\u6CD5\u8D8A\u8FC7\u6BCF\u65E5 10,000 Neurons \u7684\u514D\u8D39\u989D\u5EA6\u3002", en: "Atomic per-account reservations stop requests before the 10,000-neuron daily allocation is exceeded." },
+  "landing.cards.quota.link": { zh: "\u6838\u7B97\u65B9\u5F0F \u2192", en: "How accounting works \u2192" },
+  "landing.footer": { zh: "Workers AI2API v2 \xB7 \u72EC\u7ACB\u9879\u76EE\uFF0C\u4E0E Cloudflare \u65E0\u96B6\u5C5E\u5173\u7CFB\u3002\u6A21\u578B\u6570\u636E\u4E0E\u4EF7\u683C\u5F52 Cloudflare \u6240\u6709\u3002", en: "Workers AI2API v2 \xB7 Independent project, not affiliated with Cloudflare. Model data and prices belong to Cloudflare." },
+  "task.text-generation": { zh: "\u6587\u672C\u751F\u6210", en: "Text" },
+  "task.text-embeddings": { zh: "\u5411\u91CF", en: "Embeddings" },
+  "task.text-to-image": { zh: "\u56FE\u50CF\u751F\u6210", en: "Image" },
+  "task.automatic-speech-recognition": { zh: "\u8BED\u97F3\u8F6C\u6587\u672C", en: "Speech \u2192 text" },
+  "task.text-to-speech": { zh: "\u6587\u672C\u8F6C\u8BED\u97F3", en: "Text \u2192 speech" },
+  "task.text-classification": { zh: "\u5206\u7C7B / \u91CD\u6392", en: "Classification" },
+  "task.image-to-text": { zh: "\u56FE\u50CF\u8F6C\u6587\u672C", en: "Image \u2192 text" },
+  "task.translation": { zh: "\u7FFB\u8BD1", en: "Translation" },
+  "task.summarization": { zh: "\u6458\u8981", en: "Summarization" },
+  "task.image-classification": { zh: "\u56FE\u50CF\u5206\u7C7B", en: "Image classification" },
+  "task.object-detection": { zh: "\u76EE\u6807\u68C0\u6D4B", en: "Object detection" },
+  "task.dumb-pipe": { zh: "\u8BED\u97F3\u7BA1\u9053", en: "Dumb pipe" },
+  "task.unknown": { zh: "\u672A\u77E5", en: "Unknown" },
+  "cap.reasoning": { zh: "\u63A8\u7406", en: "reasoning" },
+  "cap.tools": { zh: "\u5DE5\u5177\u8C03\u7528", en: "tools" },
+  "cap.vision": { zh: "\u89C6\u89C9", en: "vision" },
+  "cap.audio_in": { zh: "\u97F3\u9891\u8F93\u5165", en: "audio in" },
+  "cap.audio_out": { zh: "\u97F3\u9891\u8F93\u51FA", en: "audio out" },
+  "cap.json": { zh: "JSON", en: "JSON" },
+  "cap.streaming": { zh: "\u6D41\u5F0F", en: "streaming" },
+  "cap.multilingual": { zh: "\u591A\u8BED\u8A00", en: "multilingual" },
+  "detail.title": { zh: "\u6A21\u578B\u8BE6\u60C5", en: "Model details" },
+  "detail.id": { zh: "\u6A21\u578B ID", en: "Model ID" },
+  "detail.author": { zh: "\u63D0\u4F9B\u65B9", en: "Provider" },
+  "detail.task": { zh: "\u4EFB\u52A1", en: "Task" },
+  "detail.context": { zh: "\u4E0A\u4E0B\u6587\u7A97\u53E3", en: "Context window" },
+  "detail.maxOutput": { zh: "\u6700\u5927\u8F93\u51FA", en: "Max output" },
+  "detail.caps": { zh: "\u80FD\u529B", en: "Capabilities" },
+  "detail.price": { zh: "\u4EF7\u683C", en: "Pricing" },
+  "detail.daily": { zh: "\u514D\u8D39\u65E5\u8F93\u51FA", en: "Free daily output" },
+  "detail.rank": { zh: "\u6027\u80FD\u6392\u540D", en: "Performance rank" },
+  "detail.score": { zh: "\u4F30\u7B97\u5F97\u5206", en: "Estimated score" },
+  "detail.endpoints": { zh: "\u53EF\u7528\u7AEF\u70B9", en: "Endpoints" },
+  "detail.aliases": { zh: "\u522B\u540D", en: "Aliases" },
+  "detail.docs": { zh: "Cloudflare \u6587\u6863 \u2197", en: "Cloudflare docs \u2197" },
+  "detail.copyId": { zh: "\u590D\u5236\u6A21\u578B ID", en: "Copy model ID" },
+  "detail.released": { zh: "\u53D1\u5E03\u65F6\u95F4", en: "Released" },
+  "price.input_token": { zh: "\u8F93\u5165 token", en: "input token" },
+  "price.output_token": { zh: "\u8F93\u51FA token", en: "output token" },
+  "price.cached_input_token": { zh: "\u7F13\u5B58\u8F93\u5165 token", en: "cached input token" },
+  "price.audio_minute": { zh: "\u97F3\u9891\u5206\u949F", en: "audio minute" },
+  "price.character": { zh: "\u5B57\u7B26", en: "character" },
+  "price.step": { zh: "\u6B65", en: "step" },
+  "price.image": { zh: "\u56FE\u50CF", en: "image" },
+  "price.image_tile": { zh: "\u56FE\u50CF tile", en: "image tile" },
+  "price.image_megapixel": { zh: "\u56FE\u50CF\u767E\u4E07\u50CF\u7D20", en: "image megapixel" },
+  "price.input_image_tile_step": { zh: "\u8F93\u5165\u56FE\u50CF tile \u6B65", en: "input image tile step" },
+  "price.output_image_tile_step": { zh: "\u8F93\u51FA\u56FE\u50CF tile \u6B65", en: "output image tile step" },
+  "admin.title": { zh: "\u7BA1\u7406 \u2014 Workers AI2API", en: "Admin \u2014 Workers AI2API" },
+  "admin.signinTitle": { zh: "\u767B\u5F55 \u2014 Workers AI2API", en: "Sign in \u2014 Workers AI2API" },
+  "admin.login.title": { zh: "\u7BA1\u7406\u5458\u767B\u5F55", en: "Admin sign in" },
+  "admin.login.sub": { zh: "\u4F7F\u7528\u672C\u90E8\u7F72\u914D\u7F6E\u7684 ADMIN_PASSWORD\u3002", en: "Use the ADMIN_PASSWORD configured on this deployment." },
+  "admin.login.password": { zh: "\u5BC6\u7801", en: "Password" },
+  "admin.login.submit": { zh: "\u767B\u5F55", en: "Sign in" },
+  "admin.login.back": { zh: "\u2190 \u8FD4\u56DE\u516C\u5F00\u9996\u9875", en: "\u2190 Back to public site" },
+  "admin.nav.overview": { zh: "\u603B\u89C8", en: "Overview" },
+  "admin.nav.models": { zh: "\u6A21\u578B", en: "Models" },
+  "admin.nav.accounts": { zh: "\u8D26\u53F7", en: "Accounts" },
+  "admin.nav.keys": { zh: "API \u5BC6\u94A5", en: "API keys" },
+  "admin.nav.settings": { zh: "\u8BBE\u7F6E", en: "Settings" },
+  "admin.nav.logout": { zh: "\u9000\u51FA\u767B\u5F55", en: "Sign out" },
+  "admin.overview.title": { zh: "\u603B\u89C8", en: "Overview" },
+  "admin.overview.sub": { zh: "\u514D\u8D39 Neuron \u6838\u7B97\u3001\u5DF2\u63A5\u5165\u8D26\u53F7\u4E0E\u5B9E\u65F6\u7528\u91CF\u3002", en: "Free-neuron accounting, connected accounts and live usage." },
+  "admin.kpi.used": { zh: "\u4ECA\u65E5\u5DF2\u7528 Neurons", en: "neurons used today" },
+  "admin.kpi.limit": { zh: "\u6BCF\u65E5\u514D\u8D39\u989D\u5EA6", en: "daily free allowance" },
+  "admin.kpi.remaining": { zh: "\u5269\u4F59 Neurons", en: "neurons remaining" },
+  "admin.kpi.accounts": { zh: "\u6D3B\u8DC3\u8D26\u53F7", en: "active accounts" },
+  "admin.quota.title": { zh: "\u6BCF\u65E5\u989D\u5EA6", en: "Daily quota" },
+  "admin.quota.note": { zh: "\u672C\u5730\u539F\u5B50\u8BB0\u8D26\uFF1A\u5DF2\u7528 {used} + \u9884\u7559 {reserved}\u3002\u4E91\u7AEF\u5206\u6790\uFF1A{cloud}\u3002\u540E\u7AEF\uFF1A{backend}\u3002", en: "Local atomic accounting: {used} used + {reserved} reserved. Cloud analytics: {cloud}. Backend: {backend}." },
+  "admin.quota.refresh": { zh: "\u5237\u65B0\u4E91\u7AEF\u5206\u6790", en: "Refresh analytics" },
+  "admin.quota.refreshed": { zh: "\u5DF2\u5237\u65B0\u3002\u672C\u5730 {local} n\uFF1B\u4E91\u7AEF {cloud} n\u3002", en: "Refreshed. Local {local} n; cloud {cloud} n." },
+  "admin.env.title": { zh: "\u8FD0\u884C\u73AF\u5883", en: "Environment" },
+  "admin.env.version": { zh: "\u7248\u672C", en: "Version" },
+  "admin.env.kv": { zh: "KV", en: "KV" },
+  "admin.env.quota": { zh: "\u989D\u5EA6\u540E\u7AEF", en: "Quota" },
+  "admin.env.maxDaily": { zh: "\u6BCF\u65E5\u4E0A\u9650", en: "Max daily" },
+  "admin.env.adminPassword": { zh: "\u7BA1\u7406\u5BC6\u7801", en: "Admin password" },
+  "admin.perAccount.title": { zh: "\u6309\u8D26\u53F7", en: "Per account" },
+  "admin.topModels.title": { zh: "\u4ECA\u65E5\u70ED\u95E8\u6A21\u578B", en: "Top models today" },
+  "admin.noAccounts": { zh: "\u8FD8\u6CA1\u6709\u6D3B\u8DC3\u8D26\u53F7\u3002", en: "No active accounts." },
+  "admin.noUsage": { zh: "\u6682\u65E0\u4E91\u7AEF\u7528\u91CF\u6570\u636E\u3002", en: "No cloud usage data yet." },
+  "admin.models.title": { zh: "\u6A21\u578B", en: "Models" },
+  "admin.models.includePaid": { zh: "\u5305\u542B\u4ED8\u8D39\u6A21\u578B", en: "include paid-only" },
+  "admin.models.refresh": { zh: "\u5237\u65B0\u76EE\u5F55", en: "Refresh catalog" },
+  "admin.models.footnote": { zh: "\u53EA\u6709\u514D\u8D39\u6A21\u578B\u4F1A\u88AB /v1 \u63A5\u53D7\u3002\u4ED8\u8D39\u6A21\u578B\u9ED8\u8BA4\u9690\u85CF\uFF0C\u4EC5\u7528\u4E8E\u67E5\u770B\u3002\u4EF7\u683C\u4E0E\u80FD\u529B\u6765\u81EA Cloudflare \u6587\u6863\u548C\u6A21\u578B API\u3002", en: "Free models are the only ones accepted by /v1. Paid-only models are shown for visibility and excluded by default. Prices and capabilities are refreshed from Cloudflare docs and the models API." },
+  "admin.models.source": { zh: "\u6765\u6E90\uFF1A{source} \xB7 {free} \u514D\u8D39 / {paid} \u4ED8\u8D39 / {deprecated} \u5DF2\u5F03\u7528 \xB7 \u66F4\u65B0\u4E8E {time}", en: "Source: {source} \xB7 {free} free / {paid} paid / {deprecated} deprecated \xB7 updated {time}" },
+  "admin.models.coverage": { zh: "{partner} \u4E2A\u5408\u4F5C\u65B9\u6A21\u578B \xB7 {authors} \u5BB6\u63D0\u4F9B\u65B9 \xB7 {tasks} \u7C7B\u4EFB\u52A1", en: "{partner} partner models \xB7 {authors} providers \xB7 {tasks} task types" },
+  "admin.models.noMatch": { zh: "\u6CA1\u6709\u7B26\u5408\u6761\u4EF6\u7684\u6A21\u578B\u3002", en: "No models." },
+  "admin.models.count": { zh: "{n} \u4E2A\u6A21\u578B", en: "{n} models" },
+  "admin.accounts.title": { zh: "\u8D26\u53F7", en: "Accounts" },
+  "admin.accounts.sub": { zh: "\u6BCF\u4E2A Cloudflare \u8D26\u53F7\u6BCF\u5929\u63D0\u4F9B 10,000 \u4E2A\u514D\u8D39 Neurons\u3002\u8BF7\u6C42\u4F1A\u5728\u8D26\u53F7\u4E4B\u95F4\u81EA\u52A8\u6545\u969C\u8F6C\u79FB\u3002", en: "Each Cloudflare account contributes 10,000 free neurons per UTC day. Requests fail over between accounts." },
+  "admin.accounts.addTitle": { zh: "\u6DFB\u52A0\u8D26\u53F7", en: "Add account" },
+  "admin.accounts.name": { zh: "\u540D\u79F0", en: "Name" },
+  "admin.accounts.accountId": { zh: "Account ID", en: "Account ID" },
+  "admin.accounts.token": { zh: "API Token\uFF08Workers AI Read & Edit\uFF09", en: "API token (Workers AI Read & Edit)" },
+  "admin.accounts.add": { zh: "\u6DFB\u52A0\u8D26\u53F7", en: "Add account" },
+  "admin.accounts.test": { zh: "\u6D4B\u8BD5 Token", en: "Test token" },
+  "admin.accounts.added": { zh: "\u8D26\u53F7\u5DF2\u6DFB\u52A0\u3002", en: "Account added." },
+  "admin.accounts.tokenWorks": { zh: "Token \u53EF\u7528\uFF0C\u53EF\u89C1\u6A21\u578B\u6570\uFF1A{n}", en: "Token works. Models visible: {n}" },
+  "admin.accounts.hint": { zh: "\u5728 Cloudflare Dashboard \u2192 My Profile \u2192 API Tokens \u521B\u5EFA Workers AI \u6A21\u677F Token\u3002\u82E5\u9700\u8981\u4E91\u7AEF\u7528\u91CF\u6838\u5BF9\uFF0C\u518D\u6DFB\u52A0 Account Analytics Read \u6743\u9650\u3002", en: "Create a token at Cloudflare Dashboard \u2192 My Profile \u2192 API Tokens \u2192 Workers AI template. Add \u201CAccount Analytics Read\u201D if you want cloud usage reconciliation." },
+  "admin.accounts.table.account": { zh: "\u8D26\u53F7", en: "Account" },
+  "admin.accounts.table.token": { zh: "Token", en: "Token" },
+  "admin.accounts.table.status": { zh: "\u72B6\u6001", en: "Status" },
+  "admin.accounts.table.added": { zh: "\u6DFB\u52A0\u65F6\u95F4", en: "Added" },
+  "admin.accounts.table.actions": { zh: "\u64CD\u4F5C", en: "Actions" },
+  "admin.accounts.confirm": { zh: "\u786E\u5B9A\u79FB\u9664\u8FD9\u4E2A\u8D26\u53F7\uFF1F", en: "Remove this account?" },
+  "admin.accounts.noAccounts": { zh: "\u8FD8\u6CA1\u6709\u8D26\u53F7\u3002", en: "No accounts yet." },
+  "admin.keys.title": { zh: "API \u5BC6\u94A5", en: "API keys" },
+  "admin.keys.sub": { zh: "\u5BC6\u94A5\u4EE5 SHA-256 \u54C8\u5E0C\u5B58\u50A8\uFF0C\u660E\u6587\u53EA\u663E\u793A\u4E00\u6B21\u3002", en: "Keys are stored as SHA-256 hashes. The plaintext is shown once." },
+  "admin.keys.name": { zh: "\u5BC6\u94A5\u540D\u79F0", en: "Key name" },
+  "admin.keys.create": { zh: "\u521B\u5EFA\u5BC6\u94A5", en: "Create key" },
+  "admin.keys.created": { zh: "\u5BC6\u94A5\u5DF2\u521B\u5EFA\u3002\u8BF7\u7ACB\u5373\u590D\u5236\uFF0C\u4E4B\u540E\u4E0D\u518D\u663E\u793A\u3002", en: "Key created. Copy it now; it is not shown again." },
+  "admin.keys.copyNow": { zh: "\u7ACB\u5373\u590D\u5236\u8FD9\u4E2A\u5BC6\u94A5\uFF1A", en: "Copy this key now:" },
+  "admin.keys.confirm": { zh: "\u786E\u5B9A\u5220\u9664\u8FD9\u4E2A\u5BC6\u94A5\uFF1F", en: "Delete this key?" },
+  "admin.keys.table.key": { zh: "\u5BC6\u94A5", en: "Key" },
+  "admin.keys.table.status": { zh: "\u72B6\u6001", en: "Status" },
+  "admin.keys.table.lastUsed": { zh: "\u6700\u540E\u4F7F\u7528", en: "Last used" },
+  "admin.keys.table.created": { zh: "\u521B\u5EFA\u65F6\u95F4", en: "Created" },
+  "admin.keys.table.actions": { zh: "\u64CD\u4F5C", en: "Actions" },
+  "admin.keys.noKeys": { zh: "\u8FD8\u6CA1\u6709 API \u5BC6\u94A5\u3002", en: "No API keys yet." },
+  "admin.settings.title": { zh: "\u8BBE\u7F6E", en: "Settings" },
+  "admin.settings.sub": { zh: "AI Gateway \u662F\u53EF\u9009\u9879\uFF1B\u514D\u8D39 Neuron \u4FDD\u62A4\u59CB\u7EC8\u662F\u6743\u5A01\u3002", en: "AI Gateway is optional; the free-neuron guard remains authoritative." },
+  "admin.settings.runtime": { zh: "\u8FD0\u884C\u65F6", en: "Runtime" },
+  "admin.settings.gateway": { zh: "AI Gateway ID\uFF08\u53EF\u9009\uFF09", en: "AI Gateway ID (optional)" },
+  "admin.settings.daily": { zh: "\u6BCF\u8D26\u53F7\u6BCF\u65E5 Neurons", en: "Daily neurons per account" },
+  "admin.settings.defaultMax": { zh: "\u9ED8\u8BA4\u6700\u5927\u8F93\u51FA tokens", en: "Default max output tokens" },
+  "admin.settings.public": { zh: "\u516C\u5F00\u8BBF\u95EE\uFF08\u65E0\u9700 API \u5BC6\u94A5\uFF09", en: "Public access (no API keys)" },
+  "admin.settings.quotaHint": { zh: "\u6BCF\u65E5\u4E0A\u9650\u53D7 MAX_DAILY_NEURONS \u9650\u5236\uFF08\u9ED8\u8BA4 10,000\uFF09\u3002\u514D\u8D39\u8BA1\u5212\u4E0D\u8981\u8C03\u9AD8\uFF1ACloudflare \u4F1A\u5F00\u59CB\u8FD4\u56DE 3036\u3002", en: "The daily cap is clamped by MAX_DAILY_NEURONS (default 10,000). Do not raise it on a free plan: Cloudflare will start returning error 3036." },
+  "admin.settings.aliases": { zh: "\u6A21\u578B\u522B\u540D", en: "Model aliases" },
+  "admin.settings.aliasesHint": { zh: "JSON \u5BF9\u8C61\uFF1A\u5BA2\u6237\u7AEF\u540D\u79F0 \u2192 @cf/ \u6A21\u578B ID\u3002", en: "JSON object mapping a client-facing name to an @cf/ model id." },
+  "admin.settings.benchmarks": { zh: "\u6027\u80FD\u8986\u76D6\u503C", en: "Performance overrides" },
+  "admin.settings.benchmarksHint": { zh: "JSON \u5BF9\u8C61\uFF1A\u6A21\u578B ID \u2192 0-100 \u7684\u81EA\u6D4B\u5206\u6570\u3002\u8986\u76D6\u503C\u4F1A\u53C2\u4E0E\u6027\u80FD\u6392\u5E8F\u3002", en: "JSON object mapping model id to a 0-100 score from your own evals. Overrides drive the performance sort." },
+  "admin.settings.saved": { zh: "\u8BBE\u7F6E\u5DF2\u4FDD\u5B58\u3002", en: "Settings saved." },
+  "admin.settings.invalidJson": { zh: "JSON \u65E0\u6548\uFF1A{error}", en: "Invalid JSON: {error}" },
+  "admin.setupWarning": { zh: "\u8BF7\u5148\u8BBE\u7F6E ADMIN_PASSWORD \u73AF\u5883\u53D8\u91CF\uFF0C\u518D\u4F7F\u7528\u7BA1\u7406\u9762\u677F\u3002", en: "Set the ADMIN_PASSWORD environment variable before using the admin panel." },
+  "docs.nav.home": { zh: "\u9996\u9875", en: "Home" },
+  "docs.nav.api": { zh: "\u63A5\u53E3", en: "API" },
+  "docs.nav.freeTier": { zh: "\u514D\u8D39\u989D\u5EA6", en: "Free tier" },
+  "docs.nav.vs": { zh: "Workers AI vs AI Gateway", en: "Workers AI vs AI Gateway" },
+  "docs.footer": { zh: "Workers AI2API v2 \xB7 \u4EF7\u683C\u4E0E\u9650\u989D\u5F52 Cloudflare \u6240\u6709\u3002", en: "Workers AI2API v2 \xB7 Prices and limits belong to Cloudflare." }
+};
+function t(lang, key, vars = {}) {
+  const entry = DICT[key];
+  const template = entry ? entry[lang] || entry.en : key;
+  return String(template).replace(/\{(\w+)\}/g, (_, name) => vars[name] == null ? "" : String(vars[name]));
+}
+function resolveLang(request) {
+  let url;
+  try {
+    url = new URL(request.url);
+  } catch {
+    url = null;
+  }
+  const query = url?.searchParams.get("lang");
+  if (LANGS.includes(query)) return query;
+  const cookie = request.headers.get("Cookie") || "";
+  const match = cookie.match(/(?:^|;\s*)lang=(zh|en)\b/);
+  if (match) return match[1];
+  const accept = request.headers.get("Accept-Language") || "";
+  if (/(^|,)\s*en\b/i.test(accept) && !/(^|,)\s*zh\b/i.test(accept)) return "en";
+  return DEFAULT_LANG;
+}
+function clientDictionary(lang) {
+  const out = {};
+  for (const key of Object.keys(DICT)) {
+    const entry = DICT[key];
+    out[key] = entry ? entry[lang] || entry.en : key;
+  }
+  return out;
+}
+
 // src/ui/pages.js
 var BASE_CSS = `
-:root{color-scheme:light dark;--bg:#f7f7f5;--panel:#ffffff;--panel-2:#f1f1ee;--ink:#141518;--muted:#6b6f76;--line:#deded8;--accent:#e85d04;--accent-ink:#fff;--ok:#0f7b4f;--warn:#a15c00;--bad:#b42318;--shadow:0 1px 2px rgba(0,0,0,.05),0 12px 32px rgba(0,0,0,.06)}
-@media (prefers-color-scheme:dark){:root{--bg:#0c0d0f;--panel:#141619;--panel-2:#1b1e22;--ink:#eceef0;--muted:#9aa0a8;--line:#2a2e34;--accent:#ff7a1a;--accent-ink:#141518;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--shadow:0 1px 2px rgba(0,0,0,.4),0 18px 48px rgba(0,0,0,.28)}}
-*{box-sizing:border-box}html{scroll-behavior:smooth}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
-a{color:inherit}code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
-.nav{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
-.nav .wrap{display:flex;align-items:center;gap:16px;height:62px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.02em;text-decoration:none}
-.brand .mark{width:26px;height:26px;border-radius:7px;background:var(--accent);display:grid;place-items:center;color:var(--accent-ink);font-size:15px;font-weight:800}
+:root{color-scheme:light dark;--bg:#eef1f4;--bg-2:#e7ebef;--panel:#ffffff;--panel-2:#f5f7f9;--ink:#0b0e13;--muted:#5b6572;--line:#d6dce3;--accent:#e8590c;--accent-2:#ff9a5c;--accent-ink:#ffffff;--ok:#0b7a53;--warn:#9a5b00;--bad:#b42318;--shadow:0 1px 2px rgba(8,12,20,.05),0 14px 40px rgba(8,12,20,.07);--display:"Bahnschrift","DIN Alternate","Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;--mono:"Cascadia Code","SFMono-Regular",Consolas,"Liberation Mono",monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#080a0d;--bg-2:#0c0f13;--panel:#11151a;--panel-2:#171c22;--ink:#eef1f4;--muted:#98a2ae;--line:#242c36;--accent:#ff7a1a;--accent-2:#ffb066;--accent-ink:#120b05;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171;--shadow:0 1px 2px rgba(0,0,0,.5),0 22px 60px rgba(0,0,0,.35)}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 "Segoe UI",ui-sans-serif,system-ui,-apple-system,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:inherit}
+h1,h2,h3,.brand,.ledger-big b,.kpi b,.stat b{font-family:var(--display);font-weight:700}
+code,pre,.mono,.price,.rank,.tier,.stamp,.pill{font-family:var(--mono)}
+.wrap{max-width:1200px;margin:0 auto;padding:0 24px}
+.nav{position:sticky;top:0;z-index:30;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:blur(16px);border-bottom:1px solid var(--line)}
+.nav .wrap{display:flex;align-items:center;gap:14px;height:64px}
+.brand{display:flex;align-items:center;gap:10px;font-size:15px;letter-spacing:-.02em;text-decoration:none;white-space:nowrap}
+.brand .mark{width:28px;height:28px;border-radius:8px;background:var(--accent);display:grid;place-items:center;color:var(--accent-ink);font:800 15px/1 var(--display)}
 .nav .spacer{flex:1}
-.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 10px;font-size:12px;color:var(--muted);background:var(--panel)}
+.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:5px 10px;font-size:11px;color:var(--muted);background:var(--panel);white-space:nowrap}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 18%,transparent)}
 .dot.off{background:var(--bad);box-shadow:none}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:9px;padding:9px 14px;font:600 13px/1 inherit;cursor:pointer;text-decoration:none;transition:.15s}
-.btn:hover{border-color:var(--muted)}.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}.btn.primary:hover{filter:brightness(1.06)}
+.dot.warn{background:var(--warn);box-shadow:none}
+.lang-switch{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel)}
+.lang-switch a{padding:6px 10px;font:600 11px/1 var(--mono);color:var(--muted);text-decoration:none}
+.lang-switch a+a{border-left:1px solid var(--line)}
+.lang-switch a.active{background:var(--ink);color:var(--bg)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:9px;padding:9px 14px;font:600 13px/1 inherit;cursor:pointer;text-decoration:none;transition:border-color .15s,background .15s,transform .15s;white-space:nowrap}
+.btn:hover{border-color:var(--muted)}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.btn.primary:hover{filter:brightness(1.06)}
 .btn.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 35%,var(--line))}
-.btn.sm{padding:6px 10px;font-size:12px;border-radius:7px}
+.btn.sm{padding:6px 10px;font-size:11.5px;border-radius:7px}
 .btn:disabled{opacity:.5;cursor:not-allowed}
-.hero{padding:74px 0 48px;border-bottom:1px solid var(--line)}
-.eyebrow{font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 16px}
-h1{font-size:clamp(38px,6vw,68px);line-height:1.02;letter-spacing:-.045em;margin:0 0 18px;max-width:900px;font-weight:750}
-.hero p.lead{font-size:18px;color:var(--muted);max-width:660px;margin:0 0 28px}
-.endpoint{display:flex;align-items:stretch;gap:0;max-width:660px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--panel);box-shadow:var(--shadow)}
-.endpoint code{flex:1;padding:14px 16px;font-size:13px;overflow:auto;white-space:nowrap;display:flex;align-items:center}
-.endpoint button{border:0;border-left:1px solid var(--line);border-radius:0;background:var(--panel-2);padding:0 16px;font-weight:600;font-size:12px;cursor:pointer;color:var(--ink)}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-top:34px}
-.stat{background:var(--panel);padding:18px 20px}.stat b{display:block;font-size:26px;letter-spacing:-.03em}.stat span{font-size:12px;color:var(--muted)}
-section.block{padding:54px 0}
-.block-head{display:flex;align-items:end;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:18px}
-.block-head h2{font-size:28px;letter-spacing:-.03em;margin:0}.block-head p{margin:6px 0 0;color:var(--muted);font-size:14px}
-.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
-input,select,textarea{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:9px 11px;min-width:0}
-input:focus,select:focus,textarea:focus{outline:2px solid color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:1px}
-textarea{width:100%;min-height:90px;resize:vertical;font-family:ui-monospace,monospace;font-size:12.5px}
+.hero{position:relative;border-bottom:1px solid var(--line);overflow:hidden}
+.hero::before{content:"";position:absolute;inset:0;background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);background-size:64px 64px;opacity:.27;mask-image:linear-gradient(180deg,#000 0%,transparent 84%);pointer-events:none}
+.hero-grid{position:relative;display:grid;grid-template-columns:minmax(0,1.22fr) minmax(330px,.78fr);gap:44px;align-items:center;padding:74px 0 60px}
+.eyebrow{display:flex;align-items:center;gap:10px;font:700 10.5px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--accent);margin:0 0 18px}
+.eyebrow::before{content:"";width:26px;height:1px;background:var(--accent)}
+h1{font-size:clamp(38px,4.8vw,58px);line-height:1.04;letter-spacing:-.045em;margin:0 0 20px;max-width:820px}
+html[lang^="zh"] h1{font-size:clamp(32px,3.3vw,46px);line-height:1.14;letter-spacing:-.01em;max-width:820px;word-break:keep-all}
+.hero p.lead{font-size:17.5px;color:var(--muted);max-width:640px;margin:0 0 28px}
+.endpoint{display:flex;align-items:stretch;max-width:640px;border:1px solid var(--line);border-radius:11px;overflow:hidden;background:var(--panel);box-shadow:var(--shadow)}
+.endpoint code{flex:1;padding:14px 16px;font-size:12.5px;overflow:auto;white-space:nowrap;display:flex;align-items:center}
+.endpoint button{border:0;border-left:1px solid var(--line);background:var(--panel-2);padding:0 16px;font:700 11px/1 var(--mono);letter-spacing:.04em;cursor:pointer;color:var(--ink);text-transform:uppercase}
+.endpoint button:hover{color:var(--accent)}
+.hero-meta{margin:16px 0 0;font:600 11px/1.5 var(--mono);color:var(--muted);letter-spacing:.01em}
+.ledger{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:var(--shadow);overflow:hidden}
+.ledger::after{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 7%,transparent),transparent 46%)}
+.ledger-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px}
+.ledger-head>span:first-child{font:700 10px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+.stamp{border:2px solid var(--accent);color:var(--accent);font:800 10px/1 var(--mono);letter-spacing:.14em;padding:6px 7px;border-radius:4px;transform:rotate(-6deg)}
+.ledger-big{display:flex;flex-direction:column;gap:7px}
+.ledger-big b{font-size:clamp(46px,5.6vw,64px);line-height:.95;letter-spacing:-.055em}
+.ledger-big span{font-size:11.5px;color:var(--muted)}
+.meter{position:relative;height:14px;margin:20px 0 8px;border:1px solid var(--line);border-radius:4px;background:var(--panel-2);overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width .5s ease}
+.meter::after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0 calc(10% - 1px),var(--panel) calc(10% - 1px) 10%)}
+.meter-labels{display:flex;justify-content:space-between;gap:10px;font:600 10.5px/1.2 var(--mono);color:var(--muted);margin-bottom:18px}
+.ledger-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0 0 14px;padding:0}
+.ledger-grid div{border-top:1px solid var(--line);padding-top:10px;min-width:0}
+.ledger-grid dt{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.ledger-grid dd{margin:5px 0 0;font:700 14px/1.2 var(--mono);overflow:hidden;text-overflow:ellipsis}
+.block{padding:56px 0}
+.block-head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;flex-wrap:wrap;margin-bottom:18px}
+.block-head h2{font-size:clamp(24px,3vw,32px);letter-spacing:-.03em;margin:0}
+.block-head p{margin:6px 0 0;color:var(--muted);font-size:13px}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+input,select,textarea{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 11px;min-width:0}
+input:focus,select:focus,textarea:focus,button:focus-visible,a:focus-visible{outline:2px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px}
+textarea{width:100%;min-height:100px;resize:vertical;font-family:var(--mono);font-size:12.5px}
 .table-wrap{border:1px solid var(--line);border-radius:14px;overflow:auto;background:var(--panel);box-shadow:var(--shadow)}
-table{width:100%;border-collapse:collapse;font-size:13.5px;min-width:900px}
-th{text-align:left;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:12px 14px;border-bottom:1px solid var(--line);background:var(--panel-2);position:sticky;top:0}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:920px}
+th{text-align:left;font:700 10px/1.2 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--muted);padding:13px 14px;border-bottom:1px solid var(--line);background:var(--panel-2);position:sticky;top:0;z-index:1;white-space:nowrap}
 td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:top}
-tr:last-child td{border-bottom:0}tbody tr:hover{background:color-mix(in srgb,var(--accent) 5%,transparent)}
-.model-name{font-weight:650;letter-spacing:-.01em}.model-id{font-size:11.5px;color:var(--muted);word-break:break-all}
-.badge{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:6px;padding:2px 6px;font-size:10.5px;font-weight:600;color:var(--muted);margin:1px 3px 1px 0;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+tbody tr.model-row{cursor:pointer}
+tbody tr.model-row:hover td{background:color-mix(in srgb,var(--accent) 5%,transparent)}
+.model-name{font-weight:650;letter-spacing:-.01em}
+.model-id{font-size:11px;color:var(--muted);word-break:break-all}
+.badge{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:5px;padding:2px 6px;font:600 10px/1.35 var(--mono);color:var(--muted);margin:1px 3px 1px 0;white-space:nowrap}
 .badge.hot{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
 .badge.paid{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 45%,var(--line))}
-.rank{display:inline-grid;place-items:center;width:26px;height:26px;border-radius:8px;background:var(--panel-2);font:700 11px/1 ui-monospace,monospace;color:var(--muted)}
-.tier{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:6px;font:800 11px/1 ui-monospace,monospace}
-.tier.S{background:#111;color:#fff}.tier.A{background:var(--accent);color:var(--accent-ink)}.tier.B{background:color-mix(in srgb,var(--accent) 25%,var(--panel-2))}.tier.C{background:var(--panel-2);color:var(--muted)}.tier.D{background:transparent;border:1px solid var(--line);color:var(--muted)}
-.price{font-family:ui-monospace,monospace;font-size:12px;white-space:nowrap}
-.muted{color:var(--muted)}.small{font-size:12px}.nowrap{white-space:nowrap}
+.rank{display:inline-grid;place-items:center;width:27px;height:27px;border-radius:7px;background:var(--panel-2);font:700 10.5px/1 var(--mono);color:var(--muted)}
+.tier{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:6px;font:800 11px/1 var(--mono)}
+.tier.S{background:var(--ink);color:var(--bg)}
+.tier.A{background:var(--accent);color:var(--accent-ink)}
+.tier.B{background:color-mix(in srgb,var(--accent) 24%,var(--panel-2))}
+.tier.C{background:var(--panel-2);color:var(--muted)}
+.tier.D{background:transparent;border:1px solid var(--line);color:var(--muted)}
+.price{font-size:11.5px;white-space:normal;overflow-wrap:anywhere}
+.muted{color:var(--muted)}
+.small{font-size:12px}
+.tiny{font-size:11.5px;color:var(--muted)}
+.nowrap{white-space:nowrap}
 .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;box-shadow:var(--shadow)}
-.card h3{margin:0 0 8px;font-size:16px;letter-spacing:-.01em}.card p{margin:0 0 14px;color:var(--muted);font-size:13.5px}
-.card a{font-weight:600;text-decoration:none;color:var(--accent);font-size:13px}
+.card h3{margin:0 0 8px;font-size:16px;letter-spacing:-.01em}
+.card p{margin:0 0 14px;color:var(--muted);font-size:13px}
+.card a{font-weight:600;text-decoration:none;color:var(--accent);font-size:12.5px}
 .usage-bar{height:9px;border-radius:99px;background:var(--panel-2);overflow:hidden;border:1px solid var(--line)}
-.usage-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),#f0a35e);width:0;transition:width .4s}
-.grid2{display:grid;grid-template-columns:1.15fr .85fr;gap:18px}
-.list{list-style:none;margin:0;padding:0}.list li{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}.list li:last-child{border-bottom:0}
-.note{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--panel);border-radius:0 10px 10px 0;padding:12px 14px;font-size:13px;color:var(--muted)}
-footer{border-top:1px solid var(--line);padding:28px 0 48px;color:var(--muted);font-size:12.5px}
-.login{min-height:100vh;display:grid;place-items:center;padding:24px}
-.login .card{width:100%;max-width:400px}
-.field{display:block;margin-bottom:14px}.field span{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px}
-.field input{width:100%}
-.msg{font-size:12.5px;padding:9px 11px;border-radius:8px;margin:10px 0;display:none}.msg.show{display:block}
-.msg.ok{background:color-mix(in srgb,var(--ok) 12%,transparent);color:var(--ok)}.msg.err{background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad)}
-.app{display:grid;grid-template-columns:210px 1fr;min-height:calc(100vh - 62px)}
-.side{border-right:1px solid var(--line);padding:22px 14px;background:var(--panel)}
-.side button{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:none;border:0;border-radius:8px;padding:9px 11px;font:600 13px/1 inherit;color:var(--muted);cursor:pointer;margin-bottom:2px}
-.side button:hover{background:var(--panel-2);color:var(--ink)}.side button.active{background:var(--panel-2);color:var(--ink);box-shadow:inset 2px 0 0 var(--accent)}
-.main{padding:28px 30px 60px;min-width:0}
-.tab{display:none}.tab.active{display:block}
-.main h2{font-size:24px;letter-spacing:-.03em;margin:0 0 4px}.main .sub{color:var(--muted);font-size:13px;margin:0 0 22px}
-.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
-.kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px}.kpi b{display:block;font-size:22px;letter-spacing:-.03em}.kpi span{font-size:11.5px;color:var(--muted)}
+.usage-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent-2));width:0;transition:width .4s}
 .split{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.list{list-style:none;margin:0;padding:0}
+.list li{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}
+.list li:last-child{border-bottom:0}
+.note{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--panel);border-radius:0 10px 10px 0;padding:12px 14px;font-size:13px;color:var(--muted)}
+footer{border-top:1px solid var(--line);padding:30px 0 52px;color:var(--muted);font-size:12px}
+.login{min-height:100vh;display:grid;place-items:center;padding:24px}
+.login .card{width:100%;max-width:410px}
+.field{display:block;margin-bottom:14px}
+.field span{display:block;font-size:11px;font-weight:700;letter-spacing:.03em;color:var(--muted);margin-bottom:6px}
+.field input{width:100%}
+.msg{font-size:12.5px;padding:9px 11px;border-radius:8px;margin:10px 0;display:none}
+.msg.show{display:block}
+.msg.ok{background:color-mix(in srgb,var(--ok) 12%,transparent);color:var(--ok)}
+.msg.err{background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad)}
+.app{display:grid;grid-template-columns:216px 1fr;min-height:calc(100vh - 64px)}
+.side{border-right:1px solid var(--line);padding:22px 14px;background:var(--panel)}
+.side button{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:none;border:0;border-radius:8px;padding:9px 11px;font:600 12.5px/1 inherit;color:var(--muted);cursor:pointer;margin-bottom:2px}
+.side button:hover{background:var(--panel-2);color:var(--ink)}
+.side button.active{background:var(--panel-2);color:var(--ink);box-shadow:inset 2px 0 0 var(--accent)}
+.main{padding:28px 30px 64px;min-width:0}
+.tab{display:none}
+.tab.active{display:block}
+.main h2{font-size:24px;letter-spacing:-.03em;margin:0 0 4px}
+.main .sub{color:var(--muted);font-size:12.5px;margin:0 0 22px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px}
+.kpi b{display:block;font-size:22px;letter-spacing:-.03em}
+.kpi span{font-size:11px;color:var(--muted)}
 .form{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;align-items:end}
+.form.inline{grid-template-columns:1fr auto}
 .form .wide{grid-column:1/-1}
 .row-actions{display:flex;gap:6px;flex-wrap:wrap}
-.tiny{font-size:11.5px;color:var(--muted)}
-.kv{display:grid;grid-template-columns:120px 1fr;gap:8px;font-size:13px}.kv dt{color:var(--muted)}.kv dd{margin:0;word-break:break-all}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:8px;font-size:12.5px;margin:0}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;word-break:break-all}
 pre.code{background:var(--panel-2);border:1px solid var(--line);border-radius:9px;padding:12px;overflow:auto;font-size:12px}
 details summary{cursor:pointer;font-weight:600;font-size:13px}
-@media(max-width:900px){.stats,.cards,.kpis{grid-template-columns:1fr 1fr}.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--line);display:flex;gap:6px;overflow:auto;padding:12px}.side button{width:auto;white-space:nowrap}.main{padding:20px 18px 48px}.split,.grid2,.form{grid-template-columns:1fr}h1{font-size:42px}}
-@media(max-width:560px){.stats,.cards,.kpis{grid-template-columns:1fr}.wrap{padding:0 16px}.hero{padding:48px 0 34px}.endpoint code{font-size:11px}}
-.docs{max-width:860px;padding:52px 0 72px}
+dialog{border:1px solid var(--line);border-radius:16px;padding:0;background:var(--panel);color:var(--ink);width:min(640px,calc(100% - 28px));max-height:min(86vh,820px);box-shadow:0 30px 90px rgba(0,0,0,.4)}
+dialog::backdrop{background:rgba(4,6,9,.58);backdrop-filter:blur(4px)}
+.dlg-head{display:flex;align-items:flex-start;gap:14px;padding:20px 22px 14px;border-bottom:1px solid var(--line)}
+.dlg-head h3{margin:0 0 4px;font-size:19px;letter-spacing:-.02em}
+.dlg-head .model-id{font-size:11px}
+.dlg-head .btn{margin-left:auto}
+.dlg-body{padding:18px 22px 24px;overflow:auto}
+.dlg-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0 0 16px}
+.dlg-grid div{border-top:1px solid var(--line);padding-top:9px;min-width:0}
+.dlg-grid dt{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.dlg-grid dd{margin:4px 0 0;font-size:12.5px;word-break:break-word}
+.dlg-section{margin:16px 0 0}
+.dlg-section h4{font:700 10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 8px}
+.docs{max-width:880px;padding:52px 0 80px}
 .docs h1{font-size:38px;margin-bottom:10px}
 .docs h2{font-size:22px;letter-spacing:-.02em;margin:34px 0 10px}
 .docs h3{font-size:16px;margin:22px 0 8px}
@@ -10284,126 +10717,214 @@ details summary{cursor:pointer;font-weight:600;font-size:13px}
 .docs code{background:var(--panel-2);border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-size:12.5px}
 .docs pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;overflow:auto;font-size:12.5px;line-height:1.55}
 .docs pre code{background:none;border:0;padding:0}
+.docs code{overflow-wrap:anywhere}
 .docs table{min-width:0;font-size:13px;margin:12px 0}
+.docs .table-scroll{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin:12px 0;background:var(--panel)}
+.docs .table-scroll table{margin:0;min-width:560px}
 .docs th,.docs td{padding:9px 11px}
-.docs ul{padding-left:20px}
+.docs table td:first-child,.docs table th:first-child{white-space:nowrap}
+.docs ul,.docs ol{padding-left:20px}
 .docs .callout{border-left:3px solid var(--accent);background:var(--panel);padding:12px 15px;border-radius:0 8px 8px 0;margin:18px 0;font-size:13.5px;color:var(--muted)}
+@media(max-width:980px){.hero-grid{grid-template-columns:1fr;gap:30px;padding:54px 0 48px}.ledger{max-width:560px}.cards{grid-template-columns:1fr}.app{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid var(--line);display:flex;gap:6px;overflow:auto;padding:12px}.side button{width:auto;white-space:nowrap}.main{padding:20px 18px 52px}.split,.form,.kpis{grid-template-columns:1fr 1fr}}
+@media(max-width:680px){.cards,.split,.form,.dlg-grid{grid-template-columns:1fr}.wrap{padding:0 16px}.hero{padding:0}.endpoint code{font-size:10.5px}.main{padding:18px 14px 48px}.block{padding:42px 0}h1{font-size:36px}.nav .wrap{height:56px;gap:8px}.nav .pill{display:none}.brand{font-size:13px}.brand .mark{width:24px;height:24px}.lang-switch a{padding:6px 8px}.nav .btn.sm{padding:6px 9px}.models-table{border:0;background:transparent;box-shadow:none;overflow:visible}.models-table table{min-width:0;display:block}.models-table thead{display:none}.models-table tbody{display:block}.models-table tbody tr{display:block;border:1px solid var(--line);border-radius:12px;background:var(--panel);margin-bottom:10px;padding:10px 12px}.models-table tbody td{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-start;gap:4px 10px;min-width:0;border:0;padding:4px 0;font-size:12.5px}.models-table tbody td::before{content:attr(data-label);font:700 9.5px/1.5 var(--mono);text-transform:uppercase;letter-spacing:.07em;color:var(--muted);flex:0 0 84px;padding-top:1px}.models-table tbody td:first-child{display:none}.models-table tbody td:nth-child(2){display:block;padding-bottom:8px;margin-bottom:4px;border-bottom:1px solid var(--line)}.models-table tbody td:nth-child(2)::before{display:none}.models-table tbody tr.model-row:hover td{background:transparent}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
 `;
 var CLIENT_HELPERS = `
 const $=(s,r=document)=>r.querySelector(s);const $$=(s,r=document)=>[...r.querySelectorAll(s)];
 const esc=(v)=>String(v??'').replace(/[&<>"']/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const I=window.__I18N__||{};
+const T=(k,v={})=>String(I[k]??k).replace(/\\{(\\w+)\\}/g,(_,n)=>v[n]==null?'':String(v[n]));
 async function api(path,opt={}){const r=await fetch(path,{...opt,headers:{'Content-Type':'application/json',...(opt.headers||{})}});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error?.message||d.error||('HTTP '+r.status));return d}
-function nf(n){return Number(n||0).toLocaleString('en-US')}
+function nf(n){return Number(n||0).toLocaleString(window.__LANG__==='zh'?'zh-CN':'en-US')}
 function money(v){return Number(v)<0.01?'$'+Number(v).toFixed(4):'$'+Number(v).toFixed(3)}
-function priceOf(m){const t=m.pricing?.tokens||{};if(t.input_usd_per_million!=null||t.output_usd_per_million!=null){const inP=t.input_usd_per_million!=null?money(t.input_usd_per_million):'\u2014';const outP=t.output_usd_per_million!=null?money(t.output_usd_per_million):'\u2014';return inP+' in \xB7 '+outP+' out /M'}return m.pricing?.display||'\u2014'}
-function taskLabel(t){return {'text-generation':'Text','text-embeddings':'Embeddings','text-to-image':'Image','automatic-speech-recognition':'Speech \u2192 text','text-to-speech':'Text \u2192 speech','text-classification':'Classification','image-to-text':'Image \u2192 text','translation':'Translation','summarization':'Summarization','image-classification':'Image classification','object-detection':'Object detection'}[t]||t}
-function caps(m){const c=m.capabilities||{};return [c.reasoning&&'reasoning',c.function_calling&&'tools',c.vision&&'vision',c.audio_input&&'audio in',c.audio_output&&'audio out',c.structured_output&&'JSON'].filter(Boolean)}
-function tier(m){return m.performance?.tier||'C'}
 function setMsg(el,text,ok=true){el.textContent=text;el.className='msg show '+(ok?'ok':'err')}
 function copyText(text){return navigator.clipboard.writeText(text)}
+function taskLabel(t){return T('task.'+t)}
+function caps(m){const c=m.capabilities||{};return [c.reasoning&&T('cap.reasoning'),c.function_calling&&T('cap.tools'),c.vision&&T('cap.vision'),c.audio_input&&T('cap.audio_in'),c.audio_output&&T('cap.audio_out'),c.structured_output&&T('cap.json'),c.streaming&&T('cap.streaming')].filter(Boolean)}
+function tier(m){return m.performance?.tier||'C'}
+function priceKind(k){const key='price.'+k;return I[key]?T(key):k}
+function priceOf(m){const t=m.pricing?.tokens||{};if(t.input_usd_per_million!=null||t.output_usd_per_million!=null){const i=t.input_usd_per_million!=null?money(t.input_usd_per_million):'\u2014';const o=t.output_usd_per_million!=null?money(t.output_usd_per_million):'\u2014';return i+' / '+o+' /M'}return m.pricing?.display||'\u2014'}
 `;
-function shell({ title, body, script = "", authenticated = null }) {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title}</title><meta name="description" content="OpenAI-compatible gateway for every free Cloudflare Workers AI model.">
+function escapeAttr(value) {
+  return String(value || "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[char]);
+}
+function shell({ title, description = "", body, script = "", authenticated = null, lang = "zh" }) {
+  const dictionary = JSON.stringify(clientDictionary(lang)).replace(/</g, "\\u003c");
+  const authScript = authenticated === null ? "" : `window.__AUTHENTICATED__=${authenticated ? "true" : "false"};`;
+  return `<!doctype html><html lang="${lang === "zh" ? "zh-CN" : "en"}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeAttr(title)}</title><meta name="description" content="${escapeAttr(description)}">
 <style>${BASE_CSS}</style></head><body>${body}
-${authenticated === null ? "" : `<script>window.__AUTHENTICATED__=${authenticated ? "true" : "false"};</script>`}
+<script>window.__LANG__=${JSON.stringify(lang)};window.__I18N__=${dictionary};${authScript}</script>
 <script>${CLIENT_HELPERS}${script}</script></body></html>`;
 }
-var NAV = `<header class="nav"><div class="wrap">
-<a class="brand" href="/"><span class="mark">W</span> Workers AI2API</a>
-<span class="pill"><span class="dot" id="health-dot"></span><span id="health-text">checking</span></span>
+function nav(lang, { status = false } = {}) {
+  return `<header class="nav"><div class="wrap">
+<a class="brand" href="/?lang=${lang}"><span class="mark">W</span> ${t(lang, "brand.name")}</a>
+${status ? `<span class="pill"><span class="dot" id="health-dot"></span><span id="health-text">${t(lang, "nav.status.checking")}</span></span>` : ""}
 <span class="spacer"></span>
-<a class="btn sm" href="/admin">Admin</a>
+<div class="lang-switch" role="group" aria-label="Language">
+<a href="?lang=zh" hreflang="zh" class="${lang === "zh" ? "active" : ""}">${t(lang, "nav.lang.zh")}</a>
+<a href="?lang=en" hreflang="en" class="${lang === "en" ? "active" : ""}">${t(lang, "nav.lang.en")}</a>
+</div>
+<a class="btn sm" href="/admin?lang=${lang}">${t(lang, "nav.admin")}</a>
 </div></header>`;
+}
 var LANDING_SCRIPT = `
-const state={models:[],meta:{},task:''};
+const state={models:[],meta:{}};
 async function load(){
   try{
     const [cat,stats]=await Promise.all([api('/api/catalog?include_paid=0'),api('/api/stats').catch(()=>({}))]);
     state.models=cat.data||[];state.meta=cat.meta||{};
-    $('#health-text').textContent=state.meta.stale?'catalog cached':'catalog live';
-    $('#health-dot').className='dot'+(state.meta.stale?' off':'');
+    $('#health-text').textContent=state.meta.stale?T('nav.status.cached'):T('nav.status.live');
+    $('#health-dot').className='dot'+(state.meta.stale?' warn':'');
     $('#stat-models').textContent=nf(state.meta.free_models??state.models.length);
     $('#stat-neurons').textContent=nf(state.meta.free_daily_neurons||10000);
     $('#stat-accounts').textContent=nf(stats.total_accounts||0);
-    $('#stat-usage').textContent=(stats.usage_percentage??0)+'%';
+    const pct=Number(stats.usage_percentage)||0;
+    $('#stat-usage').textContent=pct.toFixed(pct>=10?0:1)+'%';
+    $('#usage-fill').style.width=Math.min(100,pct)+'%';
+    const daily=Number(stats.free_daily_neurons)||10000;
+    const total=daily*(Number(stats.total_accounts)||0);
+    $('#stat-remaining').textContent=total?nf(Math.max(0,Math.round(total*(1-pct/100)))):'\u2014';
+    $('#stat-backend').textContent=stats.quota_backend||'\u2014';
+    const authors=Object.keys(state.meta.authors||{}).length;
+    $('#coverage').textContent=T('landing.coverage',{free:state.meta.free_models??state.models.length,partners:state.meta.partner_models??0,authors});
     const tasks=[...new Set(state.models.map(m=>m.task))].sort();
-    $('#task-filter').innerHTML='<option value="">All tasks</option>'+tasks.map(t=>'<option value="'+esc(t)+'">'+esc(taskLabel(t))+'</option>').join('');
+    $('#task-filter').innerHTML='<option value="">'+esc(T('common.allTasks'))+'</option>'+tasks.map(t=>'<option value="'+esc(t)+'">'+esc(taskLabel(t))+'</option>').join('');
     render();
-  }catch(e){$('#health-text').textContent='offline';$('#error').textContent=e.message;$('#error').className='msg show err'}
+  }catch(e){
+    $('#health-text').textContent=T('nav.status.offline');
+    $('#health-dot').className='dot off';
+    const el=$('#error');el.textContent=e.message;el.className='msg show err';
+  }
 }
 function render(){
   const q=($('#search').value||'').toLowerCase();const task=$('#task-filter').value;
   let rows=state.models.filter(m=>(!task||m.task===task)&&(!q||(m.id+' '+m.name+' '+m.description).toLowerCase().includes(q)));
   const sort=$('#sort').value;
-  const cmp={performance:(a,b)=>(b.performance?.score||0)-(a.performance?.score||0),price:(a,b)=>{const av=a.pricing?.tokens?.output_usd_per_million??a.pricing?.items?.[0]?.usd??Infinity;const bv=b.pricing?.tokens?.output_usd_per_million??b.pricing?.items?.[0]?.usd??Infinity;return av-bv},context:(a,b)=>(b.context_window||0)-(a.context_window||0),name:(a,b)=>a.name.localeCompare(b.name)};
+  const cmp={performance:(a,b)=>(b.performance?.score||0)-(a.performance?.score||0),price:(a,b)=>{const av=a.pricing?.tokens?.output_usd_per_million??a.pricing?.items?.[0]?.usd??Infinity;const bv=b.pricing?.tokens?.output_usd_per_million??b.pricing?.items?.[0]?.usd??Infinity;return av-bv},context:(a,b)=>(b.context_window||0)-(a.context_window||0),name:(a,b)=>a.name.localeCompare(b.name),updated:(a,b)=>(Date.parse(b.created_at||0)||0)-(Date.parse(a.created_at||0)||0)};
   rows=[...rows].sort(cmp[sort]||cmp.performance);
   $('#model-rows').innerHTML=rows.map((m,i)=>{
     const t=m.performance||{};const c=caps(m);
-    return '<tr><td><span class="rank">'+(t.rank||i+1)+'</span></td>'+
-      '<td><div class="model-name">'+esc(m.name)+'</div><div class="model-id">'+esc(m.id)+'</div></td>'+
-      '<td><span class="badge">'+esc(taskLabel(m.task))+'</span></td>'+
-      '<td class="nowrap">'+(m.context_window?nf(m.context_window)+' tok':'\u2014')+'</td>'+
-      '<td>'+(c.length?c.map(x=>'<span class="badge">'+esc(x)+'</span>').join(''):'<span class="muted">\u2014</span>')+'</td>'+
-      '<td class="price">'+esc(priceOf(m))+'</td>'+
-      '<td class="nowrap">'+(m.free_daily_output_tokens?nf(m.free_daily_output_tokens)+' tok/day':'\u2014')+'</td>'+
-      '<td><span class="tier '+tier(m)+'">'+tier(m)+'</span> <span class="tiny">'+(t.score??'\u2014')+'</span></td></tr>';
-  }).join('')||'<tr><td colspan="8" class="muted" style="padding:24px">No models match this filter.</td></tr>';
-  $('#model-count').textContent=rows.length+' of '+state.models.length+' free models';
+    return '<tr class="model-row" data-id="'+esc(m.id)+'" tabindex="0">'+
+      '<td><span class="rank">'+(t.rank||i+1)+'</span></td>'+
+      '<td><div class="model-name">'+esc(m.name)+'</div><div class="model-id">'+esc(m.id)+'</div>'+(m.deprecated?'<span class="badge paid">'+esc(T('common.deprecated'))+'</span>':'')+'</td>'+
+      '<td data-label="'+esc(T('landing.table.task'))+'"><span class="badge">'+esc(taskLabel(m.task))+'</span></td>'+
+      '<td data-label="'+esc(T('landing.table.context'))+'" class="nowrap">'+(m.context_window?nf(m.context_window)+' tok':'\u2014')+'</td>'+
+      '<td data-label="'+esc(T('landing.table.caps'))+'">'+(c.length?c.map(x=>'<span class="badge">'+esc(x)+'</span>').join(''):'<span class="muted">\u2014</span>')+'</td>'+
+      '<td data-label="'+esc(T('landing.table.price'))+'" class="price">'+esc(priceOf(m))+'</td>'+
+      '<td data-label="'+esc(T('landing.table.daily'))+'" class="nowrap">'+(m.free_daily_output_tokens?nf(m.free_daily_output_tokens)+' tok/day':'\u2014')+'</td>'+
+      '<td data-label="'+esc(T('landing.table.tier'))+'"><span class="tier '+tier(m)+'">'+tier(m)+'</span> <span class="tiny">'+(t.score??'\u2014')+'</span></td></tr>';
+  }).join('')||'<tr><td colspan="8" class="muted" style="padding:24px">'+esc(T('landing.noMatch'))+'</td></tr>';
+  $('#model-count').textContent=T('landing.count',{shown:rows.length,total:state.models.length});
+}
+function openModel(id){
+  const m=state.models.find(x=>x.id===id);if(!m)return;
+  const t=m.performance||{};const c=caps(m);
+  const items=(m.pricing?.items||[]).map(it=>'<li><span class="mono small">'+esc(priceKind(it.kind))+'</span><span class="price">'+(it.usd!=null?'$'+it.usd:'')+(it.neurons!=null?' \xB7 '+nf(it.neurons)+' n':'')+'</span></li>').join('')||'<li class="muted">\u2014</li>';
+  const rows=[
+    [T('detail.id'),'<span class="mono">'+esc(m.id)+'</span> <button class="btn sm" data-copy-id="'+esc(m.id)+'">'+esc(T('common.copy'))+'</button>'],
+    [T('detail.author'),esc(m.owned_by||m.author||'\u2014')],
+    [T('detail.task'),esc(taskLabel(m.task))],
+    [T('detail.context'),m.context_window?nf(m.context_window)+' tok':'\u2014'],
+    [T('detail.maxOutput'),m.max_output_tokens?nf(m.max_output_tokens)+' tok':'\u2014'],
+    [T('detail.daily'),m.free_daily_output_tokens?nf(m.free_daily_output_tokens)+' tok/day':'\u2014'],
+    [T('detail.rank'),'#'+(t.rank||'\u2014')+' \xB7 '+T('detail.score')+' '+(t.score??'\u2014')+' ('+tier(m)+')'],
+    [T('detail.released'),m.created?new Date(m.created*1000).toLocaleDateString(window.__LANG__==='zh'?'zh-CN':'en-US'):'\u2014'],
+  ];
+  $('#dlg-head').innerHTML='<div><h3>'+esc(m.name)+'</h3><div class="model-id">'+esc(m.id)+'</div></div>'+(m.deprecated?'<span class="badge paid">'+esc(T('common.deprecated'))+'</span>':'')+'<button class="btn sm" data-close="1">'+esc(T('common.close'))+'</button>';
+  $('#dlg-body').innerHTML='<dl class="dlg-grid">'+rows.map(([k,v])=>'<div><dt>'+esc(k)+'</dt><dd>'+v+'</dd></div>').join('')+'</dl>'+
+    '<div class="dlg-section"><h4>'+esc(T('detail.caps'))+'</h4>'+(c.length?c.map(x=>'<span class="badge">'+esc(x)+'</span>').join(''):'<span class="muted">\u2014</span>')+'</div>'+
+    '<div class="dlg-section"><h4>'+esc(T('detail.price'))+'</h4><ul class="list">'+items+'</ul></div>'+
+    '<div class="dlg-section"><h4>'+esc(T('detail.endpoints'))+'</h4>'+(m.endpoints||[]).map(x=>'<span class="badge">'+esc(x)+'</span>').join('')+'</div>'+
+    '<div class="dlg-section"><h4>'+esc(T('detail.aliases'))+'</h4>'+(m.aliases||[]).map(x=>'<span class="badge">'+esc(x)+'</span>').join('')+'</div>'+
+    '<div class="dlg-section"><a class="btn sm" href="'+esc(m.docs_url||'https://developers.cloudflare.com/workers-ai/models/')+'" target="_blank" rel="noopener">'+esc(T('detail.docs'))+'</a></div>';
+  const d=$('#model-dialog');
+  if(typeof d.showModal==='function')d.showModal();else d.setAttribute('open','');
 }
 $('#task-filter').addEventListener('change',render);$('#sort').addEventListener('change',render);$('#search').addEventListener('input',render);
-$('#copy').addEventListener('click',async()=>{try{await copyText($('#endpoint').textContent.trim());$('#copy').textContent='Copied';setTimeout(()=>$('#copy').textContent='Copy',1400)}catch{}});
+$('#copy').addEventListener('click',async()=>{try{await copyText($('#endpoint').textContent.trim());$('#copy').textContent=T('common.copied');setTimeout(()=>$('#copy').textContent=T('common.copy'),1400)}catch{}});
+$('#model-rows').addEventListener('click',e=>{const tr=e.target.closest('tr[data-id]');if(tr)openModel(tr.dataset.id)});
+$('#model-rows').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){const tr=e.target.closest('tr[data-id]');if(tr){e.preventDefault();openModel(tr.dataset.id)}}});
+$('#model-dialog').addEventListener('click',async(e)=>{
+  if(e.target===$('#model-dialog')){e.target.close();return}
+  const close=e.target.closest('[data-close]');if(close){$('#model-dialog').close();return}
+  const copy=e.target.closest('[data-copy-id]');if(copy){try{await copyText(copy.dataset.copyId);copy.textContent=T('common.copied')}catch{}}
+});
 $('#endpoint').textContent=location.origin+'/v1';
 load();
 `;
-async function handleLandingPage() {
-  const body = `${NAV}
+async function handleLandingPage(request) {
+  const lang = resolveLang(request);
+  const body = `${nav(lang, { status: true })}
 <main>
-<section class="hero"><div class="wrap">
-<p class="eyebrow">Independent \xB7 Cloudflare Workers AI</p>
-<h1>Every free Workers AI model.<br>One OpenAI-compatible endpoint.</h1>
-<p class="lead">A dynamic model catalog, per-account free-neuron accounting, and streaming chat, embeddings, images, audio and Anthropic Messages \u2014 deployed at the edge.</p>
-<div class="endpoint"><code id="endpoint">/v1</code><button id="copy">Copy</button></div>
-<div class="stats">
-<div class="stat"><b id="stat-models">\u2014</b><span>free models, live catalog</span></div>
-<div class="stat"><b id="stat-neurons">10,000</b><span>free neurons / account / day</span></div>
-<div class="stat"><b id="stat-accounts">\u2014</b><span>accounts connected</span></div>
-<div class="stat"><b id="stat-usage">\u2014</b><span>of daily quota used</span></div>
-</div>
+<section class="hero"><div class="wrap hero-grid">
+<div class="hero-copy">
+<p class="eyebrow">${t(lang, "landing.eyebrow")}</p>
+<h1>${t(lang, "landing.h1")}</h1>
+<p class="lead">${t(lang, "landing.lead")}</p>
+<div class="endpoint"><code id="endpoint">/v1</code><button id="copy">${t(lang, "common.copy")}</button></div>
+<p class="hero-meta" id="coverage">\u2014</p>
 <div id="error" class="msg err"></div>
+</div>
+<aside class="ledger" aria-label="${t(lang, "landing.ledger.title")}">
+<div class="ledger-head"><span>${t(lang, "landing.ledger.title")}</span><span class="stamp">FREE</span></div>
+<div class="ledger-big"><b id="stat-neurons">10,000</b><span>${t(lang, "landing.stat.neurons")}</span></div>
+<div class="meter" role="img" aria-label="${t(lang, "landing.stat.usage")}"><i id="usage-fill"></i></div>
+<div class="meter-labels"><span id="stat-usage">0%</span><span>${t(lang, "landing.ledger.caption")}</span></div>
+<dl class="ledger-grid">
+<div><dt>${t(lang, "landing.stat.freeModels")}</dt><dd id="stat-models">\u2014</dd></div>
+<div><dt>${t(lang, "landing.stat.accounts")}</dt><dd id="stat-accounts">\u2014</dd></div>
+<div><dt>${t(lang, "landing.ledger.backend")}</dt><dd id="stat-backend">\u2014</dd></div>
+<div><dt>${t(lang, "landing.ledger.remaining")}</dt><dd id="stat-remaining">\u2014</dd></div>
+</dl>
+<p class="tiny">${t(lang, "landing.ledger.note")}</p>
+</aside>
 </div></section>
+
 <section class="block" id="models"><div class="wrap">
-<div class="block-head"><div><h2>Free model catalog</h2><p id="model-count">Loading\u2026</p></div>
-<div class="toolbar"><input id="search" placeholder="Search models\u2026" style="width:210px"><select id="task-filter"><option value="">All tasks</option></select><select id="sort"><option value="performance">Performance</option><option value="price">Price</option><option value="context">Context</option><option value="name">Name</option></select></div></div>
-<div class="table-wrap"><table><thead><tr><th>#</th><th>Model</th><th>Task</th><th>Context</th><th>Capabilities</th><th>Price (USD)</th><th>Free daily output</th><th>Tier</th></tr></thead><tbody id="model-rows"><tr><td colspan="8" style="padding:24px" class="muted">Loading live catalog\u2026</td></tr></tbody></table></div>
-<p class="tiny" style="margin-top:10px">Ranking is a transparent estimate from parameters, capabilities, context, recency and price. Paid-only models are hidden. Prices come from Cloudflare's live pricing page; the free allowance is 10,000 neurons per account per UTC day.</p>
+<div class="block-head"><div><h2>${t(lang, "landing.catalog.title")}</h2><p id="model-count">${t(lang, "common.loading")}</p></div>
+<div class="toolbar">
+<input id="search" aria-label="${t(lang, "common.search")}" placeholder="${t(lang, "common.search")}" style="width:210px">
+<select id="task-filter" aria-label="${t(lang, "landing.table.task")}"><option value="">${t(lang, "common.allTasks")}</option></select>
+<select id="sort" aria-label="${t(lang, "landing.table.tier")}"><option value="performance">${t(lang, "landing.sort.performance")}</option><option value="price">${t(lang, "landing.sort.price")}</option><option value="context">${t(lang, "landing.sort.context")}</option><option value="updated">${t(lang, "landing.sort.updated")}</option><option value="name">${t(lang, "landing.sort.name")}</option></select>
+</div></div>
+<div class="table-wrap models-table"><table><thead><tr><th>#</th><th>${t(lang, "landing.table.model")}</th><th>${t(lang, "landing.table.task")}</th><th>${t(lang, "landing.table.context")}</th><th>${t(lang, "landing.table.caps")}</th><th>${t(lang, "landing.table.price")}</th><th>${t(lang, "landing.table.daily")}</th><th>${t(lang, "landing.table.tier")}</th></tr></thead><tbody id="model-rows"><tr><td colspan="8" style="padding:24px" class="muted">${t(lang, "common.loading")}</td></tr></tbody></table></div>
+<p class="tiny" style="margin-top:10px">${t(lang, "landing.footnote")}</p>
+<p class="tiny">${t(lang, "landing.paidNote")}</p>
 </div></section>
+
 <section class="block"><div class="wrap"><div class="cards">
-<div class="card"><h3>Workers AI vs AI Gateway</h3><p>One runs models and bills neurons. The other is a control layer for caching, logs, retries and unified billing.</p><a href="/docs/workers-ai-vs-ai-gateway">Read the analysis \u2192</a></div>
-<div class="card"><h3>OpenAI-compatible API</h3><p><code>/v1/chat/completions</code>, embeddings, images, audio, rerank, Anthropic Messages and a generic <code>/v1/run</code>.</p><a href="/docs/api">Endpoint reference \u2192</a></div>
-<div class="card"><h3>Hard free-tier guard</h3><p>Atomic per-account reservations stop requests before the 10,000-neuron daily allocation is exceeded.</p><a href="/docs/free-tier">How accounting works \u2192</a></div>
+<div class="card"><h3>${t(lang, "landing.cards.vs.title")}</h3><p>${t(lang, "landing.cards.vs.body")}</p><a href="/docs/workers-ai-vs-ai-gateway?lang=${lang}">${t(lang, "landing.cards.vs.link")}</a></div>
+<div class="card"><h3>${t(lang, "landing.cards.api.title")}</h3><p>${t(lang, "landing.cards.api.body")}</p><a href="/docs/api?lang=${lang}">${t(lang, "landing.cards.api.link")}</a></div>
+<div class="card"><h3>${t(lang, "landing.cards.quota.title")}</h3><p>${t(lang, "landing.cards.quota.body")}</p><a href="/docs/free-tier?lang=${lang}">${t(lang, "landing.cards.quota.link")}</a></div>
 </div></div></section>
 </main>
-<footer><div class="wrap">Workers AI2API v2 \xB7 Independent project, not affiliated with Cloudflare. Model data and prices belong to Cloudflare.</div></footer>`;
-  return shell({ title: "Workers AI2API \u2014 OpenAI-compatible Workers AI gateway", body, script: LANDING_SCRIPT });
+<dialog id="model-dialog"><div class="dlg-head" id="dlg-head"></div><div class="dlg-body" id="dlg-body"></div></dialog>
+<footer><div class="wrap">${t(lang, "landing.footer")}</div></footer>`;
+  return shell({
+    title: t(lang, "landing.title"),
+    description: t(lang, "landing.metaDesc"),
+    body,
+    script: LANDING_SCRIPT,
+    lang
+  });
 }
-var ADMIN_LOGIN = `<div class="login"><div class="card">
-<div class="brand" style="margin-bottom:18px"><span class="mark">W</span> Workers AI2API</div>
-<h2 style="font-size:22px;letter-spacing:-.03em;margin:0 0 4px">Admin sign in</h2>
-<p class="sub" style="margin:0 0 18px">Use the <code>ADMIN_PASSWORD</code> configured on this deployment.</p>
-<form id="login-form"><label class="field"><span>Password</span><input type="password" id="password" autocomplete="current-password" required autofocus></label>
-<button class="btn primary" style="width:100%" type="submit">Sign in</button></form>
-<div id="login-msg" class="msg"></div>
-<p class="tiny" style="margin-top:16px"><a href="/">\u2190 Back to public site</a></p>
-</div></div>`;
+var ADMIN_LOGIN_SCRIPT = `
+$('#login-form').addEventListener('submit',async(e)=>{e.preventDefault();try{await api('/api/auth/login',{method:'POST',body:JSON.stringify({password:$('#password').value})});location.reload()}catch(err){const m=$('#login-msg');m.textContent=err.message;m.className='msg show err'}});
+`;
 var ADMIN_SCRIPT = `
 const state={overview:null,catalog:null,tab:'overview'};
-function showLogin(){bindLogin()}
-function bindLogin(){$('#login-form')?.addEventListener('submit',async(e)=>{e.preventDefault();try{await api('/api/auth/login',{method:'POST',body:JSON.stringify({password:$('#password').value})});location.reload()}catch(err){setMsg($('#login-msg'),err.message,false)}})}
 async function boot(){
-  if(!window.__AUTHENTICATED__){showLogin();return}
+  if(!window.__AUTHENTICATED__)return;
   $('#logout').addEventListener('click',async()=>{await api('/api/auth/logout',{method:'POST'});location.reload()});
-  $$('.side button').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tab)));
+  $$('.side button[data-tab]').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tab)));
   bindOverview();bindModels();bindAccounts();bindKeys();bindSettings();
   await Promise.all([loadOverview(),loadModels()]);
 }
@@ -10412,55 +10933,57 @@ async function loadOverview(){
   try{const d=await api('/api/admin/overview');state.overview=d;const u=d.usage;
     $('#kpi-used').textContent=nf(u.totalNeuronsToday);$('#kpi-limit').textContent=nf(u.totalLimit);$('#kpi-remaining').textContent=nf(u.remainingNeurons);$('#kpi-accounts').textContent=nf(u.totalAccounts);
     $('#usage-pct').textContent=(u.usagePercentage||0)+'%';$('#usage-bar').style.width=Math.min(100,u.usagePercentage||0)+'%';
-    $('#usage-note').textContent='Local atomic accounting: '+nf(u.totalNeuronsToday)+' used + '+nf(u.reservedNeurons)+' reserved. Cloud analytics: '+nf(u.cloudNeuronsToday)+'. Backend: '+u.quotaBackend+'.';
-    $('#account-usage').innerHTML=(u.accounts||[]).map(a=>'<li><span>'+esc(a.name)+'<br><span class="tiny mono">'+esc(a.accountId)+'</span></span><span class="price">'+nf(a.used)+' / '+nf(a.limit)+(a.error?' <span class="badge paid">error</span>':'')+'</span></li>').join('')||'<li class="muted">No active accounts.</li>';
-    $('#model-usage').innerHTML=(u.modelsToday||[]).slice(0,8).map(m=>'<li><span class="mono small">'+esc(m.model)+'</span><span class="price">'+nf(m.neurons)+' n</span></li>').join('')||'<li class="muted">No cloud usage data yet.</li>';
-    $('#env-info').innerHTML='<dt>Version</dt><dd>'+esc(d.version)+'</dd><dt>KV</dt><dd>'+(d.environment.kv?'bound':'missing')+'</dd><dt>Quota</dt><dd>'+esc(d.environment.quota)+'</dd><dt>Max daily</dt><dd>'+nf(d.environment.maxDailyNeurons)+'</dd><dt>Admin password</dt><dd>'+(d.environment.adminPassword?'set':'missing')+'</dd>';
+    $('#usage-note').textContent=T('admin.quota.note',{used:nf(u.totalNeuronsToday),reserved:nf(u.reservedNeurons),cloud:nf(u.cloudNeuronsToday),backend:u.quotaBackend});
+    $('#account-usage').innerHTML=(u.accounts||[]).map(a=>'<li><span>'+esc(a.name)+'<br><span class="tiny mono">'+esc(a.accountId)+'</span></span><span class="price">'+nf(a.used)+' / '+nf(a.limit)+(a.error?' <span class="badge paid">error</span>':'')+'</span></li>').join('')||'<li class="muted">'+esc(T('admin.noAccounts'))+'</li>';
+    $('#model-usage').innerHTML=(u.modelsToday||[]).slice(0,8).map(m=>'<li><span class="mono small">'+esc(m.model)+'</span><span class="price">'+nf(m.neurons)+' n</span></li>').join('')||'<li class="muted">'+esc(T('admin.noUsage'))+'</li>';
+    $('#env-info').innerHTML='<dt>'+T('admin.env.version')+'</dt><dd>'+esc(d.version)+'</dd><dt>'+T('admin.env.kv')+'</dt><dd>'+(d.environment.kv?T('common.bound'):T('common.missing'))+'</dd><dt>'+T('admin.env.quota')+'</dt><dd>'+esc(d.environment.quota)+'</dd><dt>'+T('admin.env.maxDaily')+'</dt><dd>'+nf(d.environment.maxDailyNeurons)+'</dd><dt>'+T('admin.env.adminPassword')+'</dt><dd>'+(d.environment.adminPassword?T('common.set'):T('common.missing'))+'</dd>';
   }catch(e){location.reload()}
 }
-function bindOverview(){$('#refresh-usage').addEventListener('click',async(e)=>{e.target.disabled=true;e.target.textContent='Refreshing\u2026';try{const d=await api('/api/admin/usage?force=1');$('#usage-note').textContent='Refreshed. Local '+nf(d.totalNeuronsToday)+' n; cloud '+nf(d.cloudNeuronsToday)+' n.';await loadOverview()}catch(err){alert(err.message)}finally{e.target.disabled=false;e.target.textContent='Refresh analytics'}})}
+function bindOverview(){$('#refresh-usage').addEventListener('click',async(e)=>{const btn=e.target;btn.disabled=true;btn.textContent=T('common.refreshing');try{const d=await api('/api/admin/usage?force=1');$('#usage-note').textContent=T('admin.quota.refreshed',{local:nf(d.totalNeuronsToday),cloud:nf(d.cloudNeuronsToday)});await loadOverview()}catch(err){alert(err.message)}finally{btn.disabled=false;btn.textContent=T('admin.quota.refresh')}})}
 async function loadModels(){
   try{const cat=await api('/api/admin/catalog');state.catalog=cat;
-    $('#catalog-meta').textContent='Source: '+(cat.meta.source||'?')+' \xB7 '+(cat.meta.free_models||0)+' free / '+(cat.meta.paid_models||0)+' paid \xB7 updated '+new Date(cat.meta.fetched_at).toLocaleString();
+    $('#catalog-meta').textContent=T('admin.models.source',{source:cat.meta.source||'?',free:cat.meta.free_models||0,paid:cat.meta.paid_models||0,deprecated:cat.meta.deprecated_models||0,time:new Date(cat.meta.fetched_at).toLocaleString()});
+    $('#catalog-coverage').textContent=T('admin.models.coverage',{partner:cat.meta.partner_models||0,authors:Object.keys(cat.meta.authors||{}).length,tasks:Object.keys(cat.meta.tasks||{}).length});
     const tasks=[...new Set(cat.data.map(m=>m.task))].sort();
-    $('#model-task').innerHTML='<option value="">All tasks</option>'+tasks.map(t=>'<option value="'+esc(t)+'">'+esc(taskLabel(t))+'</option>').join('');
+    $('#model-task').innerHTML='<option value="">'+esc(T('common.allTasks'))+'</option>'+tasks.map(t=>'<option value="'+esc(t)+'">'+esc(taskLabel(t))+'</option>').join('');
     renderAdminModels();
   }catch(e){$('#catalog-meta').textContent=e.message}
 }
 function renderAdminModels(){
   const cat=state.catalog;if(!cat)return;const q=($('#model-search').value||'').toLowerCase();const task=$('#model-task').value;const paid=$('#model-paid').checked;
   let models=cat.data.filter(m=>(!task||m.task===task)&&(paid||m.free)&&(!q||(m.id+' '+m.name+' '+m.description).toLowerCase().includes(q)));
+  models=models.map((m,i)=>({...m,performance:{...(m.performance||{}),rank:i+1}}));
   $('#admin-model-rows').innerHTML=models.map(m=>{
     const t=m.performance||{};
-    return '<tr><td><span class="rank">'+(t.rank||'\u2014')+'</span></td><td><div class="model-name">'+esc(m.name)+'</div><div class="model-id">'+esc(m.id)+'</div>'+(m.requires_paid?'<span class="badge paid">paid plan</span>':'')+'</td>'+
-    '<td><span class="badge">'+esc(taskLabel(m.task))+'</span></td><td class="nowrap">'+(m.context_window?nf(m.context_window):'\u2014')+'</td><td>'+caps(m).map(x=>'<span class="badge">'+esc(x)+'</span>').join('')+'</td>'+
-    '<td class="price">'+esc(priceOf(m))+'</td><td class="nowrap">'+nf(m.pricing?.tokens?.output_neurons_per_million)+' n/M</td><td><span class="tier '+tier(m)+'">'+tier(m)+'</span> '+(t.score??'\u2014')+'</td></tr>';
-  }).join('')||'<tr><td colspan="8" class="muted" style="padding:20px">No models.</td></tr>';
-  $('#admin-model-count').textContent=models.length+' models';
+    return '<tr><td><span class="rank">'+(t.rank||'\u2014')+'</span></td><td><div class="model-name">'+esc(m.name)+'</div><div class="model-id">'+esc(m.id)+'</div>'+(m.requires_paid?'<span class="badge paid">'+esc(T('common.paidOnly'))+'</span>':'')+(m.deprecated?'<span class="badge paid">'+esc(T('common.deprecated'))+'</span>':'')+'</td>'+
+    '<td data-label="'+esc(T('landing.table.task'))+'"><span class="badge">'+esc(taskLabel(m.task))+'</span></td><td data-label="'+esc(T('landing.table.context'))+'" class="nowrap">'+(m.context_window?nf(m.context_window):'\u2014')+'</td><td data-label="'+esc(T('landing.table.caps'))+'">'+caps(m).map(x=>'<span class="badge">'+esc(x)+'</span>').join('')+'</td>'+
+    '<td data-label="'+esc(T('landing.table.price'))+'" class="price">'+esc(priceOf(m))+'</td><td data-label="'+esc(T('landing.table.neurons'))+'" class="nowrap">'+nf(m.pricing?.tokens?.output_neurons_per_million)+' n/M</td><td data-label="'+esc(T('landing.table.tier'))+'"><span class="tier '+tier(m)+'">'+tier(m)+'</span> '+(t.score??'\u2014')+'</td></tr>';
+  }).join('')||'<tr><td colspan="8" class="muted" style="padding:20px">'+esc(T('admin.models.noMatch'))+'</td></tr>';
+  $('#admin-model-count').textContent=T('admin.models.count',{n:models.length});
 }
 function bindModels(){
   ['#model-search','#model-task','#model-paid'].forEach(s=>$(s)?.addEventListener('input',renderAdminModels));
-  $('#refresh-catalog').addEventListener('click',async(e)=>{e.target.disabled=true;e.target.textContent='Refreshing\u2026';try{state.catalog=await api('/api/admin/catalog/refresh',{method:'POST'});renderAdminModels();$('#catalog-meta').textContent='Source: '+state.catalog.meta.source+' \xB7 updated '+new Date(state.catalog.meta.fetched_at).toLocaleString()}catch(err){alert(err.message)}finally{e.target.disabled=false;e.target.textContent='Refresh catalog'}});
+  $('#refresh-catalog').addEventListener('click',async(e)=>{const btn=e.target;btn.disabled=true;btn.textContent=T('common.refreshing');try{state.catalog=await api('/api/admin/catalog/refresh',{method:'POST'});renderAdminModels();$('#catalog-meta').textContent=T('admin.models.source',{source:state.catalog.meta.source,free:state.catalog.meta.free_models||0,paid:state.catalog.meta.paid_models||0,deprecated:state.catalog.meta.deprecated_models||0,time:new Date(state.catalog.meta.fetched_at).toLocaleString()});$('#catalog-coverage').textContent=T('admin.models.coverage',{partner:state.catalog.meta.partner_models||0,authors:Object.keys(state.catalog.meta.authors||{}).length,tasks:Object.keys(state.catalog.meta.tasks||{}).length})}catch(err){alert(err.message)}finally{btn.disabled=false;btn.textContent=T('admin.models.refresh')}});
 }
 async function loadAccounts(){
-  try{const d=await api('/api/admin/accounts');$('#account-rows').innerHTML=d.accounts.map(a=>'<tr><td><div class="model-name">'+esc(a.name)+'</div><div class="model-id">'+esc(a.accountId)+'</div></td><td class="mono tiny">'+esc(a.tokenPreview)+'</td><td><span class="badge '+(a.status==='active'?'':'paid')+'">'+esc(a.status)+'</span></td><td>'+new Date(a.createdAt).toLocaleDateString()+'</td><td class="row-actions"><button class="btn sm" data-toggle-account="'+esc(a.id)+'" data-status="'+(a.status==='active'?'disabled':'active')+'">'+(a.status==='active'?'Disable':'Enable')+'</button><button class="btn sm danger" data-del-account="'+esc(a.id)+'">Delete</button></td></tr>').join('')||'<tr><td colspan="5" class="muted" style="padding:20px">No accounts yet.</td></tr>';
-    $$('[data-del-account]').forEach(b=>b.onclick=async()=>{if(!confirm('Remove this account?'))return;await api('/api/admin/accounts/'+encodeURIComponent(b.dataset.delAccount),{method:'DELETE'});loadAccounts();loadOverview()});
+  try{const d=await api('/api/admin/accounts');$('#account-rows').innerHTML=d.accounts.map(a=>'<tr><td><div class="model-name">'+esc(a.name)+'</div><div class="model-id">'+esc(a.accountId)+'</div></td><td class="mono tiny">'+esc(a.tokenPreview)+'</td><td><span class="badge '+(a.status==='active'?'':'paid')+'">'+esc(a.status==='active'?T('common.active'):T('common.disabled'))+'</span></td><td>'+new Date(a.createdAt).toLocaleDateString()+'</td><td class="row-actions"><button class="btn sm" data-toggle-account="'+esc(a.id)+'" data-status="'+(a.status==='active'?'disabled':'active')+'">'+(a.status==='active'?T('common.disable'):T('common.enable'))+'</button><button class="btn sm danger" data-del-account="'+esc(a.id)+'">'+T('common.delete')+'</button></td></tr>').join('')||'<tr><td colspan="5" class="muted" style="padding:20px">'+esc(T('admin.accounts.noAccounts'))+'</td></tr>';
+    $$('[data-del-account]').forEach(b=>b.onclick=async()=>{if(!confirm(T('admin.accounts.confirm')))return;await api('/api/admin/accounts/'+encodeURIComponent(b.dataset.delAccount),{method:'DELETE'});loadAccounts();loadOverview()});
     $$('[data-toggle-account]').forEach(b=>b.onclick=async()=>{await api('/api/admin/accounts/'+encodeURIComponent(b.dataset.toggleAccount),{method:'PATCH',body:JSON.stringify({status:b.dataset.status})});loadAccounts()});
   }catch(e){alert(e.message)}
 }
 function bindAccounts(){
-  $('#account-form').addEventListener('submit',async(e)=>{e.preventDefault();const f=new FormData(e.target);try{await api('/api/admin/accounts',{method:'POST',body:JSON.stringify({name:f.get('name'),accountId:f.get('accountId'),apiToken:f.get('apiToken')})});setMsg($('#account-msg'),'Account added.',true);e.target.reset();loadAccounts();loadOverview()}catch(err){setMsg($('#account-msg'),err.message,false)}});
-  $('#test-account').addEventListener('click',async()=>{const f=new FormData($('#account-form'));try{const d=await api('/api/admin/accounts/test',{method:'POST',body:JSON.stringify({accountId:f.get('accountId'),apiToken:f.get('apiToken')})});setMsg($('#account-msg'),d.ok?'Token works. Models visible: '+d.models:(d.error||'Token failed'),d.ok)}catch(err){setMsg($('#account-msg'),err.message,false)}});
+  $('#account-form').addEventListener('submit',async(e)=>{e.preventDefault();const f=new FormData(e.target);try{await api('/api/admin/accounts',{method:'POST',body:JSON.stringify({name:f.get('name'),accountId:f.get('accountId'),apiToken:f.get('apiToken')})});setMsg($('#account-msg'),T('admin.accounts.added'),true);e.target.reset();loadAccounts();loadOverview()}catch(err){setMsg($('#account-msg'),err.message,false)}});
+  $('#test-account').addEventListener('click',async()=>{const f=new FormData($('#account-form'));try{const d=await api('/api/admin/accounts/test',{method:'POST',body:JSON.stringify({accountId:f.get('accountId'),apiToken:f.get('apiToken')})});setMsg($('#account-msg'),d.ok?T('admin.accounts.tokenWorks',{n:d.models}):(d.error||'Token failed'),d.ok)}catch(err){setMsg($('#account-msg'),err.message,false)}});
 }
 async function loadKeys(){
-  try{const d=await api('/api/admin/keys');$('#key-rows').innerHTML=d.keys.map(k=>'<tr><td><div class="model-name">'+esc(k.name)+'</div><div class="model-id">'+esc(k.prefix)+'\u2026'+esc(k.last4)+'</div></td><td><span class="badge '+(k.enabled?'':'paid')+'">'+(k.enabled?'active':'disabled')+'</span></td><td class="tiny">'+(k.lastUsedAt?new Date(k.lastUsedAt).toLocaleString():'never')+'</td><td>'+new Date(k.createdAt).toLocaleDateString()+'</td><td class="row-actions"><button class="btn sm" data-toggle-key="'+esc(k.id)+'" data-enabled="'+(!k.enabled)+'">'+(k.enabled?'Disable':'Enable')+'</button><button class="btn sm danger" data-del-key="'+esc(k.id)+'">Delete</button></td></tr>').join('')||'<tr><td colspan="5" class="muted" style="padding:20px">No API keys yet.</td></tr>';
-    $$('[data-del-key]').forEach(b=>b.onclick=async()=>{if(!confirm('Delete this key?'))return;await api('/api/admin/keys/'+encodeURIComponent(b.dataset.delKey),{method:'DELETE'});loadKeys()});
+  try{const d=await api('/api/admin/keys');$('#key-rows').innerHTML=d.keys.map(k=>'<tr><td><div class="model-name">'+esc(k.name)+'</div><div class="model-id">'+esc(k.prefix)+'\u2026'+esc(k.last4)+'</div></td><td><span class="badge '+(k.enabled?'':'paid')+'">'+(k.enabled?T('common.active'):T('common.disabled'))+'</span></td><td class="tiny">'+(k.lastUsedAt?new Date(k.lastUsedAt).toLocaleString():T('common.never'))+'</td><td>'+new Date(k.createdAt).toLocaleDateString()+'</td><td class="row-actions"><button class="btn sm" data-toggle-key="'+esc(k.id)+'" data-enabled="'+(!k.enabled)+'">'+(k.enabled?T('common.disable'):T('common.enable'))+'</button><button class="btn sm danger" data-del-key="'+esc(k.id)+'">'+T('common.delete')+'</button></td></tr>').join('')||'<tr><td colspan="5" class="muted" style="padding:20px">'+esc(T('admin.keys.noKeys'))+'</td></tr>';
+    $$('[data-del-key]').forEach(b=>b.onclick=async()=>{if(!confirm(T('admin.keys.confirm')))return;await api('/api/admin/keys/'+encodeURIComponent(b.dataset.delKey),{method:'DELETE'});loadKeys()});
     $$('[data-toggle-key]').forEach(b=>b.onclick=async()=>{await api('/api/admin/keys/'+encodeURIComponent(b.dataset.toggleKey),{method:'PATCH',body:JSON.stringify({enabled:b.dataset.enabled==='true'})});loadKeys()});
   }catch(e){alert(e.message)}
 }
 function bindKeys(){
-  $('#key-form').addEventListener('submit',async(e)=>{e.preventDefault();const f=new FormData(e.target);try{const d=await api('/api/admin/keys',{method:'POST',body:JSON.stringify({name:f.get('name')})});e.target.reset();$('#new-key').style.display='block';$('#new-key-value').textContent=d.plaintext;setMsg($('#key-msg'),'Key created. Copy it now; it is not shown again.',true);loadKeys()}catch(err){setMsg($('#key-msg'),err.message,false)}});
-  $('#copy-key').addEventListener('click',async()=>{await copyText($('#new-key-value').textContent);$('#copy-key').textContent='Copied';setTimeout(()=>$('#copy-key').textContent='Copy',1200)});
+  $('#key-form').addEventListener('submit',async(e)=>{e.preventDefault();const f=new FormData(e.target);try{const d=await api('/api/admin/keys',{method:'POST',body:JSON.stringify({name:f.get('name')})});e.target.reset();$('#new-key').style.display='block';$('#new-key-value').textContent=d.plaintext;setMsg($('#key-msg'),T('admin.keys.created'),true);loadKeys()}catch(err){setMsg($('#key-msg'),err.message,false)}});
+  $('#copy-key').addEventListener('click',async()=>{await copyText($('#new-key-value').textContent);$('#copy-key').textContent=T('common.copied');setTimeout(()=>$('#copy-key').textContent=T('common.copy'),1200)});
 }
 async function loadSettings(){
   try{const d=await api('/api/admin/settings');const s=d.settings;
@@ -10470,98 +10993,118 @@ async function loadSettings(){
 }
 function bindSettings(){
   $('#settings-form').addEventListener('submit',async(e)=>{e.preventDefault();
-    let aliases,benchmarks;try{aliases=JSON.parse($('#aliases').value||'{}');benchmarks=JSON.parse($('#benchmarks').value||'{}')}catch(err){setMsg($('#settings-msg'),'Invalid JSON: '+err.message,false);return}
-    try{await api('/api/admin/settings',{method:'PUT',body:JSON.stringify({gatewayId:$('#gateway-id').value,allowPublic:$('#allow-public').checked,dailyNeurons:Number($('#daily-neurons').value),defaultMaxOutputTokens:Number($('#default-max').value),aliases,benchmarks})});setMsg($('#settings-msg'),'Settings saved.',true);loadOverview()}catch(err){setMsg($('#settings-msg'),err.message,false)}});
+    let aliases,benchmarks;try{aliases=JSON.parse($('#aliases').value||'{}');benchmarks=JSON.parse($('#benchmarks').value||'{}')}catch(err){setMsg($('#settings-msg'),T('admin.settings.invalidJson',{error:err.message}),false);return}
+    try{await api('/api/admin/settings',{method:'PUT',body:JSON.stringify({gatewayId:$('#gateway-id').value,allowPublic:$('#allow-public').checked,dailyNeurons:Number($('#daily-neurons').value),defaultMaxOutputTokens:Number($('#default-max').value),aliases,benchmarks})});setMsg($('#settings-msg'),T('admin.settings.saved'),true);loadOverview()}catch(err){setMsg($('#settings-msg'),err.message,false)}});
 }
 boot();
 `;
-function adminBody(authenticated) {
-  if (!authenticated) return ADMIN_LOGIN;
-  return `${NAV}
+function loginBody(lang) {
+  return `<div class="login"><div class="card">
+<div class="brand" style="margin-bottom:18px"><span class="mark">W</span> ${t(lang, "brand.name")}</div>
+<h2 style="font-size:22px;letter-spacing:-.03em;margin:0 0 4px">${t(lang, "admin.login.title")}</h2>
+<p class="sub" style="margin:0 0 18px">${t(lang, "admin.login.sub")}</p>
+<form id="login-form"><label class="field"><span>${t(lang, "admin.login.password")}</span><input type="password" id="password" autocomplete="current-password" required autofocus></label>
+<button class="btn primary" style="width:100%" type="submit">${t(lang, "admin.login.submit")}</button></form>
+<div id="login-msg" class="msg"></div>
+<p class="tiny" style="margin-top:16px"><a href="/?lang=${lang}">${t(lang, "admin.login.back")}</a></p>
+</div></div>`;
+}
+function adminBody(lang) {
+  return `${nav(lang)}
 <div class="app">
 <aside class="side">
-<button data-tab="overview" class="active">Overview</button>
-<button data-tab="models">Models</button>
-<button data-tab="accounts">Accounts</button>
-<button data-tab="keys">API keys</button>
-<button data-tab="settings">Settings</button>
-<button id="logout" style="margin-top:14px;color:var(--bad)">Sign out</button>
+<button data-tab="overview" class="active">${t(lang, "admin.nav.overview")}</button>
+<button data-tab="models">${t(lang, "admin.nav.models")}</button>
+<button data-tab="accounts">${t(lang, "admin.nav.accounts")}</button>
+<button data-tab="keys">${t(lang, "admin.nav.keys")}</button>
+<button data-tab="settings">${t(lang, "admin.nav.settings")}</button>
+<button id="logout" style="margin-top:14px;color:var(--bad)">${t(lang, "admin.nav.logout")}</button>
 </aside>
 <main class="main">
 <section id="tab-overview" class="tab active">
-<h2>Overview</h2><p class="sub">Free-neuron accounting, connected accounts and live usage.</p>
-<div class="kpis"><div class="kpi"><b id="kpi-used">\u2014</b><span>neurons used today</span></div><div class="kpi"><b id="kpi-limit">\u2014</b><span>daily free allowance</span></div><div class="kpi"><b id="kpi-remaining">\u2014</b><span>neurons remaining</span></div><div class="kpi"><b id="kpi-accounts">\u2014</b><span>active accounts</span></div></div>
+<h2>${t(lang, "admin.overview.title")}</h2><p class="sub">${t(lang, "admin.overview.sub")}</p>
+<div class="kpis"><div class="kpi"><b id="kpi-used">\u2014</b><span>${t(lang, "admin.kpi.used")}</span></div><div class="kpi"><b id="kpi-limit">\u2014</b><span>${t(lang, "admin.kpi.limit")}</span></div><div class="kpi"><b id="kpi-remaining">\u2014</b><span>${t(lang, "admin.kpi.remaining")}</span></div><div class="kpi"><b id="kpi-accounts">\u2014</b><span>${t(lang, "admin.kpi.accounts")}</span></div></div>
 <div class="split">
-<div class="card"><h3>Daily quota <span id="usage-pct" class="muted"></span></h3><div class="usage-bar"><i id="usage-bar"></i></div><p class="tiny" id="usage-note" style="margin-top:10px"></p><button class="btn sm" id="refresh-usage" style="margin-top:10px">Refresh analytics</button></div>
-<div class="card"><h3>Environment</h3><dl class="kv" id="env-info"></dl></div>
+<div class="card"><h3>${t(lang, "admin.quota.title")} <span id="usage-pct" class="muted"></span></h3><div class="usage-bar"><i id="usage-bar"></i></div><p class="tiny" id="usage-note" style="margin-top:10px"></p><button class="btn sm" id="refresh-usage" style="margin-top:10px">${t(lang, "admin.quota.refresh")}</button></div>
+<div class="card"><h3>${t(lang, "admin.env.title")}</h3><dl class="kv" id="env-info"></dl></div>
 </div>
 <div class="split" style="margin-top:16px">
-<div class="card"><h3>Per account</h3><ul class="list" id="account-usage"><li class="muted">Loading\u2026</li></ul></div>
-<div class="card"><h3>Top models today</h3><ul class="list" id="model-usage"><li class="muted">Loading\u2026</li></ul></div>
+<div class="card"><h3>${t(lang, "admin.perAccount.title")}</h3><ul class="list" id="account-usage"><li class="muted">${t(lang, "common.loading")}</li></ul></div>
+<div class="card"><h3>${t(lang, "admin.topModels.title")}</h3><ul class="list" id="model-usage"><li class="muted">${t(lang, "common.loading")}</li></ul></div>
 </div>
 </section>
 
 <section id="tab-models" class="tab">
-<h2>Models</h2><p class="sub" id="catalog-meta">Loading\u2026</p>
-<div class="toolbar"><input id="model-search" placeholder="Search models\u2026" style="width:220px"><select id="model-task"><option value="">All tasks</option></select><label class="pill"><input type="checkbox" id="model-paid" style="width:auto;margin-right:4px"> include paid-only</label><button class="btn sm" id="refresh-catalog">Refresh catalog</button><span class="tiny" id="admin-model-count"></span></div>
-<div class="table-wrap"><table><thead><tr><th>#</th><th>Model</th><th>Task</th><th>Context</th><th>Capabilities</th><th>Price (USD)</th><th>Neurons/M output</th><th>Tier</th></tr></thead><tbody id="admin-model-rows"></tbody></table></div>
-<p class="tiny" style="margin-top:10px">Free models are the only ones accepted by <code>/v1</code>. Paid-only models are shown for visibility and excluded by default. Prices and capabilities are refreshed from Cloudflare docs and the models API.</p>
+<h2>${t(lang, "admin.nav.models")}</h2><p class="sub" id="catalog-meta">${t(lang, "common.loading")}</p>
+<div class="toolbar"><input id="model-search" placeholder="${t(lang, "common.search")}" style="width:220px"><select id="model-task"><option value="">${t(lang, "common.allTasks")}</option></select><label class="pill"><input type="checkbox" id="model-paid" style="width:auto;margin-right:4px"> ${t(lang, "admin.models.includePaid")}</label><button class="btn sm" id="refresh-catalog">${t(lang, "admin.models.refresh")}</button><span class="tiny" id="admin-model-count"></span></div>
+<p class="tiny" id="catalog-coverage" style="margin:10px 0 0"></p>
+<div class="table-wrap models-table" style="margin-top:12px"><table><thead><tr><th>#</th><th>${t(lang, "landing.table.model")}</th><th>${t(lang, "landing.table.task")}</th><th>${t(lang, "landing.table.context")}</th><th>${t(lang, "landing.table.caps")}</th><th>${t(lang, "landing.table.price")}</th><th>${t(lang, "landing.table.neurons")}</th><th>${t(lang, "landing.table.tier")}</th></tr></thead><tbody id="admin-model-rows"></tbody></table></div>
+<p class="tiny" style="margin-top:10px">${t(lang, "admin.models.footnote")}</p>
 </section>
 
 <section id="tab-accounts" class="tab">
-<h2>Accounts</h2><p class="sub">Each Cloudflare account contributes 10,000 free neurons per UTC day. Requests fail over between accounts.</p>
-<div class="card" style="margin-bottom:16px"><h3>Add account</h3>
+<h2>${t(lang, "admin.nav.accounts")}</h2><p class="sub">${t(lang, "admin.accounts.sub")}</p>
+<div class="card" style="margin-bottom:16px"><h3>${t(lang, "admin.accounts.addTitle")}</h3>
 <form class="form" id="account-form">
-<label class="field"><span>Name</span><input name="name" placeholder="Personal" required></label>
-<label class="field"><span>Account ID</span><input name="accountId" placeholder="32 hex characters" required></label>
-<label class="field wide"><span>API token (Workers AI Read &amp; Edit)</span><input name="apiToken" type="password" autocomplete="off" required></label>
-<div class="row-actions wide"><button class="btn primary" type="submit">Add account</button><button class="btn" type="button" id="test-account">Test token</button></div>
+<label class="field"><span>${t(lang, "admin.accounts.name")}</span><input name="name" placeholder="Personal" required></label>
+<label class="field"><span>${t(lang, "admin.accounts.accountId")}</span><input name="accountId" placeholder="32 hex characters" required></label>
+<label class="field wide"><span>${t(lang, "admin.accounts.token")}</span><input name="apiToken" type="password" autocomplete="off" required></label>
+<div class="row-actions wide"><button class="btn primary" type="submit">${t(lang, "admin.accounts.add")}</button><button class="btn" type="button" id="test-account">${t(lang, "admin.accounts.test")}</button></div>
 </form><div id="account-msg" class="msg"></div>
-<p class="tiny">Create a token at Cloudflare Dashboard \u2192 My Profile \u2192 API Tokens \u2192 Workers AI template. Add \u201CAccount Analytics Read\u201D if you want cloud usage reconciliation.</p></div>
-<div class="table-wrap"><table><thead><tr><th>Account</th><th>Token</th><th>Status</th><th>Added</th><th>Actions</th></tr></thead><tbody id="account-rows"></tbody></table></div>
+<p class="tiny">${t(lang, "admin.accounts.hint")}</p></div>
+<div class="table-wrap"><table><thead><tr><th>${t(lang, "admin.accounts.table.account")}</th><th>${t(lang, "admin.accounts.table.token")}</th><th>${t(lang, "admin.accounts.table.status")}</th><th>${t(lang, "admin.accounts.table.added")}</th><th>${t(lang, "admin.accounts.table.actions")}</th></tr></thead><tbody id="account-rows"></tbody></table></div>
 </section>
 
 <section id="tab-keys" class="tab">
-<h2>API keys</h2><p class="sub">Keys are stored as SHA-256 hashes. The plaintext is shown once.</p>
-<div class="card" style="margin-bottom:16px"><form class="form" id="key-form"><label class="field"><span>Key name</span><input name="name" placeholder="LobeChat" required></label><button class="btn primary" type="submit">Create key</button></form><div id="key-msg" class="msg"></div>
-<div id="new-key" style="display:none;margin-top:8px"><div class="note"><div class="tiny" style="margin-bottom:6px">Copy this key now:</div><div style="display:flex;gap:8px;align-items:center"><code id="new-key-value" style="word-break:break-all;flex:1"></code><button class="btn sm" id="copy-key">Copy</button></div></div></div></div>
-<div class="table-wrap"><table><thead><tr><th>Key</th><th>Status</th><th>Last used</th><th>Created</th><th>Actions</th></tr></thead><tbody id="key-rows"></tbody></table></div>
+<h2>${t(lang, "admin.nav.keys")}</h2><p class="sub">${t(lang, "admin.keys.sub")}</p>
+<div class="card" style="margin-bottom:16px"><form class="form inline" id="key-form"><label class="field"><span>${t(lang, "admin.keys.name")}</span><input name="name" placeholder="LobeChat" required></label><button class="btn primary" type="submit">${t(lang, "admin.keys.create")}</button></form><div id="key-msg" class="msg"></div>
+<div id="new-key" style="display:none;margin-top:8px"><div class="note"><div class="tiny" style="margin-bottom:6px">${t(lang, "admin.keys.copyNow")}</div><div style="display:flex;gap:8px;align-items:center"><code id="new-key-value" style="word-break:break-all;flex:1"></code><button class="btn sm" id="copy-key">${t(lang, "common.copy")}</button></div></div></div></div>
+<div class="table-wrap"><table><thead><tr><th>${t(lang, "admin.keys.table.key")}</th><th>${t(lang, "admin.keys.table.status")}</th><th>${t(lang, "admin.keys.table.lastUsed")}</th><th>${t(lang, "admin.keys.table.created")}</th><th>${t(lang, "admin.keys.table.actions")}</th></tr></thead><tbody id="key-rows"></tbody></table></div>
 </section>
 
 <section id="tab-settings" class="tab">
-<h2>Settings</h2><p class="sub">AI Gateway is optional; the free-neuron guard remains authoritative.</p>
+<h2>${t(lang, "admin.nav.settings")}</h2><p class="sub">${t(lang, "admin.settings.sub")}</p>
 <form id="settings-form">
-<div class="card" style="margin-bottom:16px"><h3>Runtime</h3><div class="form">
-<label class="field"><span>AI Gateway ID (optional)</span><input id="gateway-id" placeholder="default"></label>
-<label class="field"><span>Daily neurons per account</span><input id="daily-neurons" type="number" min="1" max="10000"></label>
-<label class="field"><span>Default max output tokens</span><input id="default-max" type="number" min="1" max="131072"></label>
-<label class="field"><span>Public access (no API keys)</span><input id="allow-public" type="checkbox" style="width:auto"></label>
-</div><p class="tiny">The daily cap is clamped by <code>MAX_DAILY_NEURONS</code> (default 10,000). Do not raise it on a free plan: Cloudflare will start returning error 3036.</p></div>
-<div class="card" style="margin-bottom:16px"><h3>Model aliases</h3><p class="tiny">JSON object mapping a client-facing name to an <code>@cf/</code> model id.</p><textarea id="aliases"></textarea></div>
-<div class="card" style="margin-bottom:16px"><h3>Performance overrides</h3><p class="tiny">JSON object mapping model id to a 0-100 score from your own evals. Overrides drive the performance sort.</p><textarea id="benchmarks"></textarea></div>
-<div class="row-actions"><button class="btn primary" type="submit">Save settings</button></div><div id="settings-msg" class="msg"></div>
+<div class="card" style="margin-bottom:16px"><h3>${t(lang, "admin.settings.runtime")}</h3><div class="form">
+<label class="field"><span>${t(lang, "admin.settings.gateway")}</span><input id="gateway-id" placeholder="default"></label>
+<label class="field"><span>${t(lang, "admin.settings.daily")}</span><input id="daily-neurons" type="number" min="1" max="10000"></label>
+<label class="field"><span>${t(lang, "admin.settings.defaultMax")}</span><input id="default-max" type="number" min="1" max="131072"></label>
+<label class="field"><span>${t(lang, "admin.settings.public")}</span><input id="allow-public" type="checkbox" style="width:auto"></label>
+</div><p class="tiny">${t(lang, "admin.settings.quotaHint")}</p></div>
+<div class="card" style="margin-bottom:16px"><h3>${t(lang, "admin.settings.aliases")}</h3><p class="tiny">${t(lang, "admin.settings.aliasesHint")}</p><textarea id="aliases"></textarea></div>
+<div class="card" style="margin-bottom:16px"><h3>${t(lang, "admin.settings.benchmarks")}</h3><p class="tiny">${t(lang, "admin.settings.benchmarksHint")}</p><textarea id="benchmarks"></textarea></div>
+<div class="row-actions"><button class="btn primary" type="submit">${t(lang, "common.save")}</button></div><div id="settings-msg" class="msg"></div>
 </form>
 </section>
 </main></div>`;
 }
 async function handleAdminPage(request, env) {
+  const lang = resolveLang(request);
   const authenticated = await isAdmin(request, env);
-  const setupWarning = hasAdminPassword(env) ? "" : '<div class="note" style="margin:16px 24px">Set the <code>ADMIN_PASSWORD</code> environment variable before using the admin panel.</div>';
-  const body = adminBody(authenticated) + setupWarning;
+  const setupWarning = hasAdminPassword(env) ? "" : `<div class="note" style="margin:16px 24px">${t(lang, "admin.setupWarning")}</div>`;
+  const body = authenticated ? `${adminBody(lang)}${setupWarning}` : loginBody(lang);
   return shell({
-    title: authenticated ? "Admin \u2014 Workers AI2API" : "Sign in \u2014 Workers AI2API",
+    title: t(lang, authenticated ? "admin.title" : "admin.signinTitle"),
     body,
-    script: ADMIN_SCRIPT,
-    authenticated
+    script: authenticated ? ADMIN_SCRIPT : ADMIN_LOGIN_SCRIPT,
+    authenticated,
+    lang
   });
 }
 
 // src/ui/docs.js
-var nav = `${NAV}<div class="wrap" style="padding-top:14px"><a class="tiny" href="/">\u2190 Home</a> <span class="tiny">/</span> <a class="tiny" href="/docs/api">API</a> <span class="tiny">/</span> <a class="tiny" href="/docs/free-tier">Free tier</a> <span class="tiny">/</span> <a class="tiny" href="/docs/workers-ai-vs-ai-gateway">Workers AI vs AI Gateway</a></div>`;
-var DOCS = {
-  "workers-ai-vs-ai-gateway": {
-    title: "Workers AI vs AI Gateway \u2014 Workers AI2API",
-    html: `<article class="docs wrap">
+function wrapTables(html) {
+  return html.replace(/<table>/g, '<div class="table-scroll"><table>').replace(/<\/table>/g, "</table></div>");
+}
+function docsNav(lang) {
+  return `${nav(lang)}<div class="wrap" style="padding-top:14px">
+<a class="tiny" href="/?lang=${lang}">\u2190 ${t(lang, "docs.nav.home")}</a>
+<span class="tiny">/</span> <a class="tiny" href="/docs/api?lang=${lang}">${t(lang, "docs.nav.api")}</a>
+<span class="tiny">/</span> <a class="tiny" href="/docs/free-tier?lang=${lang}">${t(lang, "docs.nav.freeTier")}</a>
+<span class="tiny">/</span> <a class="tiny" href="/docs/workers-ai-vs-ai-gateway?lang=${lang}">${t(lang, "docs.nav.vs")}</a>
+</div>`;
+}
+var VS_EN = `<article class="docs wrap">
 <h1>Workers AI vs AI Gateway</h1>
 <p>These are two different layers. Workers AI <em>runs</em> models. AI Gateway <em>controls</em> requests to models \u2014 including Workers AI and external providers. They compose; they do not replace each other.</p>
 
@@ -10602,11 +11145,50 @@ cf-aig-gateway-id: default
 <li>Use <strong>AI Gateway unified billing</strong> only if you intentionally move beyond the free allocation; paid-only frontier models require it or a Workers Paid plan.</li>
 </ul>
 <p class="tiny">Sources: Cloudflare Workers AI pricing, limits, errors and OpenAI-compatibility docs; AI Gateway Workers AI provider docs. Checked October 2026.</p>
-</article>`
-  },
-  api: {
-    title: "API reference \u2014 Workers AI2API",
-    html: `<article class="docs wrap">
+</article>`;
+var VS_ZH = `<article class="docs wrap">
+<h1>Workers AI \u4E0E AI Gateway</h1>
+<p>\u8FD9\u662F\u4E24\u4E2A\u4E0D\u540C\u7684\u5C42\u3002Workers AI <em>\u8FD0\u884C</em>\u6A21\u578B\uFF1BAI Gateway <em>\u63A7\u5236</em>\u53D1\u5F80\u6A21\u578B\u7684\u8BF7\u6C42\u2014\u2014\u5305\u62EC Workers AI \u548C\u5916\u90E8\u63D0\u4F9B\u5546\u3002\u5B83\u4EEC\u53EF\u4EE5\u7EC4\u5408\u4F7F\u7528\uFF0C\u4F46\u4E0D\u662F\u4E92\u76F8\u66FF\u4EE3\u3002</p>
+
+<h2>\u4E00\u53E5\u8BDD\u533A\u5206</h2>
+<table><thead><tr><th></th><th>Workers AI</th><th>AI Gateway</th></tr></thead><tbody>
+<tr><td><strong>\u662F\u4EC0\u4E48</strong></td><td>Cloudflare GPU \u4E0A\u7684\u65E0\u670D\u52A1\u5668\u63A8\u7406\uFF0C\u4EE5\u53CA\u6A21\u578B\u76EE\u5F55\u3002</td><td>\u4F4D\u4E8E AI \u63D0\u4F9B\u5546\u524D\u9762\u7684\u4EE3\u7406 / \u63A7\u5236\u5E73\u9762\u3002</td></tr>
+<tr><td><strong>\u8FD0\u884C\u6A21\u578B\uFF1F</strong></td><td>\u662F\u3002Cloudflare \u6258\u7BA1\u6A21\u578B\u4E0E\u5408\u4F5C\u4F19\u4F34\u6A21\u578B\u3002</td><td>\u5426\u3002\u5B83\u8F6C\u53D1\u5230 Workers AI\u3001OpenAI\u3001Anthropic\u3001Google \u7B49\u3002</td></tr>
+<tr><td><strong>\u8BA1\u8D39</strong></td><td>\u6309 Neurons\u3002\u6BCF 1,000 Neurons $0.011\uFF1B\u6BCF\u5929 10,000 \u514D\u8D39 Neurons\uFF0CUTC 00:00 \u91CD\u7F6E\u3002</td><td>\u6807\u51C6\u8BA1\u5212\u4E0B\u7F51\u5173\u672C\u8EAB\u514D\u8D39\u3002\u53EF\u4E3A Workers AI \u524D\u6CBF\u6A21\u578B\u542F\u7528\u9884\u4ED8\u201C\u7EDF\u4E00\u8BA1\u8D39\u201D\u989D\u5EA6\u3002</td></tr>
+<tr><td><strong>\u514D\u8D39\u989D\u5EA6</strong></td><td>\u6BCF\u5929 10,000 Neurons\u3002\u90E8\u5206\u6A21\u578B\u9700\u8981 Workers Paid \u6216 AI Gateway \u9884\u4ED8\u989D\u5EA6\u3002</td><td>\u4E0D\u589E\u52A0\u514D\u8D39\u63A8\u7406\u3002\u7F13\u5B58\u53EF\u4EE5\u907F\u514D\u91CD\u590D\u63A8\u7406\u6210\u672C\u3002</td></tr>
+<tr><td><strong>\u6838\u5FC3\u80FD\u529B</strong></td><td>\u6A21\u578B\u76EE\u5F55\u3001OpenAI \u517C\u5BB9\u5BF9\u8BDD / \u5411\u91CF\u3001\u539F\u751F run API\u3001\u51FD\u6570\u8C03\u7528\u3001LoRA\u3001\u6279\u5904\u7406\u3001\u63D0\u793A\u7F13\u5B58\u3002</td><td>\u5206\u6790\u3001\u65E5\u5FD7\u3001\u7F13\u5B58\u3001\u9650\u6D41\u3001\u91CD\u8BD5 / \u6545\u969C\u8F6C\u79FB\u3001\u62A4\u680F\u3001\u52A8\u6001\u8DEF\u7531\u3001\u7EDF\u4E00\u8BA1\u8D39\u3002</td></tr>
+<tr><td><strong>\u8BA4\u8BC1</strong></td><td>\u5177\u5907 Workers AI \u6743\u9650\u7684 Cloudflare API Token\u3002</td><td>Cloudflare API Token\uFF1B\u53EF\u9009\u7684\u7F51\u5173\u8BA4\u8BC1 Token\u3002</td></tr>
+</tbody></table>
+
+<h2>\u5B83\u4EEC\u5982\u4F55\u8FDE\u63A5</h2>
+<p>\u5728\u540C\u4E00\u4E2A Cloudflare API URL \u4E0A\u6DFB\u52A0 <code>cf-aig-gateway-id</code> \u8BF7\u6C42\u5934\uFF0C\u5C31\u80FD\u8BA9 Workers AI \u8BF7\u6C42\u7ECF\u8FC7\u7F51\u5173\u3002\u6A21\u578B\u4ECD\u5728 Workers AI \u4E0A\u8FD0\u884C\uFF0C\u4ECD\u7136\u6D88\u8017 Neurons\uFF1B\u7F51\u5173\u53EA\u8D1F\u8D23\u89C2\u5BDF\u548C\u63A7\u5236\u8BF7\u6C42\u3002</p>
+<pre><code>POST https://api.cloudflare.com/client/v4/accounts/&lt;account_id&gt;/ai/v1/chat/completions
+Authorization: Bearer &lt;api_token&gt;
+cf-aig-gateway-id: default
+
+{"model":"@cf/zai-org/glm-4.7-flash","messages":[...]}</code></pre>
+<p>Workers AI \u4E5F\u63D0\u4F9B\u7ED1\u5B9A\u8C03\u7528\u65B9\u5F0F\uFF08<code>env.AI.run(model, input, { gateway: { id, skipCache, cacheTtl } })</code>\uFF09\uFF0CAI Gateway \u8FD8\u6709\u81EA\u5DF1\u7684 REST \u57FA\u7840\u5730\u5740\u3002\u672C\u9879\u76EE\u4F7F\u7528\u8BF7\u6C42\u5934\u65B9\u5F0F\uFF0C\u56E0\u4E3A\u5B83\u8BA9\u6240\u6709\u8D26\u53F7\u5171\u7528\u540C\u4E00\u6761\u4E0A\u6E38\u8DEF\u5F84\uFF0C\u5E76\u4E14\u517C\u5BB9 REST API\u3002</p>
+
+<h2>\u672C\u9879\u76EE\u5982\u4F55\u4F7F\u7528</h2>
+<ul>
+<li><strong>Workers AI \u662F\u63A8\u7406\u63D0\u4F9B\u65B9\u3002</strong>\u6240\u6709\u6A21\u578B\u8C03\u7528\u90FD\u53D1\u9001\u5230 <code>api.cloudflare.com/client/v4/accounts/{id}/ai/...</code>\u3002</li>
+<li><strong>AI Gateway \u662F\u53EF\u9009\u9879\u3002</strong>\u5728\u7BA1\u7406\u540E\u53F0\u586B\u5199\u7F51\u5173 ID \u540E\uFF0C\u6BCF\u4E2A\u8BF7\u6C42\u90FD\u4F1A\u5E26\u4E0A <code>cf-aig-gateway-id</code>\uFF0C\u4ECE\u800C\u83B7\u5F97\u7F51\u5173\u5206\u6790\u3001\u7F13\u5B58\u4E0E\u65E5\u5FD7\uFF0C\u4E0D\u6539\u53D8\u6A21\u578B\u4E0E\u989D\u5EA6\u6A21\u578B\u3002</li>
+<li>\u7F51\u5173<strong>\u4E0D\u4F1A</strong>\u7ED5\u8FC7\u514D\u8D39 Neuron \u4E0A\u9650\u3002\u672C\u5730\u989D\u5EA6\u4FDD\u62A4\u4ECD\u4F1A\u6309\u8D26\u53F7\u3001\u6309\u5929\u9884\u7559\u5E76\u7ED3\u7B97 Neurons\u3002</li>
+<li>\u7F51\u5173\u7F13\u5B58\u53EF\u4EE5\u51CF\u5C11\u91CD\u590D\u63D0\u793A\u7684 Neuron \u6D88\u8017\u3002\u672C\u9879\u76EE\u8FD8\u4F1A\u8F6C\u53D1 <code>x-session-affinity</code>\uFF0C\u63D0\u5347 Workers AI \u524D\u7F00\u7F13\u5B58\u7684\u547D\u4E2D\u7387\u3002</li>
+</ul>
+
+<div class="callout">\u5982\u679C\u4F60\u53EA\u9700\u8981\u901A\u8FC7 OpenAI \u517C\u5BB9\u63A5\u53E3\u8BBF\u95EE\u514D\u8D39 Workers AI \u6A21\u578B\uFF0C\u4E0D\u9700\u8981 AI Gateway\u3002\u9700\u8981\u53EF\u89C2\u6D4B\u6027\u3001\u7F13\u5B58\u3001\u8DE8\u63D0\u4F9B\u5546\u91CD\u8BD5\u6216\u524D\u6CBF\u6A21\u578B\u9884\u4ED8\u8BA1\u8D39\u65F6\uFF0C\u518D\u63A5\u5165\u5B83\u3002</div>
+
+<h2>\u5982\u4F55\u9009\u62E9</h2>
+<ul>
+<li>\u7B80\u5355\u3001\u53EF\u63A7\u3001\u514D\u8D39\u989D\u5EA6\u4F18\u5148\uFF1A<strong>\u76F4\u63A5\u4F7F\u7528 Workers AI</strong>\u2014\u2014\u672C\u9879\u76EE\u7684\u9ED8\u8BA4\u65B9\u5F0F\u3002</li>
+<li>\u9700\u8981\u65E5\u5FD7\u3001\u5EF6\u8FDF\u6307\u6807\u3001\u7F13\u5B58\u63A7\u5236\u548C\u9650\u6D41\uFF1A<strong>\u5728 Workers AI \u524D\u52A0 AI Gateway</strong>\u3002</li>
+<li>\u9700\u8981\u540C\u65F6\u7BA1\u7406 Workers AI\u3001OpenAI\u3001Anthropic \u7B49\uFF1A<strong>\u7528 AI Gateway \u7EDF\u4E00\u63A7\u5236\u9762</strong>\u3002</li>
+<li>\u53EA\u6709\u660E\u786E\u8981\u8D85\u51FA\u514D\u8D39\u989D\u5EA6\u65F6\u624D\u4F7F\u7528 <strong>AI Gateway \u7EDF\u4E00\u8BA1\u8D39</strong>\uFF1B\u4ED8\u8D39\u524D\u6CBF\u6A21\u578B\u9700\u8981\u5B83\u6216 Workers Paid \u8BA1\u5212\u3002</li>
+</ul>
+<p class="tiny">\u6765\u6E90\uFF1ACloudflare Workers AI \u5B9A\u4EF7\u3001\u9650\u5236\u3001\u9519\u8BEF\u4E0E OpenAI \u517C\u5BB9\u6587\u6863\uFF1BAI Gateway \u7684 Workers AI \u63D0\u4F9B\u5546\u6587\u6863\u3002\u6838\u5BF9\u65F6\u95F4\uFF1A2026 \u5E74 10 \u6708\u3002</p>
+</article>`;
+var API_EN = `<article class="docs wrap">
 <h1>API reference</h1>
 <p>Base URL: <code>https://&lt;your-worker&gt;/v1</code>. Authenticate with <code>Authorization: Bearer sk-wa-\u2026</code> or <code>x-api-key</code>. If no keys exist and <code>allowPublic</code> is off, requests are rejected.</p>
 <pre><code>curl https://your-worker/v1/models \\
@@ -10649,10 +11231,11 @@ cf-aig-gateway-id: default
   },
   "free": true,
   "requires_paid": false,
+  "deprecated": false,
   "free_daily_output_tokens": 274725,
   "performance": {"score": 50.9, "tier": "B", "rank": 7, "basis": [...]}
 }</code></pre>
-<p>Paid-only models are hidden from <code>/v1/models</code> and rejected by the proxy. They remain visible in the admin model browser.</p>
+<p>Paid-only models are hidden from <code>/v1/models</code> and rejected by the proxy. They remain visible in the admin model browser. Deprecated models stay callable during Cloudflare's grace period and carry <code>"deprecated": true</code>.</p>
 
 <h2>Chat example</h2>
 <pre><code>curl https://your-worker/v1/chat/completions \\
@@ -10677,11 +11260,81 @@ cf-aig-gateway-id: default
 
 <h2>AI Gateway</h2>
 <p>Set a gateway id in Settings to add <code>cf-aig-gateway-id</code> to every upstream request. Optional client headers <code>cf-aig-cache-ttl</code>, <code>cf-aig-cache-key</code> and <code>cf-aig-skip-cache</code> are forwarded only when a gateway is configured. <code>x-session-affinity</code> is always forwarded to improve prefix caching.</p>
-</article>`
+</article>`;
+var API_ZH = `<article class="docs wrap">
+<h1>\u63A5\u53E3\u53C2\u8003</h1>
+<p>\u57FA\u7840\u5730\u5740\uFF1A<code>https://&lt;your-worker&gt;/v1</code>\u3002\u4F7F\u7528 <code>Authorization: Bearer sk-wa-\u2026</code> \u6216 <code>x-api-key</code> \u8BA4\u8BC1\u3002\u5982\u679C\u6CA1\u6709\u4EFB\u4F55\u5BC6\u94A5\u4E14 <code>allowPublic</code> \u5173\u95ED\uFF0C\u8BF7\u6C42\u4F1A\u88AB\u62D2\u7EDD\u3002</p>
+<pre><code>curl https://your-worker/v1/models \\
+  -H "Authorization: Bearer $KEY"</code></pre>
+
+<h2>\u7AEF\u70B9</h2>
+<table><thead><tr><th>\u65B9\u6CD5</th><th>\u8DEF\u5F84</th><th>\u7528\u9014</th></tr></thead><tbody>
+<tr><td>GET</td><td><code>/v1/models</code></td><td>\u52A8\u6001\u514D\u8D39\u76EE\u5F55\uFF0C\u6309\u4F30\u7B97\u6027\u80FD\u6392\u5E8F\u3002\u652F\u6301 <code>task</code>\u3001<code>search</code>\u3001<code>sort</code>\u3001<code>limit</code>\u3002</td></tr>
+<tr><td>GET</td><td><code>/v1/models/{id}</code></td><td>\u5355\u4E2A\u6A21\u578B\u7684\u4EF7\u683C\u3001\u80FD\u529B\u4E0E\u6392\u540D\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/chat/completions</code></td><td>OpenAI \u5BF9\u8BDD\uFF0C\u652F\u6301 SSE \u6D41\u5F0F\u3001\u5DE5\u5177\uFF0C\u4EE5\u53CA\u6A21\u578B\u652F\u6301\u7684\u89C6\u89C9\u8F93\u5165\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/completions</code></td><td>\u65E7\u7248\u6587\u672C\u8865\u5168\u9002\u914D\uFF08\u975E\u6D41\u5F0F\uFF09\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/responses</code></td><td>GPT-OSS \u6A21\u578B\u7684 OpenAI Responses API\uFF08\u975E\u6D41\u5F0F\uFF09\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/embeddings</code></td><td>\u6587\u672C\u5411\u91CF\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/images/generations</code></td><td>\u6587\u672C\u751F\u56FE\uFF0C\u8FD4\u56DE <code>b64_json</code>\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/audio/transcriptions</code></td><td>multipart \u97F3\u9891\u8F6C\u5199\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/audio/speech</code></td><td>\u6587\u672C\u8F6C\u8BED\u97F3\uFF0C\u8FD4\u56DE\u97F3\u9891\u5B57\u8282\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/rerank</code></td><td>Jina / Cohere \u98CE\u683C\u91CD\u6392\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/run</code></td><td>\u901A\u7528 <code>{model, inputs}</code> \u900F\u4F20\uFF0C\u9002\u7528\u4E8E\u76EE\u5F55\u4E2D\u7684\u4EFB\u610F\u4EFB\u52A1\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/messages</code></td><td>Anthropic Messages API\uFF0C\u652F\u6301\u6D41\u5F0F\u4E0E\u5DE5\u5177\u3002</td></tr>
+<tr><td>POST</td><td><code>/v1/messages/count_tokens</code></td><td>\u8FD1\u4F3C token \u8BA1\u6570\u3002</td></tr>
+</tbody></table>
+
+<h2>\u6A21\u578B\u5BF9\u8C61</h2>
+<p><code>/v1/models</code> \u8FD4\u56DE\u6807\u51C6 OpenAI \u5B57\u6BB5\u4EE5\u53CA\u5B9E\u65F6\u5143\u6570\u636E\uFF1A</p>
+<pre><code>{
+  "id": "@cf/zai-org/glm-4.7-flash",
+  "object": "model",
+  "owned_by": "Zhipu AI",
+  "task": "text-generation",
+  "context_window": 131072,
+  "capabilities": {"reasoning": true, "function_calling": true, ...},
+  "pricing": {
+    "tokens": {
+      "input_usd_per_million": 0.06,
+      "output_usd_per_million": 0.4,
+      "input_neurons_per_million": 5500,
+      "output_neurons_per_million": 36400
+    },
+    "display": "$0.06 / input \xB7 $0.4 / output"
   },
-  "free-tier": {
-    title: "Free-tier guard \u2014 Workers AI2API",
-    html: `<article class="docs wrap">
+  "free": true,
+  "requires_paid": false,
+  "deprecated": false,
+  "free_daily_output_tokens": 274725,
+  "performance": {"score": 50.9, "tier": "B", "rank": 7, "basis": [...]}
+}</code></pre>
+<p>\u4ED8\u8D39\u6A21\u578B\u4E0D\u4F1A\u51FA\u73B0\u5728 <code>/v1/models</code> \u4E2D\uFF0C\u4EE3\u7406\u4E5F\u4F1A\u62D2\u7EDD\u5B83\u4EEC\uFF1B\u5B83\u4EEC\u4ECD\u53EF\u5728\u7BA1\u7406\u540E\u53F0\u67E5\u770B\u3002\u5DF2\u5F03\u7528\u6A21\u578B\u5728 Cloudflare \u7684\u5BBD\u9650\u671F\u5185\u4ECD\u53EF\u8C03\u7528\uFF0C\u5E76\u5E26\u6709 <code>"deprecated": true</code>\u3002</p>
+
+<h2>\u5BF9\u8BDD\u793A\u4F8B</h2>
+<pre><code>curl https://your-worker/v1/chat/completions \\
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\
+  -d '{
+    "model": "@cf/zai-org/glm-4.7-flash",
+    "messages": [{"role":"user","content":"\u7528\u4E00\u6BB5\u8BDD\u89E3\u91CA Neurons\u3002"}],
+    "stream": true
+  }'</code></pre>
+<p>\u77ED\u540D\u79F0\u5728\u552F\u4E00\u65F6\u4F1A\u81EA\u52A8\u5339\u914D\uFF1A<code>"model":"glm-4.7-flash"</code>\u3002\u9700\u8981\u7A33\u5B9A\u7684\u5BA2\u6237\u7AEF\u540D\u79F0\u65F6\uFF0C\u53EF\u5728\u8BBE\u7F6E\u4E2D\u914D\u7F6E\u522B\u540D\u3002</p>
+
+<h2>\u989D\u5EA6\u4E0E\u9519\u8BEF</h2>
+<p>\u6210\u529F\u54CD\u5E94\u4F1A\u5305\u542B <code>x-workers-ai-model</code>\u3001<code>x-workers-ai-account</code>\u3001<code>x-quota-remaining</code> \u548C <code>x-quota-limit</code>\u3002</p>
+<table><thead><tr><th>\u72B6\u6001</th><th>\u4EE3\u7801</th><th>\u542B\u4E49</th></tr></thead><tbody>
+<tr><td>401</td><td><code>invalid_api_key</code></td><td>\u5BC6\u94A5\u7F3A\u5931\u6216\u9519\u8BEF\uFF1B\u6216\u6CA1\u6709\u4EFB\u4F55\u5BC6\u94A5\u4E14\u516C\u5F00\u8BBF\u95EE\u5173\u95ED\u3002</td></tr>
+<tr><td>403</td><td><code>model_requires_paid_plan</code></td><td>\u6A21\u578B\u9700\u8981 Workers Paid \u6216 AI Gateway \u9884\u4ED8\u989D\u5EA6\u3002</td></tr>
+<tr><td>404</td><td><code>model_not_found</code></td><td>\u4E0D\u5728\u5B9E\u65F6\u514D\u8D39\u76EE\u5F55\u4E2D\u3002</td></tr>
+<tr><td>429</td><td><code>insufficient_quota</code></td><td>\u6240\u6709\u8D26\u53F7\u7684\u6BCF\u65E5\u514D\u8D39\u989D\u5EA6\u5DF2\u8017\u5C3D\uFF08Cloudflare \u9519\u8BEF\u7801 3036\uFF09\uFF0C\u6216\u8BF7\u6C42\u4F30\u7B97\u8D85\u8FC7\u6BCF\u65E5\u9884\u7B97\u3002</td></tr>
+<tr><td>429</td><td><code>capacity_exceeded</code></td><td>Workers AI \u6682\u65F6\u5BB9\u91CF\u4E0D\u8DB3\uFF08\u9519\u8BEF\u7801 3040\uFF09\uFF0C\u7A0D\u540E\u91CD\u8BD5\u3002</td></tr>
+<tr><td>502</td><td><code>upstream_error</code></td><td>Cloudflare \u8FD4\u56DE\u4E86\u610F\u5916\u9519\u8BEF\u3002</td></tr>
+</tbody></table>
+
+<h2>AI Gateway</h2>
+<p>\u5728\u8BBE\u7F6E\u4E2D\u586B\u5199\u7F51\u5173 ID \u540E\uFF0C\u6240\u6709\u4E0A\u6E38\u8BF7\u6C42\u90FD\u4F1A\u5E26\u4E0A <code>cf-aig-gateway-id</code>\u3002\u53EA\u6709\u5728\u914D\u7F6E\u4E86\u7F51\u5173\u65F6\uFF0C\u5BA2\u6237\u7AEF\u7684 <code>cf-aig-cache-ttl</code>\u3001<code>cf-aig-cache-key</code> \u548C <code>cf-aig-skip-cache</code> \u624D\u4F1A\u88AB\u8F6C\u53D1\u3002<code>x-session-affinity</code> \u59CB\u7EC8\u8F6C\u53D1\uFF0C\u7528\u4E8E\u63D0\u5347\u524D\u7F00\u7F13\u5B58\u547D\u4E2D\u7387\u3002</p>
+</article>`;
+var FREE_EN = `<article class="docs wrap">
 <h1>The hard free-tier guard</h1>
 <p>Cloudflare gives every account <strong>10,000 neurons per day</strong> at no charge, resetting at <strong>00:00 UTC</strong>. The app treats that as a hard ceiling, not a suggestion.</p>
 
@@ -10702,6 +11355,9 @@ cf-aig-gateway-id: default
 <h2>What is excluded</h2>
 <p>Cloudflare marks certain models as requiring a Workers Paid plan or AI Gateway prepaid credits. They are <strong>not</strong> in the free catalog and the proxy rejects them with <code>403 model_requires_paid_plan</code>. The list is parsed from the live pricing page, not hardcoded; as of October 2026 it includes Kimi K2.6/K2.7, GLM-5.2/5.3/5.3-Flash, and DeepSeek V4 Flash/Pro variants.</p>
 
+<h2>Catalog coverage</h2>
+<p>The catalog merges the native <code>/ai/models/search</code> response (authoritative task names) with the OpenRouter-shaped response (pricing, context, modalities), then enriches it with the public docs snapshot. It includes Cloudflare-hosted and partner models: Meta, Mistral, Qwen, Google, OpenAI, DeepSeek, Moonshot, Zhipu, Deepgram, Black Forest Labs, Leonardo, RunwayML, Stability, IBM, NVIDIA, BAAI and others. External providers reached through AI Gateway (OpenAI, Anthropic, Google APIs) are <strong>not</strong> Workers AI models and are not part of the free neuron pool.</p>
+
 <h2>Tuning</h2>
 <ul>
 <li><code>settings.dailyNeurons</code> defaults to 10,000 and cannot exceed <code>MAX_DAILY_NEURONS</code> (default 10,000).</li>
@@ -10712,14 +11368,63 @@ cf-aig-gateway-id: default
 
 <h2>What it does not do</h2>
 <p>It does not create free quota, bypass Cloudflare's rate limits, or make paid-only models free. It only ensures this app never intentionally spends past the free allocation.</p>
-</article>`
+</article>`;
+var FREE_ZH = `<article class="docs wrap">
+<h1>\u514D\u8D39\u989D\u5EA6\u786C\u4FDD\u62A4</h1>
+<p>Cloudflare \u4E3A\u6BCF\u4E2A\u8D26\u53F7\u63D0\u4F9B<strong>\u6BCF\u5929 10,000 Neurons</strong> \u7684\u514D\u8D39\u989D\u5EA6\uFF0C\u5728 <strong>UTC 00:00</strong> \u91CD\u7F6E\u3002\u672C\u9879\u76EE\u628A\u5B83\u5F53\u4F5C\u786C\u4E0A\u9650\uFF0C\u800C\u4E0D\u662F\u5EFA\u8BAE\u503C\u3002</p>
+
+<h2>\u4E00\u6B21\u8BF7\u6C42\u5982\u4F55\u8BB0\u8D26</h2>
+<ol>
+<li><strong>\u4F30\u7B97\u3002</strong>\u4EE3\u7406\u4F1A\u4F30\u7B97\u63D0\u793A tokens\uFF08\u6309\u7EA6 3.6 \u5B57\u7B26/token\uFF0C\u6BCF\u5F20\u56FE\u7247\u989D\u5916 850 tokens \u8FDB\u884C\u9AD8\u4F30\uFF09\u548C\u8F93\u51FA tokens\uFF08<code>max_tokens</code> \u6216\u914D\u7F6E\u7684\u9ED8\u8BA4\u503C\uFF09\uFF0C\u518D\u4E58\u4EE5\u6A21\u578B\u7684\u5B9E\u65F6 Neuron \u8D39\u7387\u3002</li>
+<li><strong>\u9884\u7559\u3002</strong>Durable Object \u539F\u5B50\u68C0\u67E5 <code>\u5DF2\u7528 + \u9884\u7559 + \u4F30\u7B97 \u2264 \u4E0A\u9650</code>\u3002\u901A\u8FC7\u540E\u624D\u5728\u8C03\u7528\u4E0A\u6E38\u4E4B\u524D\u9884\u7559\u989D\u5EA6\u3002</li>
+<li><strong>\u5E26\u6545\u969C\u8F6C\u79FB\u8C03\u7528\u3002</strong>\u67D0\u4E2A\u8D26\u53F7\u6CA1\u6709\u989D\u5EA6\u6216\u8FD4\u56DE 3036 \u65F6\uFF0C\u81EA\u52A8\u5C1D\u8BD5\u4E0B\u4E00\u4E2A\u8D26\u53F7\u3002\u5176\u4ED6 429/5xx \u4E5F\u4F1A\u8F6C\u79FB\uFF1B\u5BA2\u6237\u7AEF\u9519\u8BEF\uFF08400/404/413\uFF09\u4E0D\u4F1A\u3002</li>
+<li><strong>\u7ED3\u7B97\u3002</strong>\u54CD\u5E94\u4F53\u6D88\u8D39\u5B8C\u6210\u540E\uFF0C\u7528\u5B9E\u9645 <code>usage</code> tokens \u6362\u7B97 Neurons \u5E76\u91CA\u653E\u9884\u7559\u3002\u6D41\u5F0F\u54CD\u5E94\u5728\u6D41\u7ED3\u675F\u65F6\u7ED3\u7B97\u3002</li>
+<li><strong>\u6838\u5BF9\u3002</strong>\u7528\u91CF\u9875\u4F1A\u67E5\u8BE2 Cloudflare GraphQL \u5206\u6790\uFF08<code>aiInferenceAdaptiveGroups</code>\uFF09\uFF0C\u53D6\u672C\u5730\u4E0E\u4E91\u7AEF\u7528\u91CF\u7684\u8F83\u5927\u503C\u3002\u8FD9\u6837\u80FD\u8986\u76D6 Dashboard / Playground \u6216\u5176\u4ED6\u5E94\u7528\u7684\u6D88\u8017\u3002</li>
+</ol>
+
+<div class="callout">\u5982\u679C\u7F3A\u5C11 Durable Object \u7ED1\u5B9A\uFF0C\u5E94\u7528\u4F1A\u9000\u5316\u4E3A KV \u8BB0\u8D26\u3002\u5B83\u4ECD\u4F1A\u5C3D\u529B\u6267\u884C\u4E0A\u9650\uFF0C\u4F46 KV \u5728\u5E76\u53D1\u4E0B\u4E0D\u662F\u539F\u5B50\u7684\u3002\u9700\u8981\u4E25\u683C\u4FDD\u8BC1\u65F6\u8BF7\u7ED1\u5B9A <code>QUOTA</code>\u3002</div>
+
+<h2>\u4E3A\u4EC0\u4E48\u8981\u6309\u6700\u5927\u503C\u9884\u7559\uFF1F</h2>
+<p>Cloudflare \u5728\u63A8\u7406\u5B8C\u6210\u540E\u624D\u8BA1\u8D39\uFF0C\u6CA1\u6709\u8C03\u7528\u524D\u7684 Neuron \u62A5\u4EF7\u3002\u9884\u7559\u4E0A\u754C\u53EF\u4EE5\u786E\u4FDD\u5E76\u53D1\u8BF7\u6C42\u4E0D\u4F1A\u5408\u8BA1\u8D85\u652F\u3002\u5982\u679C\u6A21\u578B\u5B9E\u9645\u8F93\u51FA\u66F4\u5C11\uFF0C\u5DEE\u989D\u4F1A\u5728\u7ED3\u7B97\u65F6\u91CA\u653E\u3002\u5982\u679C\u5728\u9884\u7559\u4E0E\u7ED3\u7B97\u4E4B\u95F4\u5D29\u6E83\uFF0C\u9884\u7559\u4F1A\u4FDD\u7559\u5230 UTC \u8DE8\u5929\u2014\u2014\u8FD9\u662F\u504F\u5B89\u5168\u7684\u5931\u8D25\u65B9\u5411\u3002</p>
+
+<h2>\u54EA\u4E9B\u6A21\u578B\u88AB\u6392\u9664</h2>
+<p>Cloudflare \u5C06\u90E8\u5206\u6A21\u578B\u6807\u8BB0\u4E3A\u9700\u8981 Workers Paid \u8BA1\u5212\u6216 AI Gateway \u9884\u4ED8\u989D\u5EA6\u3002\u5B83\u4EEC<strong>\u4E0D\u4F1A</strong>\u8FDB\u5165\u514D\u8D39\u76EE\u5F55\uFF0C\u4EE3\u7406\u4F1A\u4EE5 <code>403 model_requires_paid_plan</code> \u62D2\u7EDD\u3002\u540D\u5355\u4ECE\u5B9E\u65F6\u5B9A\u4EF7\u9875\u89E3\u6790\uFF0C\u800C\u975E\u786C\u7F16\u7801\uFF1B\u622A\u81F3 2026 \u5E74 10 \u6708\u5305\u62EC Kimi K2.6/K2.7\u3001GLM-5.2/5.3/5.3-Flash\uFF0C\u4EE5\u53CA DeepSeek V4 Flash/Pro \u7CFB\u5217\u3002</p>
+
+<h2>\u76EE\u5F55\u8986\u76D6\u8303\u56F4</h2>
+<p>\u76EE\u5F55\u4F1A\u5408\u5E76\u539F\u751F <code>/ai/models/search</code> \u54CD\u5E94\uFF08\u6743\u5A01\u4EFB\u52A1\u540D\u79F0\uFF09\u4E0E OpenRouter \u5F62\u72B6\u7684\u54CD\u5E94\uFF08\u4EF7\u683C\u3001\u4E0A\u4E0B\u6587\u3001\u6A21\u6001\uFF09\uFF0C\u518D\u8865\u5145\u516C\u5F00\u6587\u6863\u5FEB\u7167\u3002\u5B83\u5305\u542B Cloudflare \u6258\u7BA1\u6A21\u578B\u4E0E\u5408\u4F5C\u4F19\u4F34\u6A21\u578B\uFF1AMeta\u3001Mistral\u3001Qwen\u3001Google\u3001OpenAI\u3001DeepSeek\u3001Moonshot\u3001Zhipu\u3001Deepgram\u3001Black Forest Labs\u3001Leonardo\u3001RunwayML\u3001Stability\u3001IBM\u3001NVIDIA\u3001BAAI \u7B49\u3002\u901A\u8FC7 AI Gateway \u8BBF\u95EE\u7684\u5916\u90E8\u63D0\u4F9B\u5546\uFF08OpenAI\u3001Anthropic\u3001Google API\uFF09<strong>\u4E0D\u662F</strong> Workers AI \u6A21\u578B\uFF0C\u4E5F\u4E0D\u5C5E\u4E8E\u514D\u8D39 Neuron \u6C60\u3002</p>
+
+<h2>\u8C03\u4F18</h2>
+<ul>
+<li><code>settings.dailyNeurons</code> \u9ED8\u8BA4 10,000\uFF0C\u4E14\u4E0D\u80FD\u8D85\u8FC7 <code>MAX_DAILY_NEURONS</code>\uFF08\u9ED8\u8BA4 10,000\uFF09\u3002</li>
+<li><code>settings.defaultMaxOutputTokens</code> \u63A7\u5236\u5BA2\u6237\u7AEF\u672A\u4F20 <code>max_tokens</code> \u65F6\u7684\u9884\u7559\u91CF\u3002\u5982\u679C\u7ECF\u5E38\u51FA\u73B0\u53EF\u907F\u514D\u7684\u989D\u5EA6\u62D2\u7EDD\uFF0C\u53EF\u4EE5\u8C03\u4F4E\u5B83\u3002</li>
+<li>\u8F83\u5927\u7684\u4E0A\u4E0B\u6587\u53EF\u80FD\u5728\u4E00\u6B21\u8BF7\u6C42\u4E2D\u8017\u5C3D\u6574\u65E5\u989D\u5EA6\u3002\u4EE3\u7406\u4F1A\u5728\u8C03\u7528\u4E0A\u6E38\u524D\u7528\u660E\u786E\u4F30\u7B97\u62D2\u7EDD\u8FD9\u7C7B\u8BF7\u6C42\u3002</li>
+<li>\u591A\u8D26\u53F7\u65F6\u603B\u9884\u7B97\u662F <code>\u8D26\u53F7\u6570 \xD7 10,000</code>\uFF1B\u6BCF\u4E2A\u8D26\u53F7\u5355\u72EC\u8BB0\u8D26\u3002</li>
+</ul>
+
+<h2>\u5B83\u4E0D\u505A\u4EC0\u4E48</h2>
+<p>\u5B83\u4E0D\u4F1A\u521B\u9020\u514D\u8D39\u989D\u5EA6\u3001\u7ED5\u8FC7 Cloudflare \u7684\u901F\u7387\u9650\u5236\uFF0C\u4E5F\u4E0D\u4F1A\u8BA9\u4ED8\u8D39\u6A21\u578B\u53D8\u514D\u8D39\u3002\u5B83\u53EA\u4FDD\u8BC1\u672C\u5E94\u7528\u4E0D\u4F1A\u4E3B\u52A8\u82B1\u8D85\u514D\u8D39\u989D\u5EA6\u3002</p>
+</article>`;
+var DOCS = {
+  "workers-ai-vs-ai-gateway": {
+    en: { title: "Workers AI vs AI Gateway \u2014 Workers AI2API", html: VS_EN },
+    zh: { title: "Workers AI \u4E0E AI Gateway \u2014 Workers AI2API", html: VS_ZH }
+  },
+  api: {
+    en: { title: "API reference \u2014 Workers AI2API", html: API_EN },
+    zh: { title: "\u63A5\u53E3\u53C2\u8003 \u2014 Workers AI2API", html: API_ZH }
+  },
+  "free-tier": {
+    en: { title: "Free-tier guard \u2014 Workers AI2API", html: FREE_EN },
+    zh: { title: "\u514D\u8D39\u989D\u5EA6\u786C\u4FDD\u62A4 \u2014 Workers AI2API", html: FREE_ZH }
   }
 };
-function handleDocsPage(slug) {
+function handleDocsPage(slug, request) {
   const doc = DOCS[slug];
   if (!doc) return null;
-  const body = `${nav}<main>${doc.html}</main><footer><div class="wrap">Workers AI2API v2 \xB7 Prices and limits belong to Cloudflare.</div></footer>`;
-  return shell({ title: doc.title, body });
+  const lang = request ? resolveLang(request) : "zh";
+  const content = doc[lang] || doc.en;
+  const body = `${docsNav(lang)}<main>${wrapTables(content.html)}</main><footer><div class="wrap">${t(lang, "docs.footer")}</div></footer>`;
+  return shell({ title: content.title, body, lang });
 }
 
 // src/quota-do.js
@@ -10817,6 +11522,16 @@ var HTML_HEADERS = {
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "strict-origin-when-cross-origin"
 };
+function htmlHeaders(request) {
+  const headers = { ...HTML_HEADERS };
+  const url = new URL(request.url);
+  const lang = url.searchParams.get("lang");
+  if (lang === "zh" || lang === "en") {
+    const secure = url.protocol === "https:" ? "; Secure" : "";
+    headers["Set-Cookie"] = `lang=${resolveLang(request)}; Path=/; Max-Age=31536000; SameSite=Lax${secure}`;
+  }
+  return headers;
+}
 function setupResponse(request) {
   if (new URL(request.url).pathname.startsWith("/v1/")) {
     return json({
@@ -11008,14 +11723,14 @@ var index_default = {
         return cors(await handleV1(request, env, ctx), request);
       }
       if (url.pathname === "/") {
-        return new Response(await handleLandingPage(request, env, ctx), { headers: HTML_HEADERS });
+        return new Response(await handleLandingPage(request, env, ctx), { headers: htmlHeaders(request) });
       }
       if (url.pathname === "/admin" || url.pathname === "/admin/") {
-        return new Response(await handleAdminPage(request, env, ctx), { headers: HTML_HEADERS });
+        return new Response(await handleAdminPage(request, env, ctx), { headers: htmlHeaders(request) });
       }
       if (url.pathname.startsWith("/docs/")) {
-        const page = handleDocsPage(url.pathname.slice("/docs/".length).replace(/\/$/, ""));
-        if (page) return new Response(page, { headers: HTML_HEADERS });
+        const page = handleDocsPage(url.pathname.slice("/docs/".length).replace(/\/$/, ""), request);
+        if (page) return new Response(page, { headers: htmlHeaders(request) });
       }
       return new Response("404 Not Found", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
     } catch (error) {

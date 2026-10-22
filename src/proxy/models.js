@@ -66,6 +66,12 @@ export async function catalogResponse(env, ctx, {
 	};
 	models = [...models].sort(sorters[sort] || sorters.performance);
 	if (limit) models = models.slice(0, limit);
+	if (sort === 'performance') {
+		models = models.map((model, index) => ({
+			...model,
+			performance: { ...(model.performance || {}), rank: index + 1 },
+		}));
+	}
 
 	return {
 		object: 'list',

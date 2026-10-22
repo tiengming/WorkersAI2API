@@ -80,7 +80,7 @@ function parseModelPage(markdown, pricing, paidOnly, freeQuota) {
 	});
 	if (!model) return null;
 	model.requires_paid = requiresPaid;
-	model.free = !requiresPaid && !deprecated;
+	model.free = !requiresPaid;
 	model.deprecated = deprecated;
 	model.source = 'docs-snapshot';
 	model.docs_url = `https://developers.cloudflare.com/workers-ai/models/${id.split('/').pop()}/`;

@@ -1,10 +1,10 @@
 import { getActiveAccounts, getSettings } from '../config.js';
 import { parsePricingMarkdown, PRICING_URL } from './pricing.js';
-import { normalizeOpenRouterModel, normalizeApiModel } from './normalize.js';
+import { normalizeModel } from './normalize.js';
 import { rankModels, shortModelId } from './ranking.js';
 import snapshot from '../data/catalog-snapshot.js';
 
-const CATALOG_KEY = 'catalog:cache:v2';
+const CATALOG_KEY = 'catalog:cache:v3';
 const PRICING_KEY = 'pricing:cache:v2';
 const CATALOG_TTL_MS = 15 * 60 * 1000;
 const PRICING_TTL_MS = 6 * 60 * 60 * 1000;
@@ -41,7 +41,7 @@ async function fetchModelsPage(account, page, format) {
 		per_page: '100',
 		page: String(page),
 		hide_experimental: 'false',
-		include_deprecated: 'false',
+		include_deprecated: 'true',
 	});
 	if (format) params.set('format', format);
 	const url = `https://api.cloudflare.com/client/v4/accounts/${account.accountId}/ai/models/search?${params}`;
@@ -51,10 +51,36 @@ async function fetchModelsPage(account, page, format) {
 			Accept: 'application/json',
 		},
 	});
-	return {
-		models: Array.isArray(data.result) ? data.result : (Array.isArray(data.data) ? data.data : []),
-		openrouter: format === 'openrouter' || Array.isArray(data.data),
-	};
+	return Array.isArray(data.result) ? data.result : (Array.isArray(data.data) ? data.data : []);
+}
+
+async function fetchFormat(account, format) {
+	const models = [];
+	for (let page = 1; page <= 10; page += 1) {
+		const pageModels = await fetchModelsPage(account, page, format);
+		models.push(...pageModels);
+		if (pageModels.length < 100) break;
+	}
+	return models;
+}
+
+/**
+ * The native response carries the authoritative `task` object/properties; the
+ * OpenRouter response carries pricing, context length and modality metadata.
+ * Fetch both and merge, native fields winning on conflicts.
+ */
+function mergeFormats(native, openrouter) {
+	const byId = new Map();
+	for (const raw of openrouter) {
+		if (raw?.id) byId.set(String(raw.id), { ...raw });
+	}
+	for (const raw of native) {
+		if (!raw?.id) continue;
+		const key = String(raw.id);
+		const existing = byId.get(key);
+		byId.set(key, existing ? { ...existing, ...raw } : { ...raw });
+	}
+	return [...byId.values()];
 }
 
 async function fetchAllModels(env) {
@@ -63,27 +89,32 @@ async function fetchAllModels(env) {
 
 	let lastError = null;
 	for (const account of accounts) {
-		for (const format of ['openrouter', null]) {
-			try {
-				const models = [];
-				let openrouter = false;
-				for (let page = 1; page <= 10; page += 1) {
-					const result = await fetchModelsPage(account, page, format);
-					openrouter = result.openrouter;
-					models.push(...result.models);
-					if (result.models.length < 100) break;
-				}
-				if (models.length > 0) {
-					return {
-						models,
-						openrouter,
-						account: { id: account.id, name: account.name, accountId: account.accountId },
-					};
-				}
-			} catch (error) {
-				lastError = error;
-			}
+		const [nativeResult, openrouterResult] = await Promise.allSettled([
+			fetchFormat(account, null),
+			fetchFormat(account, 'openrouter'),
+		]);
+
+		const native = nativeResult.status === 'fulfilled' ? nativeResult.value : [];
+		const openrouter = openrouterResult.status === 'fulfilled' ? openrouterResult.value : [];
+		const models = mergeFormats(native, openrouter);
+
+		if (models.length > 0) {
+			return {
+				models,
+				formats: {
+					native: native.length,
+					openrouter: openrouter.length,
+					merged: models.length,
+				},
+				account: { id: account.id, name: account.name, accountId: account.accountId },
+			};
 		}
+
+		lastError = nativeResult.status === 'rejected'
+			? nativeResult.reason
+			: openrouterResult.status === 'rejected'
+				? openrouterResult.reason
+				: lastError;
 	}
 	throw lastError || new Error('Unable to fetch models');
 }
@@ -123,6 +154,15 @@ function snapshotById() {
 	return map;
 }
 
+function tally(models, key) {
+	const out = {};
+	for (const model of models) {
+		const value = model[key] || 'unknown';
+		out[value] = (out[value] || 0) + 1;
+	}
+	return out;
+}
+
 function mergeWithSnapshot(model, snapshotMap) {
 	const base = snapshotMap.get(model.id);
 	if (!base) return model;
@@ -137,6 +177,7 @@ function mergeWithSnapshot(model, snapshotMap) {
 		capabilities: { ...(base.capabilities || {}), ...(model.capabilities || {}) },
 		pricing: model.pricing?.items?.length ? model.pricing : base.pricing,
 		requires_paid: model.requires_paid || base.requires_paid,
+		deprecated: Boolean(model.deprecated || base.deprecated),
 		free: model.free && base.free !== false,
 		free_daily_output_tokens: model.free_daily_output_tokens || base.free_daily_output_tokens,
 		aliases: [...new Set([...(base.aliases || []), ...(model.aliases || [])])],
@@ -167,9 +208,8 @@ async function buildCatalog(env) {
 	let source = 'bundled-snapshot';
 
 	if (live?.models?.length) {
-		const normalize = live.openrouter ? normalizeOpenRouterModel : normalizeApiModel;
 		models = live.models
-			.map((raw) => normalize(raw, {
+			.map((raw) => normalizeModel(raw, {
 				paidOnly,
 				pricing: pricingMap[String(raw.id)],
 				freeQuota,
@@ -183,7 +223,7 @@ async function buildCatalog(env) {
 			...model,
 			pricing: pricingMap[model.id] || model.pricing,
 			requires_paid: model.requires_paid || paidOnly.has(model.id),
-			free: !(model.requires_paid || paidOnly.has(model.id)) && !model.deprecated,
+			free: !(model.requires_paid || paidOnly.has(model.id)),
 		}));
 	}
 
@@ -192,27 +232,31 @@ async function buildCatalog(env) {
 	for (const model of models) {
 		const merged = mergeWithSnapshot(model, snapshotMap);
 		merged.requires_paid = Boolean(merged.requires_paid || paidOnly.has(merged.id));
-		merged.free = !merged.requires_paid && !merged.deprecated;
+		merged.free = !merged.requires_paid;
 		byId.set(merged.id, merged);
 	}
 
 	// Include paid-only models that are present in the snapshot but missing from
 	// the API response (e.g. the account token cannot list them). They are
-	// flagged and hidden from the free catalog, but visible to admins.
+	// flagged and hidden from the free catalog, but visible to admins. Free
+	// models missing from the live response are intentionally not resurrected:
+	// the live API is authoritative once it answers.
 	for (const base of snapshot.models || []) {
-		if (!byId.has(base.id)) {
-			const requiresPaid = base.requires_paid || paidOnly.has(base.id);
-			byId.set(base.id, {
-				...base,
-				pricing: pricingMap[base.id] || base.pricing,
-				requires_paid: requiresPaid,
-				free: !requiresPaid && !base.deprecated,
-			});
-		}
+		if (byId.has(base.id)) continue;
+		const requiresPaid = base.requires_paid || paidOnly.has(base.id);
+		if (!requiresPaid) continue;
+		byId.set(base.id, {
+			...base,
+			pricing: pricingMap[base.id] || base.pricing,
+			requires_paid: true,
+			free: false,
+		});
 	}
 
 	const ranked = rankModels([...byId.values()], settings.benchmarks || {});
 	const now = Date.now();
+	const authors = tally(ranked, 'author');
+	const tasks = tally(ranked, 'task');
 	return {
 		models: ranked,
 		meta: {
@@ -226,8 +270,13 @@ async function buildCatalog(env) {
 			total_models: ranked.length,
 			free_models: ranked.filter((model) => model.free).length,
 			paid_models: ranked.filter((model) => model.requires_paid).length,
+			deprecated_models: ranked.filter((model) => model.deprecated).length,
+			partner_models: ranked.filter((model) => model.author && model.author !== 'Cloudflare').length,
+			authors,
+			tasks,
+			formats: live?.formats || null,
 			account: live?.account || null,
-			stale: false,
+			stale: source !== 'cloudflare-models-api',
 			version: snapshot.generated_at || null,
 		},
 	};
@@ -272,15 +321,20 @@ export async function getCatalog(env, ctx, { force = false } = {}) {
 		return await refresh(env);
 	} catch (error) {
 		if (cached) return { ...cached, meta: { ...cached.meta, stale: true, error: error.message } };
+		const models = (snapshot.models || []).map((model) => ({ ...model }));
 		return {
-			models: (snapshot.models || []).map((model) => ({ ...model })),
+			models,
 			meta: {
 				source: 'bundled-snapshot',
 				fetched_at: Date.now(),
 				free_daily_neurons: 10_000,
-				total_models: (snapshot.models || []).length,
-				free_models: (snapshot.models || []).filter((model) => model.free).length,
-				paid_models: (snapshot.models || []).filter((model) => model.requires_paid).length,
+				total_models: models.length,
+				free_models: models.filter((model) => model.free).length,
+				paid_models: models.filter((model) => model.requires_paid).length,
+				deprecated_models: models.filter((model) => model.deprecated).length,
+				partner_models: models.filter((model) => model.author && model.author !== 'Cloudflare').length,
+				authors: tally(models, 'author'),
+				tasks: tally(models, 'task'),
 				stale: true,
 				error: error.message,
 			},
@@ -314,6 +368,8 @@ export function publicModel(model) {
 		created: model.created_unix || 0,
 		owned_by: model.author || 'cloudflare',
 		name: model.name,
+		description: model.description,
+		created_at: model.created_at,
 		task: model.task,
 		context_window: model.context_window,
 		max_output_tokens: model.max_output_tokens,
@@ -322,6 +378,7 @@ export function publicModel(model) {
 		pricing: model.pricing,
 		free: model.free,
 		requires_paid: model.requires_paid,
+		deprecated: model.deprecated,
 		free_daily_output_tokens: model.free_daily_output_tokens,
 		performance: model.performance,
 		endpoints: model.endpoints,

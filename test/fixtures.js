@@ -91,7 +91,7 @@ export async function seedConfig(overrides = {}) {
 
 export async function seedCatalog(models) {
 	const catalog = buildCatalog(models);
-	await env.KV.put('catalog:cache:v2', JSON.stringify(catalog));
+	await env.KV.put('catalog:cache:v3', JSON.stringify(catalog));
 	return catalog;
 }
 

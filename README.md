@@ -17,6 +17,20 @@
 - **价格、能力、性能排序**：每个模型都返回实时价格（USD 与 neurons）、上下文、能力标签和透明的启发式性能评分，可按 `sort=performance|price|context|name|updated` 排序。
 - **管理面板**：账号、API Key、模型浏览、用量、AI Gateway、别名和性能覆盖值。
 - **API Key 只存哈希**：SHA-256 存储，明文只在创建时显示一次。
+- **中英双语界面**：默认中文，点击右上角切换英文（或 `?lang=en`）；首页、管理面板和文档均已本地化。
+- **完整免费目录**：合并原生模型 API（权威 `task`）与 OpenRouter 形状响应（价格、上下文、模态），再补充官方文档快照；覆盖 Cloudflare 托管模型和第三方合作模型，并对已弃用模型加标记。
+
+---
+
+## 免费模型覆盖范围
+
+当前内置快照包含 **73 个 Workers AI 模型**：**65 个免费**、**8 个需要 Workers Paid 或 AI Gateway 预付额度**。免费部分既包括 Cloudflare 托管模型（Llama、Mistral、Qwen、Gemma、Flux、Whisper 等），也包括第三方合作模型（DeepSeek、Moonshot、Zhipu、Deepgram、Black Forest Labs、Leonardo、RunwayML、Stability、IBM、NVIDIA、BAAI 等）。
+
+运行时优先使用 Cloudflare 模型搜索 API 的完整列表（同时抓取原生格式与 `format=openrouter`），内置快照只作为断网、无账号或 API 失败时的回退。因此部署后看到的目录以你的账号实际可用的模型为准；Cloudflare 新增模型会自动出现，无需改代码。
+
+需要区分：通过 AI Gateway 访问的 OpenAI / Anthropic / Google 官方 API 属于**外部提供商**，不是 Workers AI 模型，也不在每天 10,000 免费 neurons 池内。本项目不会把它们伪装成免费模型。
+
+`/v1/models` 只返回免费模型；管理面板可勾选查看付费模型。付费模型请求会被 `403 model_requires_paid_plan` 拒绝。已弃用模型在 Cloudflare 宽限期内仍可调用，并带有 `deprecated: true`。
 
 ---
 

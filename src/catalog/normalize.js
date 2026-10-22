@@ -6,17 +6,22 @@ const TASK_ALIASES = {
 	'text-generation': 'text-generation',
 	'text embeddings': 'text-embeddings',
 	'text-embeddings': 'text-embeddings',
+	embeddings: 'text-embeddings',
+	embedding: 'text-embeddings',
 	'text-to-image': 'text-to-image',
 	'text to image': 'text-to-image',
+	'image generation': 'text-to-image',
 	'automatic speech recognition': 'automatic-speech-recognition',
 	'speech recognition': 'automatic-speech-recognition',
+	'speech to text': 'automatic-speech-recognition',
 	'text-to-speech': 'text-to-speech',
 	'text to speech': 'text-to-speech',
 	translation: 'translation',
-	'summarization': 'summarization',
+	summarization: 'summarization',
 	'text classification': 'text-classification',
 	'image classification': 'image-classification',
 	'image-to-text': 'image-to-text',
+	'image to text': 'image-to-text',
 	'object detection': 'object-detection',
 	'dumb pipe': 'dumb-pipe',
 };
@@ -26,7 +31,121 @@ export function normalizeTask(value) {
 	const raw = typeof value === 'string'
 		? value
 		: (value.name || value.id || value.task || '');
-	return TASK_ALIASES[String(raw).toLowerCase()] || String(raw).toLowerCase().replace(/\s+/g, '-');
+	const key = String(raw).trim().toLowerCase();
+	if (!key) return 'unknown';
+	return TASK_ALIASES[key] || key.replace(/\s+/g, '-');
+}
+
+const KNOWN_TASKS = new Set(Object.values(TASK_ALIASES));
+
+function resolveDeclaredTask(raw, props) {
+	for (const value of [raw?.task, raw?.task_name, props?.task]) {
+		const task = normalizeTask(value);
+		if (task !== 'unknown') return task;
+	}
+	// OpenRouter-shaped rows sometimes carry a generic `type` such as "chat".
+	// Only accept it when it maps to a real Workers AI task.
+	const type = normalizeTask(raw?.type);
+	return KNOWN_TASKS.has(type) ? type : 'unknown';
+}
+
+function modalityList(value) {
+	if (!value) return null;
+	const list = Array.isArray(value)
+		? value
+		: String(value).split(/[,+/|]/);
+	const normalized = [...new Set(
+		list
+			.map((item) => String(item).trim().toLowerCase())
+			.filter(Boolean),
+	)];
+	return normalized.length ? normalized : null;
+}
+
+/**
+ * Extract modalities from either the OpenRouter architecture shape or the
+ * native Workers AI properties. Returns null when the API gives us nothing,
+ * so callers can fall back to task-based defaults.
+ */
+export function explicitModalities(raw) {
+	const architecture = raw?.architecture || {};
+	let input = modalityList(
+		architecture.input_modalities
+		|| raw?.input_modalities
+		|| raw?.modalities?.input,
+	);
+	let output = modalityList(
+		architecture.output_modalities
+		|| raw?.output_modalities
+		|| raw?.modalities?.output,
+	);
+
+	const modality = String(architecture.modality || raw?.modality || '').toLowerCase();
+	if ((!input || !output) && /->|→/.test(modality)) {
+		const [left, right] = modality.split(/->|→/);
+		input ||= modalityList(left);
+		output ||= modalityList(right);
+	}
+	return { input, output };
+}
+
+/**
+ * Infer the Workers AI task when the API response omits it.
+ *
+ * The `?format=openrouter` response is OpenRouter-shaped: it has no `task`
+ * field at all. Without inference every model shows up as "unknown". The
+ * native response always carries `task`, so this is a safety net, not the
+ * primary source of truth.
+ */
+export function inferTask(raw, props = {}, modalities = null) {
+	const id = String(raw?.id || '').toLowerCase();
+	const name = String(raw?.name || '').toLowerCase();
+	const text = `${id} ${name}`;
+	const mods = modalities || explicitModalities(raw);
+	const input = mods.input || [];
+	const output = mods.output || [];
+
+	const propTask = normalizeTask(props.task);
+	if (propTask !== 'unknown') return propTask;
+
+	if (/rerank/.test(text)) return 'text-classification';
+
+	if (/embedding|embed-|bge-|plamo-embedding|embeddinggemma/.test(text)
+		|| output.includes('embedding') || output.includes('embeddings')) {
+		return 'text-embeddings';
+	}
+
+	if (/melotts|aura-|text[- ]to[- ]speech|\btts\b/.test(text) || output.includes('audio')) {
+		return 'text-to-speech';
+	}
+
+	if (/smart-turn|dumb[- ]pipe/.test(text)) return 'dumb-pipe';
+
+	if (/llava|moondream/.test(text)) return 'image-to-text';
+
+	if (/whisper|nova-3|transcrib|speech[- ]to[- ]text|\basr\b|deepgram\/flux/.test(text)
+		|| (input.includes('audio') && output.includes('text'))) {
+		return 'automatic-speech-recognition';
+	}
+
+	if (/resnet|image[- ]classification/.test(text)) return 'image-classification';
+
+	// Image generation: only trust the id/name when the model is not a
+	// vision-language or image-to-text model (those output text, not images).
+	const looksLikeChat = /vision|instruct|chat|multimodal/.test(text);
+	const looksLikeImageToText = /image[- ]to[- ]text|llava|moondream/.test(text);
+	if (output.includes('image')
+		|| (!looksLikeChat && !looksLikeImageToText && /stable-diffusion|sdxl|flux|dreamshaper|lucid-origin|phoenix|diffusion|text[- ]to[- ]image|image[- ]generat/.test(text))) {
+		return 'text-to-image';
+	}
+
+	if (input.includes('image') && output.includes('text') && !looksLikeChat) return 'image-to-text';
+
+	if (/m2m100|indictrans|translat/.test(text)) return 'translation';
+	if (/bart.*cnn|summar/.test(text)) return 'summarization';
+	if (/classif|sentiment|distilbert|sst-2|toxic/.test(text)) return 'text-classification';
+
+	return 'text-generation';
 }
 
 export function endpointForTask(task) {
@@ -70,16 +189,12 @@ function firstNumber(...values) {
 }
 
 function parseModalities(raw, task) {
-	const architecture = raw.architecture || {};
-	const input = architecture.input_modalities
-		|| raw.input_modalities
-		|| raw.modalities?.input
-		|| taskModalities(task).input;
-	const output = architecture.output_modalities
-		|| raw.output_modalities
-		|| raw.modalities?.output
-		|| taskModalities(task).output;
-	return { input: [...new Set(input)], output: [...new Set(output)] };
+	const explicit = explicitModalities(raw);
+	const fallback = taskModalities(task);
+	return {
+		input: explicit.input || fallback.input,
+		output: explicit.output || fallback.output,
+	};
 }
 
 function taskModalities(task) {
@@ -179,7 +294,10 @@ export function normalizeModel(raw, { paidOnly = new Set(), pricing = null, free
 	if (!raw?.id || !String(raw.id).startsWith('@cf/')) return null;
 	const id = String(raw.id);
 	const props = propsOf(raw);
-	const task = normalizeTask(raw.task || raw.task_name || raw.type);
+	const declaredTask = resolveDeclaredTask(raw, props);
+	const task = declaredTask === 'unknown'
+		? inferTask(raw, props)
+		: declaredTask;
 	const description = String(raw.description || '');
 	const modalities = parseModalities(raw, task);
 	const capabilities = inferCapabilities(raw, props, modalities, task, description);
@@ -230,7 +348,10 @@ export function normalizeModel(raw, { paidOnly = new Set(), pricing = null, free
 		pricing: price || { items: [], tokens: {}, display: '—', source: null },
 		requires_paid: Boolean(requiresPaid),
 		deprecated: Boolean(deprecated),
-		free: !requiresPaid && !deprecated,
+		// Deprecated models remain callable during Cloudflare's 3-month grace
+		// period, so they stay in the catalog (clearly flagged) instead of
+		// silently disappearing from a free user's options.
+		free: !requiresPaid,
 		free_daily_output_tokens: dailyTokens,
 		created_at: created ? new Date(created * 1000).toISOString() : (raw.created_at || null),
 		created_unix: created,

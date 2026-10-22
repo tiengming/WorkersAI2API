@@ -11,6 +11,7 @@ import { AnthropicError, handleAnthropicCountTokens, handleAnthropicMessages } f
 import { InferenceError } from './proxy/inference.js';
 import { handleAdminPage, handleLandingPage } from './ui/pages.js';
 import { handleDocsPage } from './ui/docs.js';
+import { resolveLang } from './ui/i18n.js';
 import {
 	RequestError,
 	cors,
@@ -26,6 +27,17 @@ const HTML_HEADERS = {
 	'X-Content-Type-Options': 'nosniff',
 	'Referrer-Policy': 'strict-origin-when-cross-origin',
 };
+
+function htmlHeaders(request) {
+	const headers = { ...HTML_HEADERS };
+	const url = new URL(request.url);
+	const lang = url.searchParams.get('lang');
+	if (lang === 'zh' || lang === 'en') {
+		const secure = url.protocol === 'https:' ? '; Secure' : '';
+		headers['Set-Cookie'] = `lang=${resolveLang(request)}; Path=/; Max-Age=31536000; SameSite=Lax${secure}`;
+	}
+	return headers;
+}
 
 function setupResponse(request) {
 	if (new URL(request.url).pathname.startsWith('/v1/')) {
@@ -248,16 +260,16 @@ export default {
 			}
 
 			if (url.pathname === '/') {
-				return new Response(await handleLandingPage(request, env, ctx), { headers: HTML_HEADERS });
+				return new Response(await handleLandingPage(request, env, ctx), { headers: htmlHeaders(request) });
 			}
 
 			if (url.pathname === '/admin' || url.pathname === '/admin/') {
-				return new Response(await handleAdminPage(request, env, ctx), { headers: HTML_HEADERS });
+				return new Response(await handleAdminPage(request, env, ctx), { headers: htmlHeaders(request) });
 			}
 
 			if (url.pathname.startsWith('/docs/')) {
-				const page = handleDocsPage(url.pathname.slice('/docs/'.length).replace(/\/$/, ''));
-				if (page) return new Response(page, { headers: HTML_HEADERS });
+				const page = handleDocsPage(url.pathname.slice('/docs/'.length).replace(/\/$/, ''), request);
+				if (page) return new Response(page, { headers: htmlHeaders(request) });
 			}
 
 			return new Response('404 Not Found', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });

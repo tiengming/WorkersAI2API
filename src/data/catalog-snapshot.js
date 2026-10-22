@@ -1,5 +1,5 @@
 export default {
-	"generated_at": "2026-10-22T03:08:01.063Z",
+	"generated_at": "2026-10-22T04:40:40.185Z",
 	"free_daily_neurons": 10000,
 	"pricing": {
 		"models": {
@@ -1746,101 +1746,6 @@ export default {
 			}
 		},
 		{
-			"id": "@cf/moonshotai/kimi-k2.7-code",
-			"name": "kimi-k2.7-code",
-			"author": "Moonshot AI",
-			"task": "text-generation",
-			"description": "Kimi K2.7 is a frontier-scale open-source 1T parameter model with a 262.1k context window, multi-turn tool calling, vision inputs, and structured outputs for agentic workloads.",
-			"context_window": 262144,
-			"max_output_tokens": null,
-			"modalities": {
-				"input": [
-					"text"
-				],
-				"output": [
-					"text"
-				]
-			},
-			"capabilities": {
-				"function_calling": true,
-				"reasoning": false,
-				"structured_output": true,
-				"vision": false,
-				"audio_input": false,
-				"audio_output": false,
-				"streaming": true,
-				"multilingual": false
-			},
-			"pricing": {
-				"items": [
-					{
-						"kind": "input_token",
-						"usd": 0.95,
-						"neurons": 86364,
-						"unit": "per M input tokens"
-					},
-					{
-						"kind": "cached_input_token",
-						"usd": 0.19,
-						"neurons": 17273,
-						"unit": "per M cached input tokens"
-					},
-					{
-						"kind": "output_token",
-						"usd": 4,
-						"neurons": 363636,
-						"unit": "per M output tokens"
-					}
-				],
-				"tokens": {
-					"input_usd_per_million": 0.95,
-					"input_neurons_per_million": 86364,
-					"output_usd_per_million": 4,
-					"output_neurons_per_million": 363636,
-					"cached_input_usd_per_million": 0.19,
-					"cached_input_neurons_per_million": 17273
-				},
-				"display": "$0.95 / input · $0.19 / cached input · $4 / output",
-				"source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
-			},
-			"requires_paid": true,
-			"deprecated": false,
-			"free": false,
-			"free_daily_output_tokens": 27500,
-			"created_at": null,
-			"created_unix": null,
-			"docs_url": "https://developers.cloudflare.com/workers-ai/models/kimi-k2.7-code/",
-			"openai_compatible": true,
-			"endpoints": [
-				"/v1/chat/completions",
-				"/v1/run"
-			],
-			"aliases": [
-				"@cf/moonshotai/kimi-k2.7-code",
-				"kimi-k2.7-code"
-			],
-			"source": "docs-snapshot",
-			"performance": {
-				"score": 53.8,
-				"tier": "B",
-				"basis": [
-					"size unknown",
-					"262k context",
-					"tools",
-					"heuristic score"
-				],
-				"components": {
-					"size": 40,
-					"capability": 56,
-					"context": 76,
-					"recency": 45,
-					"price": 77,
-					"override": null
-				},
-				"rank": 3
-			}
-		},
-		{
 			"id": "@cf/moonshotai/kimi-k2.6",
 			"name": "kimi-k2.6",
 			"author": "Moonshot AI",
@@ -1913,6 +1818,101 @@ export default {
 			"aliases": [
 				"@cf/moonshotai/kimi-k2.6",
 				"kimi-k2.6"
+			],
+			"source": "docs-snapshot",
+			"performance": {
+				"score": 53.8,
+				"tier": "B",
+				"basis": [
+					"size unknown",
+					"262k context",
+					"tools",
+					"heuristic score"
+				],
+				"components": {
+					"size": 40,
+					"capability": 56,
+					"context": 76,
+					"recency": 45,
+					"price": 77,
+					"override": null
+				},
+				"rank": 3
+			}
+		},
+		{
+			"id": "@cf/moonshotai/kimi-k2.7-code",
+			"name": "kimi-k2.7-code",
+			"author": "Moonshot AI",
+			"task": "text-generation",
+			"description": "Kimi K2.7 is a frontier-scale open-source 1T parameter model with a 262.1k context window, multi-turn tool calling, vision inputs, and structured outputs for agentic workloads.",
+			"context_window": 262144,
+			"max_output_tokens": null,
+			"modalities": {
+				"input": [
+					"text"
+				],
+				"output": [
+					"text"
+				]
+			},
+			"capabilities": {
+				"function_calling": true,
+				"reasoning": false,
+				"structured_output": true,
+				"vision": false,
+				"audio_input": false,
+				"audio_output": false,
+				"streaming": true,
+				"multilingual": false
+			},
+			"pricing": {
+				"items": [
+					{
+						"kind": "input_token",
+						"usd": 0.95,
+						"neurons": 86364,
+						"unit": "per M input tokens"
+					},
+					{
+						"kind": "cached_input_token",
+						"usd": 0.19,
+						"neurons": 17273,
+						"unit": "per M cached input tokens"
+					},
+					{
+						"kind": "output_token",
+						"usd": 4,
+						"neurons": 363636,
+						"unit": "per M output tokens"
+					}
+				],
+				"tokens": {
+					"input_usd_per_million": 0.95,
+					"input_neurons_per_million": 86364,
+					"output_usd_per_million": 4,
+					"output_neurons_per_million": 363636,
+					"cached_input_usd_per_million": 0.19,
+					"cached_input_neurons_per_million": 17273
+				},
+				"display": "$0.95 / input · $0.19 / cached input · $4 / output",
+				"source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+			},
+			"requires_paid": true,
+			"deprecated": false,
+			"free": false,
+			"free_daily_output_tokens": 27500,
+			"created_at": null,
+			"created_unix": null,
+			"docs_url": "https://developers.cloudflare.com/workers-ai/models/kimi-k2.7-code/",
+			"openai_compatible": true,
+			"endpoints": [
+				"/v1/chat/completions",
+				"/v1/run"
+			],
+			"aliases": [
+				"@cf/moonshotai/kimi-k2.7-code",
+				"kimi-k2.7-code"
 			],
 			"source": "docs-snapshot",
 			"performance": {
@@ -2793,11 +2793,11 @@ export default {
 			}
 		},
 		{
-			"id": "@cf/deepgram/aura-2-en",
-			"name": "aura-2-en",
+			"id": "@cf/deepgram/aura-1",
+			"name": "aura-1",
 			"author": "Deepgram",
 			"task": "text-to-speech",
-			"description": "Aura-2 is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
+			"description": "Aura is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
 			"context_window": null,
 			"max_output_tokens": null,
 			"modalities": {
@@ -2822,13 +2822,13 @@ export default {
 				"items": [
 					{
 						"kind": "character",
-						"usd": 0.03,
-						"neurons": 2727.27,
+						"usd": 0.015,
+						"neurons": 1,
 						"unit": "per 1k characters input"
 					}
 				],
 				"tokens": {},
-				"display": "$0.03 / 1k chars",
+				"display": "$0.015 / 1k chars",
 				"source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
 			},
 			"requires_paid": false,
@@ -2837,15 +2837,15 @@ export default {
 			"free_daily_output_tokens": null,
 			"created_at": null,
 			"created_unix": null,
-			"docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-2-en/",
+			"docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-1/",
 			"openai_compatible": false,
 			"endpoints": [
 				"/v1/audio/speech",
 				"/v1/run"
 			],
 			"aliases": [
-				"@cf/deepgram/aura-2-en",
-				"aura-2-en"
+				"@cf/deepgram/aura-1",
+				"aura-1"
 			],
 			"source": "docs-snapshot",
 			"performance": {
@@ -2943,11 +2943,11 @@ export default {
 			}
 		},
 		{
-			"id": "@cf/deepgram/aura-1",
-			"name": "aura-1",
+			"id": "@cf/deepgram/aura-2-en",
+			"name": "aura-2-en",
 			"author": "Deepgram",
 			"task": "text-to-speech",
-			"description": "Aura is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
+			"description": "Aura-2 is a context-aware text-to-speech (TTS) model that applies natural pacing, expressiveness, and fillers based on the context of the provided text. The quality of your text input directly impacts the naturalness of the audio output.",
 			"context_window": null,
 			"max_output_tokens": null,
 			"modalities": {
@@ -2972,13 +2972,13 @@ export default {
 				"items": [
 					{
 						"kind": "character",
-						"usd": 0.015,
-						"neurons": 1,
+						"usd": 0.03,
+						"neurons": 2727.27,
 						"unit": "per 1k characters input"
 					}
 				],
 				"tokens": {},
-				"display": "$0.015 / 1k chars",
+				"display": "$0.03 / 1k chars",
 				"source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
 			},
 			"requires_paid": false,
@@ -2987,15 +2987,15 @@ export default {
 			"free_daily_output_tokens": null,
 			"created_at": null,
 			"created_unix": null,
-			"docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-1/",
+			"docs_url": "https://developers.cloudflare.com/workers-ai/models/aura-2-en/",
 			"openai_compatible": false,
 			"endpoints": [
 				"/v1/audio/speech",
 				"/v1/run"
 			],
 			"aliases": [
-				"@cf/deepgram/aura-1",
-				"aura-1"
+				"@cf/deepgram/aura-2-en",
+				"aura-2-en"
 			],
 			"source": "docs-snapshot",
 			"performance": {
@@ -3832,6 +3832,83 @@ export default {
 			}
 		},
 		{
+			"id": "@cf/baai/bge-reranker-base",
+			"name": "bge-reranker-base",
+			"author": "BAAI",
+			"task": "text-classification",
+			"description": "\"Different from embedding model, reranker uses question and document as input and directly output similarity instead of embedding. You can get a relevance score by inputting query and passage to the reranker. And the score can be mapped to a float value in [0,1] by sigmoid function.\\n\\n\"",
+			"context_window": null,
+			"max_output_tokens": null,
+			"modalities": {
+				"input": [
+					"text"
+				],
+				"output": [
+					"text"
+				]
+			},
+			"capabilities": {
+				"function_calling": false,
+				"reasoning": false,
+				"structured_output": false,
+				"vision": false,
+				"audio_input": false,
+				"audio_output": false,
+				"streaming": true,
+				"multilingual": false
+			},
+			"pricing": {
+				"items": [
+					{
+						"kind": "input_token",
+						"usd": 0.003,
+						"neurons": 283,
+						"unit": "per M input tokens"
+					}
+				],
+				"tokens": {
+					"input_usd_per_million": 0.003,
+					"input_neurons_per_million": 283
+				},
+				"display": "$0.003 / input",
+				"source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+			},
+			"requires_paid": false,
+			"deprecated": false,
+			"free": true,
+			"free_daily_output_tokens": 35335689,
+			"created_at": null,
+			"created_unix": null,
+			"docs_url": "https://developers.cloudflare.com/workers-ai/models/bge-reranker-base/",
+			"openai_compatible": false,
+			"endpoints": [
+				"/v1/run"
+			],
+			"aliases": [
+				"@cf/baai/bge-reranker-base",
+				"bge-reranker-base"
+			],
+			"source": "docs-snapshot",
+			"performance": {
+				"score": 37.3,
+				"tier": "C",
+				"basis": [
+					"size unknown",
+					"context unknown",
+					"heuristic score"
+				],
+				"components": {
+					"size": 40,
+					"capability": 30,
+					"context": 30,
+					"recency": 45,
+					"price": 45,
+					"override": null
+				},
+				"rank": 28
+			}
+		},
+		{
 			"id": "@cf/baai/bge-large-en-v1.5",
 			"name": "bge-large-en-v1.5",
 			"author": "BAAI",
@@ -3888,83 +3965,6 @@ export default {
 			"aliases": [
 				"@cf/baai/bge-large-en-v1.5",
 				"bge-large-en-v1.5"
-			],
-			"source": "docs-snapshot",
-			"performance": {
-				"score": 37.3,
-				"tier": "C",
-				"basis": [
-					"size unknown",
-					"context unknown",
-					"heuristic score"
-				],
-				"components": {
-					"size": 40,
-					"capability": 30,
-					"context": 30,
-					"recency": 45,
-					"price": 45,
-					"override": null
-				},
-				"rank": 28
-			}
-		},
-		{
-			"id": "@cf/baai/bge-reranker-base",
-			"name": "bge-reranker-base",
-			"author": "BAAI",
-			"task": "text-classification",
-			"description": "\"Different from embedding model, reranker uses question and document as input and directly output similarity instead of embedding. You can get a relevance score by inputting query and passage to the reranker. And the score can be mapped to a float value in [0,1] by sigmoid function.\\n\\n\"",
-			"context_window": null,
-			"max_output_tokens": null,
-			"modalities": {
-				"input": [
-					"text"
-				],
-				"output": [
-					"text"
-				]
-			},
-			"capabilities": {
-				"function_calling": false,
-				"reasoning": false,
-				"structured_output": false,
-				"vision": false,
-				"audio_input": false,
-				"audio_output": false,
-				"streaming": true,
-				"multilingual": false
-			},
-			"pricing": {
-				"items": [
-					{
-						"kind": "input_token",
-						"usd": 0.003,
-						"neurons": 283,
-						"unit": "per M input tokens"
-					}
-				],
-				"tokens": {
-					"input_usd_per_million": 0.003,
-					"input_neurons_per_million": 283
-				},
-				"display": "$0.003 / input",
-				"source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
-			},
-			"requires_paid": false,
-			"deprecated": false,
-			"free": true,
-			"free_daily_output_tokens": 35335689,
-			"created_at": null,
-			"created_unix": null,
-			"docs_url": "https://developers.cloudflare.com/workers-ai/models/bge-reranker-base/",
-			"openai_compatible": false,
-			"endpoints": [
-				"/v1/run"
-			],
-			"aliases": [
-				"@cf/baai/bge-reranker-base",
-				"bge-reranker-base"
 			],
 			"source": "docs-snapshot",
 			"performance": {
@@ -4065,74 +4065,6 @@ export default {
 			}
 		},
 		{
-			"id": "@cf/google/embeddinggemma-300m",
-			"name": "embeddinggemma-300m",
-			"author": "Google",
-			"task": "text-embeddings",
-			"description": "EmbeddingGemma is a 300M parameter, state-of-the-art for its size, open embedding model from Google, built from Gemma 3 (with T5Gemma initialization) and the same research and technology used to create Gemini models. EmbeddingGemma produces vector representations of text, making it well-suited for search and retrieval tasks, including classification, clustering, and semantic similarity search. This model was trained with data in 100+ spoken languages.",
-			"context_window": null,
-			"max_output_tokens": null,
-			"modalities": {
-				"input": [
-					"text"
-				],
-				"output": [
-					"text"
-				]
-			},
-			"capabilities": {
-				"function_calling": false,
-				"reasoning": false,
-				"structured_output": false,
-				"vision": false,
-				"audio_input": false,
-				"audio_output": false,
-				"streaming": true,
-				"multilingual": false
-			},
-			"pricing": {
-				"items": [],
-				"tokens": {},
-				"display": "—",
-				"source": null
-			},
-			"requires_paid": false,
-			"deprecated": false,
-			"free": true,
-			"free_daily_output_tokens": null,
-			"created_at": null,
-			"created_unix": null,
-			"docs_url": "https://developers.cloudflare.com/workers-ai/models/embeddinggemma-300m/",
-			"openai_compatible": true,
-			"endpoints": [
-				"/v1/embeddings",
-				"/v1/run"
-			],
-			"aliases": [
-				"@cf/google/embeddinggemma-300m",
-				"embeddinggemma-300m"
-			],
-			"source": "docs-snapshot",
-			"performance": {
-				"score": 37.3,
-				"tier": "C",
-				"basis": [
-					"size unknown",
-					"context unknown",
-					"heuristic score"
-				],
-				"components": {
-					"size": 40,
-					"capability": 30,
-					"context": 30,
-					"recency": 45,
-					"price": 45,
-					"override": null
-				},
-				"rank": 31
-			}
-		},
-		{
 			"id": "@cf/huggingface/distilbert-sst-2-int8",
 			"name": "distilbert-sst-2-int8",
 			"author": "HuggingFace",
@@ -4206,7 +4138,7 @@ export default {
 					"price": 45,
 					"override": null
 				},
-				"rank": 32
+				"rank": 31
 			}
 		},
 		{
@@ -4274,15 +4206,15 @@ export default {
 					"price": 45,
 					"override": null
 				},
-				"rank": 33
+				"rank": 32
 			}
 		},
 		{
-			"id": "@cf/black-forest-labs/flux-1-schnell",
-			"name": "flux-1-schnell",
-			"author": "Black Forest Labs",
-			"task": "text-to-image",
-			"description": "\"FLUX.1 [schnell] is a 12 billion parameter rectified flow transformer capable of generating images from text descriptions. \"",
+			"id": "@cf/google/embeddinggemma-300m",
+			"name": "embeddinggemma-300m",
+			"author": "Google",
+			"task": "text-embeddings",
+			"description": "EmbeddingGemma is a 300M parameter, state-of-the-art for its size, open embedding model from Google, built from Gemma 3 (with T5Gemma initialization) and the same research and technology used to create Gemini models. EmbeddingGemma produces vector representations of text, making it well-suited for search and retrieval tasks, including classification, clustering, and semantic similarity search. This model was trained with data in 100+ spoken languages.",
 			"context_window": null,
 			"max_output_tokens": null,
 			"modalities": {
@@ -4290,7 +4222,7 @@ export default {
 					"text"
 				],
 				"output": [
-					"image"
+					"text"
 				]
 			},
 			"capabilities": {
@@ -4304,23 +4236,10 @@ export default {
 				"multilingual": false
 			},
 			"pricing": {
-				"items": [
-					{
-						"kind": "image_tile",
-						"usd": 0.0000528,
-						"neurons": 4.8,
-						"unit": "per 512x512 tile"
-					},
-					{
-						"kind": "step",
-						"usd": 0.0001056,
-						"neurons": 9.6,
-						"unit": "per step"
-					}
-				],
+				"items": [],
 				"tokens": {},
-				"display": "$0.0000528 / tile · $0.0001056 / step",
-				"source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+				"display": "—",
+				"source": null
 			},
 			"requires_paid": false,
 			"deprecated": false,
@@ -4328,15 +4247,15 @@ export default {
 			"free_daily_output_tokens": null,
 			"created_at": null,
 			"created_unix": null,
-			"docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-1-schnell/",
-			"openai_compatible": false,
+			"docs_url": "https://developers.cloudflare.com/workers-ai/models/embeddinggemma-300m/",
+			"openai_compatible": true,
 			"endpoints": [
-				"/v1/images/generations",
+				"/v1/embeddings",
 				"/v1/run"
 			],
 			"aliases": [
-				"@cf/black-forest-labs/flux-1-schnell",
-				"flux-1-schnell"
+				"@cf/google/embeddinggemma-300m",
+				"embeddinggemma-300m"
 			],
 			"source": "docs-snapshot",
 			"performance": {
@@ -4355,7 +4274,7 @@ export default {
 					"price": 45,
 					"override": null
 				},
-				"rank": 34
+				"rank": 33
 			}
 		},
 		{
@@ -4418,6 +4337,87 @@ export default {
 			"aliases": [
 				"@cf/black-forest-labs/flux-2-dev",
 				"flux-2-dev"
+			],
+			"source": "docs-snapshot",
+			"performance": {
+				"score": 37.3,
+				"tier": "C",
+				"basis": [
+					"size unknown",
+					"context unknown",
+					"heuristic score"
+				],
+				"components": {
+					"size": 40,
+					"capability": 30,
+					"context": 30,
+					"recency": 45,
+					"price": 45,
+					"override": null
+				},
+				"rank": 34
+			}
+		},
+		{
+			"id": "@cf/black-forest-labs/flux-1-schnell",
+			"name": "flux-1-schnell",
+			"author": "Black Forest Labs",
+			"task": "text-to-image",
+			"description": "\"FLUX.1 [schnell] is a 12 billion parameter rectified flow transformer capable of generating images from text descriptions. \"",
+			"context_window": null,
+			"max_output_tokens": null,
+			"modalities": {
+				"input": [
+					"text"
+				],
+				"output": [
+					"image"
+				]
+			},
+			"capabilities": {
+				"function_calling": false,
+				"reasoning": false,
+				"structured_output": false,
+				"vision": false,
+				"audio_input": false,
+				"audio_output": false,
+				"streaming": true,
+				"multilingual": false
+			},
+			"pricing": {
+				"items": [
+					{
+						"kind": "image_tile",
+						"usd": 0.0000528,
+						"neurons": 4.8,
+						"unit": "per 512x512 tile"
+					},
+					{
+						"kind": "step",
+						"usd": 0.0001056,
+						"neurons": 9.6,
+						"unit": "per step"
+					}
+				],
+				"tokens": {},
+				"display": "$0.0000528 / tile · $0.0001056 / step",
+				"source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+			},
+			"requires_paid": false,
+			"deprecated": false,
+			"free": true,
+			"free_daily_output_tokens": null,
+			"created_at": null,
+			"created_unix": null,
+			"docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-1-schnell/",
+			"openai_compatible": false,
+			"endpoints": [
+				"/v1/images/generations",
+				"/v1/run"
+			],
+			"aliases": [
+				"@cf/black-forest-labs/flux-1-schnell",
+				"flux-1-schnell"
 			],
 			"source": "docs-snapshot",
 			"performance": {
@@ -4676,74 +4676,6 @@ export default {
 			}
 		},
 		{
-			"id": "@cf/runwayml/stable-diffusion-v1-5-inpainting",
-			"name": "stable-diffusion-v1-5-inpainting",
-			"author": "RunwayML",
-			"task": "text-to-image",
-			"description": "Stable Diffusion Inpainting is a latent text-to-image diffusion model capable of generating photo-realistic images given any text input, with the extra capability of inpainting the pictures by using a mask.",
-			"context_window": null,
-			"max_output_tokens": null,
-			"modalities": {
-				"input": [
-					"text"
-				],
-				"output": [
-					"image"
-				]
-			},
-			"capabilities": {
-				"function_calling": false,
-				"reasoning": false,
-				"structured_output": false,
-				"vision": false,
-				"audio_input": false,
-				"audio_output": false,
-				"streaming": true,
-				"multilingual": false
-			},
-			"pricing": {
-				"items": [],
-				"tokens": {},
-				"display": "—",
-				"source": null
-			},
-			"requires_paid": false,
-			"deprecated": false,
-			"free": true,
-			"free_daily_output_tokens": null,
-			"created_at": null,
-			"created_unix": null,
-			"docs_url": "https://developers.cloudflare.com/workers-ai/models/stable-diffusion-v1-5-inpainting/",
-			"openai_compatible": false,
-			"endpoints": [
-				"/v1/images/generations",
-				"/v1/run"
-			],
-			"aliases": [
-				"@cf/runwayml/stable-diffusion-v1-5-inpainting",
-				"stable-diffusion-v1-5-inpainting"
-			],
-			"source": "docs-snapshot",
-			"performance": {
-				"score": 37.3,
-				"tier": "C",
-				"basis": [
-					"size unknown",
-					"context unknown",
-					"heuristic score"
-				],
-				"components": {
-					"size": 40,
-					"capability": 30,
-					"context": 30,
-					"recency": 45,
-					"price": 45,
-					"override": null
-				},
-				"rank": 39
-			}
-		},
-		{
 			"id": "@cf/microsoft/resnet-50",
 			"name": "resnet-50",
 			"author": "Microsoft",
@@ -4814,7 +4746,7 @@ export default {
 					"price": 45,
 					"override": null
 				},
-				"rank": 40
+				"rank": 39
 			}
 		},
 		{
@@ -4882,7 +4814,7 @@ export default {
 					"price": 45,
 					"override": null
 				},
-				"rank": 41
+				"rank": 40
 			}
 		},
 		{
@@ -4932,6 +4864,74 @@ export default {
 			"aliases": [
 				"@cf/bytedance/stable-diffusion-xl-lightning",
 				"stable-diffusion-xl-lightning"
+			],
+			"source": "docs-snapshot",
+			"performance": {
+				"score": 37.3,
+				"tier": "C",
+				"basis": [
+					"size unknown",
+					"context unknown",
+					"heuristic score"
+				],
+				"components": {
+					"size": 40,
+					"capability": 30,
+					"context": 30,
+					"recency": 45,
+					"price": 45,
+					"override": null
+				},
+				"rank": 41
+			}
+		},
+		{
+			"id": "@cf/runwayml/stable-diffusion-v1-5-inpainting",
+			"name": "stable-diffusion-v1-5-inpainting",
+			"author": "RunwayML",
+			"task": "text-to-image",
+			"description": "Stable Diffusion Inpainting is a latent text-to-image diffusion model capable of generating photo-realistic images given any text input, with the extra capability of inpainting the pictures by using a mask.",
+			"context_window": null,
+			"max_output_tokens": null,
+			"modalities": {
+				"input": [
+					"text"
+				],
+				"output": [
+					"image"
+				]
+			},
+			"capabilities": {
+				"function_calling": false,
+				"reasoning": false,
+				"structured_output": false,
+				"vision": false,
+				"audio_input": false,
+				"audio_output": false,
+				"streaming": true,
+				"multilingual": false
+			},
+			"pricing": {
+				"items": [],
+				"tokens": {},
+				"display": "—",
+				"source": null
+			},
+			"requires_paid": false,
+			"deprecated": false,
+			"free": true,
+			"free_daily_output_tokens": null,
+			"created_at": null,
+			"created_unix": null,
+			"docs_url": "https://developers.cloudflare.com/workers-ai/models/stable-diffusion-v1-5-inpainting/",
+			"openai_compatible": false,
+			"endpoints": [
+				"/v1/images/generations",
+				"/v1/run"
+			],
+			"aliases": [
+				"@cf/runwayml/stable-diffusion-v1-5-inpainting",
+				"stable-diffusion-v1-5-inpainting"
 			],
 			"source": "docs-snapshot",
 			"performance": {
@@ -6609,6 +6609,87 @@ export default {
 			}
 		},
 		{
+			"id": "@cf/black-forest-labs/flux-2-klein-4b",
+			"name": "flux-2-klein-4b",
+			"author": "Black Forest Labs",
+			"task": "text-to-image",
+			"description": "FLUX.2 [klein] is an ultra-fast, distilled image model. It unifies image generation and editing in a single model, delivering state-of-the-art quality enabling interactive workflows, real-time previews, and latency-critical applications.",
+			"context_window": null,
+			"max_output_tokens": null,
+			"modalities": {
+				"input": [
+					"text"
+				],
+				"output": [
+					"image"
+				]
+			},
+			"capabilities": {
+				"function_calling": false,
+				"reasoning": false,
+				"structured_output": false,
+				"vision": false,
+				"audio_input": false,
+				"audio_output": false,
+				"streaming": true,
+				"multilingual": false
+			},
+			"pricing": {
+				"items": [
+					{
+						"kind": "image_tile",
+						"usd": 0.000059,
+						"neurons": 5.37,
+						"unit": "per input 512x512 tile"
+					},
+					{
+						"kind": "image_tile",
+						"usd": 0.000287,
+						"neurons": 26.05,
+						"unit": "per output 512x512 tile"
+					}
+				],
+				"tokens": {},
+				"display": "$0.000059 / tile · $0.000287 / tile",
+				"source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
+			},
+			"requires_paid": false,
+			"deprecated": false,
+			"free": true,
+			"free_daily_output_tokens": null,
+			"created_at": null,
+			"created_unix": null,
+			"docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/",
+			"openai_compatible": false,
+			"endpoints": [
+				"/v1/images/generations",
+				"/v1/run"
+			],
+			"aliases": [
+				"@cf/black-forest-labs/flux-2-klein-4b",
+				"flux-2-klein-4b"
+			],
+			"source": "docs-snapshot",
+			"performance": {
+				"score": 23.3,
+				"tier": "D",
+				"basis": [
+					"4B parameters",
+					"context unknown",
+					"heuristic score"
+				],
+				"components": {
+					"size": 0,
+					"capability": 30,
+					"context": 30,
+					"recency": 45,
+					"price": 45,
+					"override": null
+				},
+				"rank": 63
+			}
+		},
+		{
 			"id": "@cf/black-forest-labs/flux-2-klein-9b",
 			"name": "flux-2-klein-9b",
 			"author": "Black Forest Labs",
@@ -6681,87 +6762,6 @@ export default {
 				"tier": "D",
 				"basis": [
 					"9B parameters",
-					"context unknown",
-					"heuristic score"
-				],
-				"components": {
-					"size": 0,
-					"capability": 30,
-					"context": 30,
-					"recency": 45,
-					"price": 45,
-					"override": null
-				},
-				"rank": 63
-			}
-		},
-		{
-			"id": "@cf/black-forest-labs/flux-2-klein-4b",
-			"name": "flux-2-klein-4b",
-			"author": "Black Forest Labs",
-			"task": "text-to-image",
-			"description": "FLUX.2 [klein] is an ultra-fast, distilled image model. It unifies image generation and editing in a single model, delivering state-of-the-art quality enabling interactive workflows, real-time previews, and latency-critical applications.",
-			"context_window": null,
-			"max_output_tokens": null,
-			"modalities": {
-				"input": [
-					"text"
-				],
-				"output": [
-					"image"
-				]
-			},
-			"capabilities": {
-				"function_calling": false,
-				"reasoning": false,
-				"structured_output": false,
-				"vision": false,
-				"audio_input": false,
-				"audio_output": false,
-				"streaming": true,
-				"multilingual": false
-			},
-			"pricing": {
-				"items": [
-					{
-						"kind": "image_tile",
-						"usd": 0.000059,
-						"neurons": 5.37,
-						"unit": "per input 512x512 tile"
-					},
-					{
-						"kind": "image_tile",
-						"usd": 0.000287,
-						"neurons": 26.05,
-						"unit": "per output 512x512 tile"
-					}
-				],
-				"tokens": {},
-				"display": "$0.000059 / tile · $0.000287 / tile",
-				"source": "https://developers.cloudflare.com/workers-ai/platform/pricing/index.md"
-			},
-			"requires_paid": false,
-			"deprecated": false,
-			"free": true,
-			"free_daily_output_tokens": null,
-			"created_at": null,
-			"created_unix": null,
-			"docs_url": "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/",
-			"openai_compatible": false,
-			"endpoints": [
-				"/v1/images/generations",
-				"/v1/run"
-			],
-			"aliases": [
-				"@cf/black-forest-labs/flux-2-klein-4b",
-				"flux-2-klein-4b"
-			],
-			"source": "docs-snapshot",
-			"performance": {
-				"score": 23.3,
-				"tier": "D",
-				"basis": [
-					"4B parameters",
 					"context unknown",
 					"heuristic score"
 				],
